@@ -3,11 +3,15 @@
 #ifndef JAIM_ENGINE_H
 #define JAIM_ENGINE_H
 
+#include <fcitx/action.h>
 #include <fcitx/addonfactory.h>
 #include <fcitx/addonmanager.h>
 #include <fcitx/inputcontextproperty.h>
 #include <fcitx/inputmethodengine.h>
 #include <fcitx/instance.h>
+#include <fcitx/menu.h>
+#include <fcitx/statusarea.h>
+#include <fcitx/userinterfacemanager.h>
 
 #include "jaim_ffi.h"
 
@@ -51,8 +55,22 @@ public:
     auto &factory() { return factory_; }
 
 private:
+    // Dictionary management via zenity dialogs (run in background threads)
+    static void runWordRegister();
+    static void runManageDict();
+    static void runExportDict();
+    static void runImportDict();
+
     fcitx::Instance *instance_;
     fcitx::FactoryFor<JaimState> factory_;
+
+    // Menu actions
+    fcitx::SimpleAction actionRegister_;
+    fcitx::SimpleAction actionManage_;
+    fcitx::SimpleAction actionExport_;
+    fcitx::SimpleAction actionImport_;
+    fcitx::Menu menu_;
+    fcitx::SimpleAction menuAction_;
 };
 
 class JaimEngineFactory : public fcitx::AddonFactory {
