@@ -110,10 +110,10 @@ fn main() {
         let mut count = 0;
         for line in utf8.lines() {
             if let Some(parsed) = parse_line(line, source) {
-                // Collect verb/adjective conjugation stems for compound generation
-                let dominated_by_kana = parsed.entry.surface == parsed.entry.reading;
-                if !dominated_by_kana
-                    && matches!(parsed.entry.pos, "Verb" | "Adjective")
+                // Collect verb/adjective conjugation stems for compound generation.
+                // Include kana-only forms (し, い, き, etc.) — they produce essential
+                // compounds like します, います, きます.
+                if matches!(parsed.entry.pos, "Verb" | "Adjective")
                     && matches!(parsed.conjugation_form.as_str(), "連用タ接続" | "連用形" | "未然形")
                 {
                     parsed_for_compounds.push(ParsedEntry {
@@ -261,7 +261,9 @@ fn parse_line(line: &str, source: &DictSource) -> Option<ParsedEntry> {
 ///   stem + ている/でいる (progressive, e.g., 食べている, 読んでいる)
 ///   stem + ています/でいます (polite progressive, e.g., 食べています)
 ///
-/// For each 連用形 stem of ichidan-type verbs, generates:
+/// For each 連用形 stem, generates polite forms (all verb types):
+///   stem + ます/ました/ません/ましょう (e.g., 書きます, 食べました, しません)
+/// For ichidan-type verbs, also generates:
 ///   stem + た/て (past/te-form, e.g., 食べた, 食べて)
 ///   stem + ている/ています (progressive)
 ///
@@ -310,17 +312,22 @@ fn generate_compounds(parsed: &[ParsedEntry]) -> Vec<Entry> {
                 }
             }
             "連用形" => {
-                // Only ichidan-style verbs form past/te directly from 連用形
-                if !ICHIDAN_TYPES.iter().any(|&t| ctype.starts_with(t)) {
-                    continue;
-                }
                 let boosted = boost_freq(p.entry.frequency);
-                for &suffix in &["た", "て"] {
+
+                // Polite forms: ALL verb types use 連用形 + ます/ました/ません/ましょう
+                for &suffix in &["ます", "ました", "ません", "ましょう"] {
                     compounds.push(make_compound(&p.entry, suffix, suffix, boosted));
                 }
-                // Progressive forms
-                for &suffix in &["ている", "ていた", "ていない", "ています"] {
-                    compounds.push(make_compound(&p.entry, suffix, suffix, boosted));
+
+                // Only ichidan-style verbs form past/te directly from 連用形
+                if ICHIDAN_TYPES.iter().any(|&t| ctype.starts_with(t)) {
+                    for &suffix in &["た", "て"] {
+                        compounds.push(make_compound(&p.entry, suffix, suffix, boosted));
+                    }
+                    // Progressive forms
+                    for &suffix in &["ている", "ていた", "ていない", "ています"] {
+                        compounds.push(make_compound(&p.entry, suffix, suffix, boosted));
+                    }
                 }
             }
             "未然形" => {
@@ -477,6 +484,35 @@ fn extra_entries() -> Vec<Entry> {
     let extras: &[(&str, &str, &str, u32)] = &[
         // (reading, surface, pos, frequency)
         ("ご", "誤", "Noun", 5000),
+        // Common words missing from IPADIC
+        ("なんかい", "何回", "Noun", 6000),
+        // Frequency overrides: common words that lose to competing splits
+        ("りょうかい", "了解", "Noun", 7000),
+        ("かんりょう", "完了", "Noun", 6000),
+        ("じゅんばん", "順番", "Noun", 6000),
+        ("しょうがい", "障害", "Noun", 5500),
+        // Common polite verb endings (base forms have unreasonably low IPADIC cost)
+        ("しました", "しました", "Verb", 7000),
+        ("します", "します", "Verb", 7000),
+        ("しません", "しません", "Verb", 6500),
+        ("しましょう", "しましょう", "Verb", 6500),
+        ("います", "います", "Verb", 7000),
+        ("いました", "いました", "Verb", 7000),
+        ("いません", "いません", "Verb", 6500),
+        ("ぷろんぷと", "プロンプト", "Noun", 5500),
+        ("とーくん", "トークン", "Noun", 5500),
+        ("あらーと", "アラート", "Noun", 5500),
+        // Half-width digit → full-width digit conversion
+        ("1", "１", "Noun", 7000),
+        ("2", "２", "Noun", 7000),
+        ("3", "３", "Noun", 7000),
+        ("4", "４", "Noun", 7000),
+        ("5", "５", "Noun", 7000),
+        ("6", "６", "Noun", 7000),
+        ("7", "７", "Noun", 7000),
+        ("8", "８", "Noun", 7000),
+        ("9", "９", "Noun", 7000),
+        ("0", "０", "Noun", 7000),
     ];
     extras
         .iter()
