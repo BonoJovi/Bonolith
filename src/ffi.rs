@@ -10,7 +10,8 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 use std::ptr;
 
-use crate::engine::ConversionEngine;
+use crate::core::dictionary::{Dictionary, DictionaryEntry, PartOfSpeech};
+use crate::engine::{ConversionEngine, SharedCore};
 
 // X11 keysym values (shared by IBus and Fcitx5)
 const KEY_SPACE: u32 = 0x0020;
@@ -573,5 +574,201 @@ pub unsafe extern "C" fn jaim_get_ui_state(ctx: *mut JaimContext, out: *mut Jaim
         } else {
             out.preedit = ptr::null();
         }
+    }
+}
+
+// ── Dictionary operations (global, not per-context) ─────────────────────────
+
+/// Entry info returned by jaim_dict_get_user_entries().
+#[repr(C)]
+pub struct JaimDictEntry {
+    pub reading: *const c_char,
+    pub surface: *const c_char,
+}
+
+/// Result of jaim_dict_get_user_entries().
+/// Caller must free with jaim_dict_free_entries().
+#[repr(C)]
+pub struct JaimDictEntries {
+    pub entries: *mut JaimDictEntry,
+    pub count: i32,
+}
+
+/// Add a word to the user dictionary and save to disk.
+/// Returns true on success.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jaim_dict_add_entry(
+    reading: *const c_char,
+    surface: *const c_char,
+) -> bool {
+    let reading = match unsafe { std::ffi::CStr::from_ptr(reading) }.to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => return false,
+    };
+    let surface = match unsafe { std::ffi::CStr::from_ptr(surface) }.to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => return false,
+    };
+    if reading.is_empty() || surface.is_empty() {
+        return false;
+    }
+
+    let entry = DictionaryEntry {
+        reading,
+        surface,
+        pos: PartOfSpeech::Noun,
+        frequency: 8000,
+    };
+
+    let shared = SharedCore::global();
+    let mut dict = shared.dictionary.write().unwrap();
+    dict.add_entry(entry);
+    if let Ok(path) = Dictionary::default_user_dict_path() {
+        dict.save_user_entries(&path).is_ok()
+    } else {
+        false
+    }
+}
+
+/// Delete a user dictionary entry by index. Returns true on success.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jaim_dict_delete_entry(index: i32) -> bool {
+    let shared = SharedCore::global();
+    let mut dict = shared.dictionary.write().unwrap();
+    let mut entries = dict.user_entries().to_vec();
+    let idx = index as usize;
+    if idx >= entries.len() {
+        return false;
+    }
+    entries.remove(idx);
+    dict.replace_user_entries(entries);
+    if let Ok(path) = Dictionary::default_user_dict_path() {
+        dict.save_user_entries(&path).is_ok()
+    } else {
+        false
+    }
+}
+
+/// Update a user dictionary entry by index. Empty strings mean "no change".
+/// Returns true on success.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jaim_dict_update_entry(
+    index: i32,
+    new_reading: *const c_char,
+    new_surface: *const c_char,
+) -> bool {
+    let new_reading = match unsafe { std::ffi::CStr::from_ptr(new_reading) }.to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => return false,
+    };
+    let new_surface = match unsafe { std::ffi::CStr::from_ptr(new_surface) }.to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => return false,
+    };
+
+    let shared = SharedCore::global();
+    let mut dict = shared.dictionary.write().unwrap();
+    let mut entries = dict.user_entries().to_vec();
+    let idx = index as usize;
+    if idx >= entries.len() {
+        return false;
+    }
+    if !new_reading.is_empty() {
+        entries[idx].reading = new_reading;
+    }
+    if !new_surface.is_empty() {
+        entries[idx].surface = new_surface;
+    }
+    dict.replace_user_entries(entries);
+    if let Ok(path) = Dictionary::default_user_dict_path() {
+        dict.save_user_entries(&path).is_ok()
+    } else {
+        false
+    }
+}
+
+/// Get all user dictionary entries. Caller must free with jaim_dict_free_entries().
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jaim_dict_get_user_entries() -> JaimDictEntries {
+    let shared = SharedCore::global();
+    let dict = shared.dictionary.read().unwrap();
+    let user = dict.user_entries();
+
+    if user.is_empty() {
+        return JaimDictEntries {
+            entries: ptr::null_mut(),
+            count: 0,
+        };
+    }
+
+    let count = user.len();
+    let layout = std::alloc::Layout::array::<JaimDictEntry>(count).unwrap();
+    let entries = unsafe { std::alloc::alloc(layout) as *mut JaimDictEntry };
+
+    for (i, e) in user.iter().enumerate() {
+        let reading = CString::new(e.reading.as_str()).unwrap_or_default();
+        let surface = CString::new(e.surface.as_str()).unwrap_or_default();
+        unsafe {
+            (*entries.add(i)).reading = reading.into_raw();
+            (*entries.add(i)).surface = surface.into_raw();
+        }
+    }
+
+    JaimDictEntries {
+        entries,
+        count: count as i32,
+    }
+}
+
+/// Free entries returned by jaim_dict_get_user_entries().
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jaim_dict_free_entries(result: JaimDictEntries) {
+    if result.entries.is_null() {
+        return;
+    }
+    for i in 0..result.count as usize {
+        unsafe {
+            let entry = &*result.entries.add(i);
+            if !entry.reading.is_null() {
+                drop(CString::from_raw(entry.reading as *mut c_char));
+            }
+            if !entry.surface.is_null() {
+                drop(CString::from_raw(entry.surface as *mut c_char));
+            }
+        }
+    }
+    let layout = std::alloc::Layout::array::<JaimDictEntry>(result.count as usize).unwrap();
+    unsafe { std::alloc::dealloc(result.entries as *mut u8, layout) };
+}
+
+/// Export dictionary to a file path. Returns true on success.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jaim_dict_export(path: *const c_char) -> bool {
+    let path = match unsafe { std::ffi::CStr::from_ptr(path) }.to_str() {
+        Ok(s) => std::path::PathBuf::from(s),
+        Err(_) => return false,
+    };
+    let shared = SharedCore::global();
+    let dict = shared.dictionary.read().unwrap();
+    dict.export(&path).is_ok()
+}
+
+/// Import dictionary from a file path. Returns number of entries imported, or -1 on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jaim_dict_import(path: *const c_char) -> i32 {
+    let path = match unsafe { std::ffi::CStr::from_ptr(path) }.to_str() {
+        Ok(s) => std::path::PathBuf::from(s),
+        Err(_) => return -1,
+    };
+    let shared = SharedCore::global();
+    let mut dict = shared.dictionary.write().unwrap();
+    match dict.import(&path) {
+        Ok(count) => {
+            if let Ok(save_path) = Dictionary::default_user_dict_path() {
+                let _ = dict.save_user_entries(&save_path);
+            }
+            count as i32
+        }
+        Err(_) => -1,
     }
 }
