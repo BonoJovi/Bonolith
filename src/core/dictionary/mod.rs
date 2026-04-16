@@ -323,6 +323,32 @@ impl Dictionary {
             });
         }
         self.load_symbol_entries();
+        self.load_emoji_entries();
+    }
+
+    /// Load emoji entries from the embedded TSV data.
+    /// Emoji are added with low frequency so they appear after regular candidates.
+    fn load_emoji_entries(&mut self) {
+        const EMOJI_TSV: &str = include_str!("../../../data/emoji.tsv");
+        const EMOJI_BASE_FREQ: u32 = 500;
+
+        for line in EMOJI_TSV.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((reading, emojis)) = line.split_once('\t') else {
+                continue;
+            };
+            for (i, emoji) in emojis.split_whitespace().enumerate() {
+                self.add_entry(DictionaryEntry {
+                    reading: reading.to_string(),
+                    surface: emoji.to_string(),
+                    pos: PartOfSpeech::Other,
+                    frequency: EMOJI_BASE_FREQ.saturating_sub(i as u32 * 10),
+                });
+            }
+        }
     }
 
     /// Load symbol/special character entries not found in IPADIC.
@@ -420,6 +446,23 @@ mod tests {
         let results = dict.lookup("きょう");
         assert!(!results.is_empty());
         assert_eq!(results[0].surface, "今日"); // highest frequency
+    }
+
+    #[test]
+    fn lookup_emoji() {
+        let dict = Dictionary::new();
+
+        let results = dict.lookup("えがお");
+        let surfaces: Vec<&str> = results.iter().map(|e| e.surface.as_str()).collect();
+        assert!(surfaces.contains(&"😊"), "Expected 😊 in results for えがお: {:?}", surfaces);
+
+        let results = dict.lookup("ねこ");
+        let surfaces: Vec<&str> = results.iter().map(|e| e.surface.as_str()).collect();
+        assert!(surfaces.contains(&"🐱"), "Expected 🐱 in results for ねこ: {:?}", surfaces);
+
+        // Emoji should have lower frequency than regular words
+        let emoji = results.iter().find(|e| e.surface == "🐱").unwrap();
+        assert!(emoji.frequency <= 500);
     }
 
     #[test]
