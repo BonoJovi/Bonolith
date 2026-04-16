@@ -98,6 +98,18 @@ impl Trie {
         results
     }
 
+    /// Remove an entry index from the node for the given reading.
+    pub fn remove(&mut self, reading: &str, entry_idx: usize) {
+        let mut node = &mut self.root;
+        for ch in reading.chars() {
+            match node.children.get_mut(&ch) {
+                Some(child) => node = child,
+                None => return,
+            }
+        }
+        node.entry_indices.retain(|&idx| idx != entry_idx);
+    }
+
     fn collect_all(node: &TrieNode, results: &mut Vec<usize>) {
         results.extend_from_slice(&node.entry_indices);
         for child in node.children.values() {
