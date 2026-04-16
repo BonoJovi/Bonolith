@@ -69,6 +69,40 @@ int32_t jaim_selected_index(JaimContext *ctx);
 
 void jaim_reset(JaimContext *ctx);
 
+// ── Dictionary operations (global, not per-context) ─────────────────────
+
+typedef struct {
+    const char *reading;
+    const char *surface;
+} JaimDictEntry;
+
+typedef struct {
+    JaimDictEntry *entries;
+    int32_t count;
+} JaimDictEntries;
+
+/// Add a word to the user dictionary and save. Returns true on success.
+bool jaim_dict_add_entry(const char *reading, const char *surface);
+
+/// Delete a user dictionary entry by index. Returns true on success.
+bool jaim_dict_delete_entry(int32_t index);
+
+/// Update a user dictionary entry by index. Empty strings mean "no change".
+bool jaim_dict_update_entry(int32_t index, const char *new_reading,
+                            const char *new_surface);
+
+/// Get all user dictionary entries. Caller must free with jaim_dict_free_entries().
+JaimDictEntries jaim_dict_get_user_entries(void);
+
+/// Free entries returned by jaim_dict_get_user_entries().
+void jaim_dict_free_entries(JaimDictEntries result);
+
+/// Export dictionary to a file path. Returns true on success.
+bool jaim_dict_export(const char *path);
+
+/// Import dictionary from a file path. Returns count imported, or -1 on error.
+int32_t jaim_dict_import(const char *path);
+
 #ifdef __cplusplus
 }
 #endif

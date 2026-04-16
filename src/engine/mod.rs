@@ -8,7 +8,7 @@
 /// Flow: keystroke → romaji → kana → dictionary segment → grammar score
 ///       → LLM rerank → candidate list → user selects → commit
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 
 use crate::core::{
@@ -71,7 +71,7 @@ impl ConversionState {
 /// Shared heavy resources (dictionary, grammar, LLM, user scorer).
 /// Initialized once per process and shared across all InputContexts.
 pub struct SharedCore {
-    pub dictionary: Dictionary,
+    pub dictionary: RwLock<Dictionary>,
     pub grammar: GrammarEngine,
     pub llm: Mutex<LlmEngine>,
     pub user_scorer: Mutex<UserScorer>,
@@ -108,7 +108,7 @@ impl SharedCore {
                 }
 
                 Arc::new(SharedCore {
-                    dictionary,
+                    dictionary: RwLock::new(dictionary),
                     grammar: GrammarEngine::new(),
                     llm: Mutex::new(LlmEngine::new()),
                     user_scorer: Mutex::new(user_scorer),
@@ -176,23 +176,30 @@ impl ConversionEngine {
             return None;
         }
 
-        let user_scorer = self.shared.user_scorer.lock().unwrap();
-        let segments = self.shared.dictionary.segment_with_boost(&kana, |reading, entries| {
-            // Don't boost single-char segments — learned single-kana scores (の, が, い...)
-            // are very high and distort segmentation by encouraging excessive splitting.
-            if reading.chars().count() <= 1 {
-                return 0.0;
-            }
-            entries
-                .iter()
-                .map(|e| user_scorer.score(reading, &e.surface))
-                .fold(0.0_f64, f64::max)
-                * 10.0 // Scale boost to be significant vs segment cost
-        });
-        drop(user_scorer);
+        let dict = self.shared.dictionary.read().unwrap();
+        let segments = {
+            let user_scorer = self.shared.user_scorer.lock().unwrap();
+            dict.segment_with_boost(&kana, |reading, entries| {
+                // Don't boost single-char segments — learned single-kana scores (の, が, い...)
+                // are very high and distort segmentation by encouraging excessive splitting.
+                if reading.chars().count() <= 1 {
+                    return 0.0;
+                }
+                entries
+                    .iter()
+                    .map(|e| user_scorer.score(reading, &e.surface))
+                    .fold(0.0_f64, f64::max)
+                    * 10.0 // Scale boost to be significant vs segment cost
+            })
+            // user_scorer lock released here
+        };
         if segments.is_empty() {
             return None;
         }
+
+        // Apply AI segmentation filter: try alternative segmentations and pick the best
+        let segments = self.filter_segmentation(segments, &kana, &dict);
+        drop(dict);
 
         let segment_states = self.build_segment_states(&segments);
         self.conversion = Some(ConversionState {
@@ -399,7 +406,7 @@ impl ConversionEngine {
             return Vec::new();
         }
 
-        let segments = self.shared.dictionary.segment(&kana);
+        let segments = self.shared.dictionary.read().unwrap().segment(&kana);
         if segments.is_empty() {
             return Vec::new();
         }
@@ -757,13 +764,276 @@ impl ConversionEngine {
         0.0
     }
 
+    /// AI segmentation filter: generate alternative segmentations and pick the best.
+    ///
+    /// Uses a two-stage scoring approach:
+    /// 1. Heuristic score based on dictionary frequency and segment quality (always available)
+    /// 2. LLM score for naturalness check (when available, used as tiebreaker)
+    fn filter_segmentation(
+        &self,
+        base_segments: Vec<Segment>,
+        kana: &str,
+        dict: &Dictionary,
+    ) -> Vec<Segment> {
+        // Skip if too few segments to have meaningful alternatives
+        if base_segments.len() <= 1 {
+            return base_segments;
+        }
+
+        let alternatives = self.generate_alternative_segmentations(&base_segments, kana, dict);
+        if alternatives.len() <= 1 {
+            return base_segments;
+        }
+
+        // Score each alternative with heuristic
+        let mut scored: Vec<(usize, f64)> = alternatives
+            .iter()
+            .enumerate()
+            .map(|(i, alt)| (i, Self::score_segmentation_heuristic(alt)))
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // If the top heuristic candidate differs from base, try LLM as tiebreaker
+        let heuristic_best = scored[0].0;
+        if heuristic_best != 0 {
+            // Try LLM scoring on the top 2 candidates for final decision
+            if let Ok(llm) = self.shared.llm.try_lock() {
+                let base_llm = Self::score_segmentation_llm(&alternatives[0], &llm);
+                let best_llm = Self::score_segmentation_llm(&alternatives[heuristic_best], &llm);
+                log::debug!(
+                    "Segmentation filter LLM: base={:.3} '{}' vs best={:.3} '{}'",
+                    base_llm,
+                    Self::compose_top_candidates(&alternatives[0]),
+                    best_llm,
+                    Self::compose_top_candidates(&alternatives[heuristic_best]),
+                );
+                // Use LLM result only if it strongly disagrees (base scores much higher)
+                if base_llm > best_llm + 0.15 {
+                    log::info!("Segmentation filter: LLM overrode heuristic, keeping base");
+                    return alternatives.into_iter().next().unwrap();
+                }
+            }
+            log::info!(
+                "Segmentation filter: changed from '{}' to '{}'",
+                Self::compose_top_candidates(&alternatives[0]),
+                Self::compose_top_candidates(&alternatives[heuristic_best]),
+            );
+        }
+
+        for (i, score) in &scored {
+            log::debug!(
+                "Segmentation filter: alt[{}] h_score={:.3} text='{}'",
+                i,
+                score,
+                Self::compose_top_candidates(&alternatives[*i]),
+            );
+        }
+
+        alternatives.into_iter().nth(scored[0].0).unwrap()
+    }
+
+    /// Generate alternative segmentations by merging adjacent segment pairs.
+    /// Returns a list where the first entry is always the original segmentation.
+    fn generate_alternative_segmentations(
+        &self,
+        base: &[Segment],
+        _kana: &str,
+        dict: &Dictionary,
+    ) -> Vec<Vec<Segment>> {
+        let mut alternatives: Vec<Vec<Segment>> = vec![base.to_vec()];
+
+        const MAX_ALTERNATIVES: usize = 8;
+
+        // Find all valid merge positions (where merging produces a dictionary word)
+        let mut valid_merges: Vec<usize> = Vec::new();
+        for i in 0..base.len().saturating_sub(1) {
+            let merged_reading = format!("{}{}", base[i].reading, base[i + 1].reading);
+            if !dict.lookup(&merged_reading).is_empty() {
+                valid_merges.push(i);
+            }
+        }
+
+        // Try each single merge
+        for &i in &valid_merges {
+            if alternatives.len() >= MAX_ALTERNATIVES {
+                break;
+            }
+            if let Some(alt) = Self::build_merged_segmentation(base, &[i], dict) {
+                alternatives.push(alt);
+            }
+        }
+
+        // Try greedy multi-merge: apply all non-overlapping merges left-to-right.
+        // Two merges at positions i and j overlap if j == i+1 (both consume segment i+1).
+        if valid_merges.len() >= 2 {
+            let mut multi_merges: Vec<usize> = Vec::new();
+            for &i in &valid_merges {
+                // Skip if this position overlaps with the previous merge
+                if let Some(&last) = multi_merges.last() {
+                    if i <= last + 1 {
+                        continue;
+                    }
+                }
+                multi_merges.push(i);
+            }
+            if multi_merges.len() >= 2 && alternatives.len() < MAX_ALTERNATIVES {
+                if let Some(alt) = Self::build_merged_segmentation(base, &multi_merges, dict) {
+                    alternatives.push(alt);
+                }
+            }
+        }
+
+        // Try splitting segments that are 4+ chars (may contain two words)
+        for i in 0..base.len() {
+            if alternatives.len() >= MAX_ALTERNATIVES {
+                break;
+            }
+            let reading_chars: Vec<char> = base[i].reading.chars().collect();
+            if reading_chars.len() < 4 {
+                continue;
+            }
+
+            // Try splitting at each internal position (prefer middle splits)
+            let mid = reading_chars.len() / 2;
+            let mut split_positions: Vec<usize> = (2..reading_chars.len() - 1).collect();
+            split_positions.sort_by_key(|&p| (p as i32 - mid as i32).unsigned_abs());
+
+            for p in split_positions {
+                if alternatives.len() >= MAX_ALTERNATIVES {
+                    break;
+                }
+                let left_reading: String = reading_chars[..p].iter().collect();
+                let right_reading: String = reading_chars[p..].iter().collect();
+
+                let left_entries = dict.lookup(&left_reading);
+                let right_entries = dict.lookup(&right_reading);
+                if left_entries.is_empty() || right_entries.is_empty() {
+                    continue;
+                }
+
+                let mut alt: Vec<Segment> = Vec::with_capacity(base.len() + 1);
+                alt.extend_from_slice(&base[..i]);
+                alt.push(Segment {
+                    reading: left_reading,
+                    start: base[i].start,
+                    len: p,
+                    candidates: left_entries.into_iter().cloned().collect(),
+                });
+                alt.push(Segment {
+                    reading: right_reading,
+                    start: base[i].start + p,
+                    len: reading_chars.len() - p,
+                    candidates: right_entries.into_iter().cloned().collect(),
+                });
+                if i + 1 < base.len() {
+                    alt.extend_from_slice(&base[i + 1..]);
+                }
+                alternatives.push(alt);
+            }
+        }
+
+        alternatives
+    }
+
+    /// Build a segmentation by applying merges at the given positions.
+    /// Positions must be sorted and non-overlapping.
+    fn build_merged_segmentation(
+        base: &[Segment],
+        merge_positions: &[usize],
+        dict: &Dictionary,
+    ) -> Option<Vec<Segment>> {
+        let merge_set: std::collections::HashSet<usize> = merge_positions.iter().copied().collect();
+        let mut alt: Vec<Segment> = Vec::new();
+        let mut i = 0;
+        while i < base.len() {
+            if merge_set.contains(&i) && i + 1 < base.len() {
+                let merged_reading = format!("{}{}", base[i].reading, base[i + 1].reading);
+                let entries = dict.lookup(&merged_reading);
+                if entries.is_empty() {
+                    return None;
+                }
+                alt.push(Segment {
+                    reading: merged_reading,
+                    start: base[i].start,
+                    len: base[i].len + base[i + 1].len,
+                    candidates: entries.into_iter().cloned().collect(),
+                });
+                i += 2; // skip merged pair
+            } else {
+                alt.push(base[i].clone());
+                i += 1;
+            }
+        }
+        Some(alt)
+    }
+
+    /// Heuristic score for segmentation quality.
+    /// Prefers: fewer segments, higher word frequencies, longer matched words.
+    fn score_segmentation_heuristic(segments: &[Segment]) -> f64 {
+        if segments.is_empty() {
+            return 0.0;
+        }
+
+        let mut score = 0.0;
+        let total_chars: usize = segments.iter().map(|s| s.len).sum();
+
+        for seg in segments {
+            let top_freq = seg
+                .candidates
+                .first()
+                .map(|c| c.frequency as f64)
+                .unwrap_or(100.0); // low default for unknown segments
+
+            // Weighted frequency: longer segments contribute more (reward compound recognition)
+            let weight = seg.len as f64 / total_chars as f64;
+            score += weight * top_freq.ln();
+
+            // Penalty for single-char non-particle segments (likely fragmented)
+            if seg.len == 1 {
+                let is_particle = seg
+                    .candidates
+                    .first()
+                    .map(|c| matches!(c.pos, PartOfSpeech::Particle | PartOfSpeech::Auxiliary))
+                    .unwrap_or(false);
+                if !is_particle {
+                    score -= 1.0;
+                }
+            }
+        }
+
+        // Bonus for fewer segments (prefer cohesive segmentation)
+        score -= segments.len() as f64 * 0.5;
+
+        score
+    }
+
+    /// Score a segmentation using LLM (naturalness check).
+    fn score_segmentation_llm(segments: &[Segment], llm: &LlmEngine) -> f64 {
+        let text = Self::compose_top_candidates(segments);
+        llm.score_with_context(llm.context(), &text)
+    }
+
+    /// Compose text from the top candidate of each segment.
+    fn compose_top_candidates(segments: &[Segment]) -> String {
+        segments
+            .iter()
+            .map(|seg| {
+                seg.candidates
+                    .first()
+                    .map(|c| c.surface.as_str())
+                    .unwrap_or(&seg.reading)
+            })
+            .collect()
+    }
+
     /// Re-lookup candidates for a segment after its reading changed.
     fn relookup_segment(&mut self, idx: usize) {
         let reading = match self.conversion.as_ref() {
             Some(state) => state.segments[idx].reading.clone(),
             None => return,
         };
-        let mut entries = self.shared.dictionary.lookup(&reading);
+        let dict = self.shared.dictionary.read().unwrap();
+        let mut entries = dict.lookup(&reading);
         let user_scorer = self.shared.user_scorer.lock().unwrap();
         entries.sort_by(|a, b| {
             let score_a = Self::effective_score_with(&user_scorer, &reading, a);
@@ -1061,6 +1331,77 @@ mod tests {
         let ranges = state.segment_char_ranges();
         assert_eq!(ranges[0].0, 0);
         assert!(ranges.last().unwrap().1 > 0);
+    }
+
+    #[test]
+    fn segmentation_filter_ryoukai_shimashita() {
+        let mut engine = ConversionEngine::new();
+        // Type "ryoukaisimashita" → りょうかいしました
+        for ch in "ryoukaisimashita".chars() {
+            engine.process_key(ch);
+        }
+        let state = engine.start_conversion().unwrap();
+        let readings: Vec<&str> = state.segments.iter().map(|s| s.reading.as_str()).collect();
+        // The filter (even with MockScorer) should keep りょうかい as one segment
+        assert!(
+            readings.contains(&"りょうかい"),
+            "Expected 'りょうかい' as a segment, got: {:?}",
+            readings,
+        );
+    }
+
+    #[test]
+    fn segmentation_filter_multi_merge() {
+        // Verify that the filter generates multi-merge alternatives
+        // (merging non-overlapping segment pairs simultaneously)
+        let engine = ConversionEngine::new();
+        let dict = engine.shared.dictionary.read().unwrap();
+
+        let base = vec![
+            Segment {
+                reading: "りょ".to_string(),
+                start: 0,
+                len: 2,
+                candidates: dict.lookup("りょ").into_iter().cloned().collect(),
+            },
+            Segment {
+                reading: "うかい".to_string(),
+                start: 2,
+                len: 3,
+                candidates: dict.lookup("うかい").into_iter().cloned().collect(),
+            },
+            Segment {
+                reading: "しま".to_string(),
+                start: 5,
+                len: 2,
+                candidates: dict.lookup("しま").into_iter().cloned().collect(),
+            },
+            Segment {
+                reading: "した".to_string(),
+                start: 7,
+                len: 2,
+                candidates: dict.lookup("した").into_iter().cloned().collect(),
+            },
+        ];
+
+        let alts = engine.generate_alternative_segmentations(&base, "りょうかいしました", &dict);
+        let has_correct = alts.iter().any(|alt| {
+            let readings: Vec<&str> = alt.iter().map(|s| s.reading.as_str()).collect();
+            readings == vec!["りょうかい", "しました"]
+        });
+        assert!(has_correct, "Expected multi-merge alternative りょうかい+しました");
+    }
+
+    #[test]
+    fn segmentation_filter_single_segment_passthrough() {
+        let mut engine = ConversionEngine::new();
+        for ch in "kyou".chars() {
+            engine.process_key(ch);
+        }
+        let state = engine.start_conversion().unwrap();
+        // Single word — filter should pass through without change
+        assert_eq!(state.segments.len(), 1);
+        assert_eq!(state.segments[0].reading, "きょう");
     }
 
     #[test]

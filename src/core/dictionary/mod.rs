@@ -216,6 +216,26 @@ impl Dictionary {
             .collect()
     }
 
+    /// Return a slice of user-added entries.
+    pub fn user_entries(&self) -> &[DictionaryEntry] {
+        &self.entries[self.user_start..]
+    }
+
+    /// Replace all user entries. Removes old user entries from the trie
+    /// and adds new ones.
+    pub fn replace_user_entries(&mut self, new_entries: Vec<DictionaryEntry>) {
+        // Remove old user entries from trie
+        for idx in self.user_start..self.entries.len() {
+            self.trie.remove(&self.entries[idx].reading, idx);
+        }
+        // Truncate to builtin only
+        self.entries.truncate(self.user_start);
+        // Add new entries
+        for entry in new_entries {
+            self.add_entry(entry);
+        }
+    }
+
     /// Total number of entries in the dictionary.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -303,6 +323,32 @@ impl Dictionary {
             });
         }
         self.load_symbol_entries();
+        self.load_emoji_entries();
+    }
+
+    /// Load emoji entries from the embedded TSV data.
+    /// Emoji are added with low frequency so they appear after regular candidates.
+    fn load_emoji_entries(&mut self) {
+        const EMOJI_TSV: &str = include_str!("../../../data/emoji.tsv");
+        const EMOJI_BASE_FREQ: u32 = 500;
+
+        for line in EMOJI_TSV.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((reading, emojis)) = line.split_once('\t') else {
+                continue;
+            };
+            for (i, emoji) in emojis.split_whitespace().enumerate() {
+                self.add_entry(DictionaryEntry {
+                    reading: reading.to_string(),
+                    surface: emoji.to_string(),
+                    pos: PartOfSpeech::Other,
+                    frequency: EMOJI_BASE_FREQ.saturating_sub(i as u32 * 10),
+                });
+            }
+        }
     }
 
     /// Load symbol/special character entries not found in IPADIC.
@@ -400,6 +446,23 @@ mod tests {
         let results = dict.lookup("きょう");
         assert!(!results.is_empty());
         assert_eq!(results[0].surface, "今日"); // highest frequency
+    }
+
+    #[test]
+    fn lookup_emoji() {
+        let dict = Dictionary::new();
+
+        let results = dict.lookup("えがお");
+        let surfaces: Vec<&str> = results.iter().map(|e| e.surface.as_str()).collect();
+        assert!(surfaces.contains(&"😊"), "Expected 😊 in results for えがお: {:?}", surfaces);
+
+        let results = dict.lookup("ねこ");
+        let surfaces: Vec<&str> = results.iter().map(|e| e.surface.as_str()).collect();
+        assert!(surfaces.contains(&"🐱"), "Expected 🐱 in results for ねこ: {:?}", surfaces);
+
+        // Emoji should have lower frequency than regular words
+        let emoji = results.iter().find(|e| e.surface == "🐱").unwrap();
+        assert!(emoji.frequency <= 500);
     }
 
     #[test]
@@ -562,6 +625,33 @@ mod tests {
         let mut dict = Dictionary::new();
         let result = dict.load_user_entries(Path::new("/tmp/jaim_nonexistent_dict.json"));
         assert_eq!(result.unwrap(), 0);
+    }
+
+    #[test]
+    fn segmentation_common_words() {
+        let dict = Dictionary::new();
+
+        // Common compound words must not be split into short fragments,
+        // both standalone and in-context (with particles/verbs following)
+        let test_cases: &[(&str, &[&str])] = &[
+            ("りょうかい", &["りょうかい"]),
+            ("かんりょう", &["かんりょう"]),
+            ("じゅんばん", &["じゅんばん"]),
+            ("しょうがい", &["しょうがい"]),
+            ("りょうかいしました", &["りょうかい", "しました"]),
+            ("りょうかいです", &["りょうかい", "です"]),
+            ("かんりょうした", &["かんりょう", "した"]),
+            ("かんりょうです", &["かんりょう", "です"]),
+            ("じゅんばんに", &["じゅんばん", "に"]),
+            ("じゅんばんです", &["じゅんばん", "です"]),
+            ("しょうがいがある", &["しょうがい", "が", "ある"]),
+            ("しょうがいです", &["しょうがい", "です"]),
+        ];
+        for (input, expected) in test_cases {
+            let segments = dict.segment(input);
+            let words: Vec<&str> = segments.iter().map(|s| s.reading.as_str()).collect();
+            assert_eq!(&words, expected, "Failed for input: {}", input);
+        }
     }
 
     #[test]
