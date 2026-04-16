@@ -486,6 +486,11 @@ fn extra_entries() -> Vec<Entry> {
         ("ご", "誤", "Noun", 5000),
         // Common words missing from IPADIC
         ("なんかい", "何回", "Noun", 6000),
+        ("ほしがる", "欲しがる", "Verb", 5500),
+        ("ほしがり", "欲しがり", "Noun", 5000),
+        ("ほしがって", "欲しがって", "Verb", 5500),
+        ("ほしがった", "欲しがった", "Verb", 5500),
+        ("ほしがらない", "欲しがらない", "Verb", 5500),
         // Frequency overrides: common words that lose to competing splits
         ("りょうかい", "了解", "Noun", 7000),
         ("かんりょう", "完了", "Noun", 6000),
