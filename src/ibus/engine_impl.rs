@@ -9,8 +9,8 @@ use log::{debug, info, warn};
 use zbus::object_server::SignalEmitter;
 use zbus::{interface, zvariant};
 
-use jaim::core::dictionary::Dictionary;
-use jaim::engine::{ConversionEngine, ConversionState};
+use jaim::core::dictionary::{Dictionary, DictionaryEntry, PartOfSpeech};
+use jaim::engine::{ConversionEngine, ConversionState, SharedCore};
 
 use super::config::{CompiledToggleKey, JaimConfig};
 use super::keymap::*;
@@ -426,6 +426,16 @@ impl JaimEngine {
             "jaim-import" => {
                 std::thread::spawn(|| {
                     Self::run_dict_import();
+                });
+            }
+            "jaim-register-word" => {
+                std::thread::spawn(|| {
+                    Self::run_word_register();
+                });
+            }
+            "jaim-manage-dict" => {
+                std::thread::spawn(|| {
+                    Self::run_manage_dict();
                 });
             }
             _ => {}
@@ -853,16 +863,26 @@ impl JaimEngine {
         // prop_type: 0=normal, 1=toggle, 2=radio, 3=separator, 4=menu
         let export_prop = ibus_property(
             "jaim-export", 0,
-            "Export Dictionary...", "",
-            "Export dictionary to a JSON file",
+            "辞書エクスポート...", "",
+            "辞書をJSONファイルにエクスポート",
         );
         let import_prop = ibus_property(
             "jaim-import", 0,
-            "Import Dictionary...", "",
-            "Import dictionary from a JSON file",
+            "辞書インポート...", "",
+            "JSONファイルから辞書をインポート",
+        );
+        let register_prop = ibus_property(
+            "jaim-register-word", 0,
+            "単語登録...", "",
+            "ユーザー辞書に新しい単語を登録",
+        );
+        let manage_prop = ibus_property(
+            "jaim-manage-dict", 0,
+            "辞書管理...", "",
+            "ユーザー辞書の編集・削除",
         );
 
-        let prop_list = ibus_prop_list(vec![export_prop, import_prop]);
+        let prop_list = ibus_prop_list(vec![register_prop, manage_prop, export_prop, import_prop]);
 
         Self::register_properties(emitter, prop_list).await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
@@ -873,7 +893,7 @@ impl JaimEngine {
     fn run_dict_export() {
         let output = std::process::Command::new("zenity")
             .args(["--file-selection", "--save", "--confirm-overwrite",
-                   "--title=JaIM: Export Dictionary",
+                   "--title=JaIM: 辞書エクスポート",
                    "--file-filter=JSON files (*.json) | *.json",
                    "--filename=jaim_dict.json"])
             .output();
@@ -892,14 +912,14 @@ impl JaimEngine {
                         info!("JaIM: Dictionary exported to {}", path);
                         let _ = std::process::Command::new("zenity")
                             .args(["--info", "--title=JaIM",
-                                   &format!("--text=Dictionary exported to {}", path)])
+                                   &format!("--text=辞書をエクスポートしました: {}", path)])
                             .spawn();
                     }
                     Err(e) => {
                         warn!("JaIM: Export failed: {}", e);
                         let _ = std::process::Command::new("zenity")
                             .args(["--error", "--title=JaIM",
-                                   &format!("--text=Export failed: {}", e)])
+                                   &format!("--text=エクスポートに失敗しました: {}", e)])
                             .spawn();
                     }
                 }
@@ -912,7 +932,7 @@ impl JaimEngine {
     fn run_dict_import() {
         let output = std::process::Command::new("zenity")
             .args(["--file-selection",
-                   "--title=JaIM: Import Dictionary",
+                   "--title=JaIM: 辞書インポート",
                    "--file-filter=JSON files (*.json) | *.json"])
             .output();
 
@@ -931,27 +951,247 @@ impl JaimEngine {
                             warn!("JaIM: Failed to save after import: {}", e);
                             let _ = std::process::Command::new("zenity")
                                 .args(["--error", "--title=JaIM",
-                                       &format!("--text=Failed to save: {}", e)])
+                                       &format!("--text=保存に失敗しました: {}", e)])
                                 .spawn();
                             return;
                         }
                         info!("JaIM: Imported {} entries from {}", added, path);
                         let _ = std::process::Command::new("zenity")
                             .args(["--info", "--title=JaIM",
-                                   &format!("--text=Imported {} new entries from {}", added, path)])
+                                   &format!("--text={}件の単語をインポートしました ({})", added, path)])
                             .spawn();
                     }
                     Err(e) => {
                         warn!("JaIM: Import failed: {}", e);
                         let _ = std::process::Command::new("zenity")
                             .args(["--error", "--title=JaIM",
-                                   &format!("--text=Import failed: {}", e)])
+                                   &format!("--text=インポートに失敗しました: {}", e)])
                             .spawn();
                     }
                 }
             }
             _ => { /* user cancelled or zenity not available */ }
         }
+    }
+
+    /// Register a new word to user dictionary via zenity forms dialog.
+    fn run_word_register() {
+        // zenity --forms to collect reading and surface
+        let output = std::process::Command::new("zenity")
+            .args([
+                "--forms",
+                "--title=JaIM: 単語登録",
+                "--text=ユーザー辞書に新しい単語を登録します",
+                "--add-entry=よみ (ひらがな)",
+                "--add-entry=単語 (漢字・カタカナなど)",
+                "--separator=|",
+            ])
+            .output();
+
+        match output {
+            Ok(out) if out.status.success() => {
+                let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let parts: Vec<&str> = text.split('|').collect();
+                if parts.len() < 2 {
+                    return;
+                }
+                let reading = parts[0].trim();
+                let surface = parts[1].trim();
+                if reading.is_empty() || surface.is_empty() {
+                    let _ = std::process::Command::new("zenity")
+                        .args(["--error", "--title=JaIM",
+                               "--text=よみと単語の両方を入力してください"])
+                        .spawn();
+                    return;
+                }
+
+                let entry = DictionaryEntry {
+                    reading: reading.to_string(),
+                    surface: surface.to_string(),
+                    pos: PartOfSpeech::Noun,
+                    frequency: 8000,
+                };
+
+                // Add to live dictionary via SharedCore
+                let shared = SharedCore::global();
+                {
+                    let mut dict = shared.dictionary.write().unwrap();
+                    dict.add_entry(entry);
+                    if let Ok(path) = Dictionary::default_user_dict_path() {
+                        if let Err(e) = dict.save_user_entries(&path) {
+                            warn!("JaIM: Failed to save user dict: {}", e);
+                            let _ = std::process::Command::new("zenity")
+                                .args(["--error", "--title=JaIM",
+                                       &format!("--text=保存に失敗しました: {}", e)])
+                                .spawn();
+                            return;
+                        }
+                    }
+                }
+
+                info!("JaIM: Registered word: {} → {}", reading, surface);
+                let _ = std::process::Command::new("zenity")
+                    .args(["--info", "--title=JaIM",
+                           &format!("--text=登録しました: {} → {}", reading, surface)])
+                    .spawn();
+            }
+            _ => { /* user cancelled or zenity not available */ }
+        }
+    }
+
+    /// Manage user dictionary: list entries, then choose edit or delete.
+    fn run_manage_dict() {
+        let shared = SharedCore::global();
+        let user_entries: Vec<DictionaryEntry> = {
+            let dict = shared.dictionary.read().unwrap();
+            dict.user_entries().to_vec()
+        };
+
+        if user_entries.is_empty() {
+            let _ = std::process::Command::new("zenity")
+                .args(["--info", "--title=JaIM",
+                       "--text=ユーザー辞書にエントリがありません"])
+                .spawn();
+            return;
+        }
+
+        // Step 1: Show list and let user select an entry
+        let mut args = vec![
+            "--list".to_string(),
+            "--title=JaIM: 辞書管理".to_string(),
+            "--text=エントリを選択してOKを押してください".to_string(),
+            "--column=#".to_string(),
+            "--column=よみ".to_string(),
+            "--column=単語".to_string(),
+            "--print-column=1".to_string(),
+            "--width=500".to_string(),
+            "--height=400".to_string(),
+        ];
+        for (i, entry) in user_entries.iter().enumerate() {
+            args.push(format!("{}", i));
+            args.push(entry.reading.clone());
+            args.push(entry.surface.clone());
+        }
+
+        let output = std::process::Command::new("zenity")
+            .args(&args)
+            .output();
+
+        let idx: usize = match output {
+            Ok(out) if out.status.success() => {
+                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                match stdout.parse() {
+                    Ok(i) if i < user_entries.len() => i,
+                    _ => return,
+                }
+            }
+            _ => return,
+        };
+
+        // Step 2: Ask what to do with the selected entry
+        let selected = &user_entries[idx];
+        let action = std::process::Command::new("zenity")
+            .args([
+                "--list", "--radiolist",
+                "--title=JaIM: 操作を選択",
+                &format!("--text=選択中: {} → {}", selected.reading, selected.surface),
+                "--column=", "--column=操作",
+                "TRUE", "編集",
+                "FALSE", "削除",
+            ])
+            .output();
+
+        match action {
+            Ok(out) if out.status.success() => {
+                let choice = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                match choice.as_str() {
+                    "編集" => Self::edit_user_entry(user_entries, idx),
+                    "削除" => Self::delete_user_entry(user_entries, idx),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Delete a user dictionary entry by index.
+    fn delete_user_entry(mut entries: Vec<DictionaryEntry>, idx: usize) {
+        let entry = &entries[idx];
+        let confirm = std::process::Command::new("zenity")
+            .args([
+                "--question", "--title=JaIM: 削除の確認",
+                &format!("--text=「{}」→「{}」を削除しますか？", entry.reading, entry.surface),
+            ])
+            .status();
+
+        match confirm {
+            Ok(s) if s.success() => {
+                entries.remove(idx);
+                Self::save_and_apply_user_entries(entries);
+            }
+            _ => {}
+        }
+    }
+
+    /// Edit a user dictionary entry by index.
+    fn edit_user_entry(mut entries: Vec<DictionaryEntry>, idx: usize) {
+        let old = &entries[idx];
+
+        let output = std::process::Command::new("zenity")
+            .args([
+                "--forms",
+                "--title=JaIM: 単語の編集",
+                &format!("--text=現在のよみ: {}\n現在の単語: {}\n\n変更する項目のみ入力してください (空欄は変更なし)",
+                    old.reading, old.surface),
+                "--add-entry=よみ (ひらがな)",
+                "--add-entry=単語 (漢字・カタカナなど)",
+                "--separator=|",
+            ])
+            .output();
+
+        match output {
+            Ok(out) if out.status.success() => {
+                let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let parts: Vec<&str> = text.split('|').collect();
+                if parts.len() < 2 {
+                    return;
+                }
+                let new_reading = parts[0].trim();
+                let new_surface = parts[1].trim();
+                if new_reading.is_empty() && new_surface.is_empty() {
+                    return;
+                }
+                if !new_reading.is_empty() {
+                    entries[idx].reading = new_reading.to_string();
+                }
+                if !new_surface.is_empty() {
+                    entries[idx].surface = new_surface.to_string();
+                }
+                Self::save_and_apply_user_entries(entries);
+            }
+            _ => {}
+        }
+    }
+
+    /// Save modified user entries to file and apply to live dictionary.
+    fn save_and_apply_user_entries(entries: Vec<DictionaryEntry>) {
+        let shared = SharedCore::global();
+        let mut dict = shared.dictionary.write().unwrap();
+        dict.replace_user_entries(entries);
+        if let Ok(path) = Dictionary::default_user_dict_path() {
+            if let Err(e) = dict.save_user_entries(&path) {
+                warn!("JaIM: Failed to save user dict: {}", e);
+                let _ = std::process::Command::new("zenity")
+                    .args(["--error", "--title=JaIM",
+                           &format!("--text=保存に失敗しました: {}", e)])
+                    .spawn();
+                return;
+            }
+        }
+        let _ = std::process::Command::new("zenity")
+            .args(["--info", "--title=JaIM",
+                   "--text=辞書を更新しました"])
+            .spawn();
     }
 
     async fn handle_backspace(
