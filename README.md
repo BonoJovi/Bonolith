@@ -162,14 +162,17 @@ curl http://127.0.0.1:8080/health
 ### IBus
 
 ```bash
-# バイナリをインストール
+# IBus デーモンを停止してバイナリをインストール
+sudo pkill -f ibus-daemon
+sleep 1
+sudo rm -f /usr/bin/ibus-engine-jaim
 sudo cp target/release/jaim /usr/bin/ibus-engine-jaim
 
 # IBus コンポーネント記述ファイルをインストール
 sudo cp data/jaim.xml /usr/share/ibus/component/jaim.xml
 
 # IBus を再起動
-ibus restart
+sleep 2 && ibus-daemon -drx
 ```
 
 ### Fcitx5
@@ -178,6 +181,7 @@ ibus restart
 # Fcitx5 アドオンをビルド・インストール
 cd fcitx5
 mkdir -p build && cd build
+make clean
 cmake .. -DCMAKE_INSTALL_PREFIX=/usr
 make
 sudo make install

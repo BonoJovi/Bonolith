@@ -595,6 +595,14 @@ mod tests {
     }
 
     #[test]
+    fn wh_row() {
+        assert_eq!(convert("wha"), "うぁ");
+        assert_eq!(convert("whi"), "うぃ");
+        assert_eq!(convert("whe"), "うぇ");
+        assert_eq!(convert("who"), "うぉ");
+    }
+
+    #[test]
     fn hiragana_to_katakana_basic() {
         assert_eq!(hiragana_to_katakana("ぷろんぷと"), "プロンプト");
     }
