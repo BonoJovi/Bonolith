@@ -184,10 +184,7 @@ mkdir -p build && cd build
 make clean
 cmake .. -DCMAKE_INSTALL_PREFIX=/usr
 make
-sudo make install
-
-# Fcitx5 を再起動
-fcitx5 -r -d
+sudo make install && fcitx5 -r -d
 ```
 
 ## セットアップ

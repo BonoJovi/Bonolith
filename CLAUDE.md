@@ -25,7 +25,7 @@ cargo build --release
 sudo pkill -f ibus-daemon && sleep 1 && sudo rm -f /usr/bin/ibus-engine-jaim && sudo cp target/release/jaim /usr/bin/ibus-engine-jaim && sleep 2 && ibus-daemon -drx
 
 # Fcitx5 — build and install
-cd fcitx5/build && make clean && cmake .. -DCMAKE_INSTALL_PREFIX=/usr && make && sudo make install
+cd fcitx5/build && make clean && cmake .. -DCMAKE_INSTALL_PREFIX=/usr && make && sudo make install && fcitx5 -r -d
 ```
 
 ## Commands
