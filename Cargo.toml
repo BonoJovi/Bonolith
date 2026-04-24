@@ -1,6 +1,6 @@
 [package]
 name = "jaim"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2024"
 authors = ["Yoshihiro NAKAHARA"]
 description = "Japanese AI-powered Input Method - LLM-based intelligent Japanese input for Linux"
