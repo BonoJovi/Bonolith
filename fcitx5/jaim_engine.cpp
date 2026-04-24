@@ -98,6 +98,8 @@ void JaimState::updateUI() {
             }
             if (ui.selected_index >= 0 && ui.selected_index < ui.candidate_count) {
                 candList->setGlobalCursorIndex(ui.selected_index);
+                int page = ui.selected_index / candList->pageSize();
+                candList->setPage(page);
             }
             panel.setCandidateList(std::move(candList));
         }
