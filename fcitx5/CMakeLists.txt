@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(fcitx5-jaim VERSION 1.2.0)
+project(fcitx5-jaim VERSION 1.2.1)
 
 set(CMAKE_CXX_STANDARD 17)
 
@@ -47,3 +47,19 @@ install(FILES jaim-im.conf
 install(FILES "${JAIM_LIB_DIR}/libjaim.so"
     DESTINATION "${FCITX_INSTALL_LIBDIR}"
 )
+
+# Clean up stale files from previous /usr/local installs to prevent conflicts
+install(CODE "
+    set(_stale_files
+        \"/usr/local/share/fcitx5/addon/jaim.conf\"
+        \"/usr/local/share/fcitx5/inputmethod/jaim.conf\"
+        \"/usr/local/lib/x86_64-linux-gnu/fcitx5/fcitx5-jaim.so\"
+        \"/usr/local/lib/x86_64-linux-gnu/libjaim.so\"
+    )
+    foreach(_f \${_stale_files})
+        if(EXISTS \"\${_f}\")
+            message(STATUS \"Removing stale file: \${_f}\")
+            file(REMOVE \"\${_f}\")
+        endif()
+    endforeach()
+")

@@ -1,0 +1,3 @@
+[submodule ".ai-context/shared"]
+	path = .ai-context/shared
+	url = https://github.com/BonoJovi/ai-context-shared.git

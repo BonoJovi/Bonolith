@@ -4,7 +4,7 @@
 
 **Japanese Input Method / Japanese a Input Method / Japanese AI Method**
 
-[![Version](https://img.shields.io/badge/Version-1.2.0-blue)](https://github.com/BonoJovi/JaIM/releases)
+[![Version](https://img.shields.io/badge/Version-1.2.1-blue)](https://github.com/BonoJovi/JaIM/releases)
 [![Rust](https://img.shields.io/badge/Rust-2024-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/bonojovi)
@@ -163,14 +163,17 @@ curl http://127.0.0.1:8080/health
 ### IBus
 
 ```bash
-# バイナリをインストール
+# IBus デーモンを停止してバイナリをインストール
+sudo pkill -f ibus-daemon
+sleep 1
+sudo rm -f /usr/bin/ibus-engine-jaim
 sudo cp target/release/jaim /usr/bin/ibus-engine-jaim
 
 # IBus コンポーネント記述ファイルをインストール
 sudo cp data/jaim.xml /usr/share/ibus/component/jaim.xml
 
 # IBus を再起動
-ibus restart
+sleep 2 && ibus-daemon -drx
 ```
 
 ### Fcitx5
@@ -179,12 +182,10 @@ ibus restart
 # Fcitx5 アドオンをビルド・インストール
 cd fcitx5
 mkdir -p build && cd build
+make clean
 cmake .. -DCMAKE_INSTALL_PREFIX=/usr
 make
-sudo make install
-
-# Fcitx5 を再起動
-fcitx5 -r -d
+sudo make install && fcitx5 -r -d
 ```
 
 ## セットアップ

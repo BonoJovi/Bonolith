@@ -170,6 +170,10 @@ pub const ROMAJI_TABLE: &[(&str, &str)] = &[
     // W-row
     ("wa", "わ"),
     ("we", "ゑ"),
+    ("wha", "うぁ"),
+    ("whe", "うぇ"),
+    ("whi", "うぃ"),
+    ("who", "うぉ"),
     ("wi", "ゐ"),
     ("wo", "を"),
     // X-row (small kana)

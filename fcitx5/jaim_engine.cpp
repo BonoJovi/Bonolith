@@ -98,6 +98,8 @@ void JaimState::updateUI() {
             }
             if (ui.selected_index >= 0 && ui.selected_index < ui.candidate_count) {
                 candList->setGlobalCursorIndex(ui.selected_index);
+                int page = ui.selected_index / candList->pageSize();
+                candList->setPage(page);
             }
             panel.setCandidateList(std::move(candList));
         }
@@ -183,7 +185,9 @@ void JaimEngine::keyEvent(const fcitx::InputMethodEntry & /*entry*/,
 void JaimEngine::activate(const fcitx::InputMethodEntry & /*entry*/,
                           fcitx::InputContextEvent &event) {
     auto *ic = event.inputContext();
-    ic->statusArea().addAction(fcitx::StatusGroup::InputMethod, &menuAction_);
+    // Use AfterInputMethod so the menu persists even when IME is deactivated
+    // (InputMethod group is auto-cleared on deactivate)
+    ic->statusArea().addAction(fcitx::StatusGroup::AfterInputMethod, &menuAction_);
 }
 
 void JaimEngine::deactivate(const fcitx::InputMethodEntry & /*entry*/,
