@@ -185,7 +185,9 @@ void JaimEngine::keyEvent(const fcitx::InputMethodEntry & /*entry*/,
 void JaimEngine::activate(const fcitx::InputMethodEntry & /*entry*/,
                           fcitx::InputContextEvent &event) {
     auto *ic = event.inputContext();
-    ic->statusArea().addAction(fcitx::StatusGroup::InputMethod, &menuAction_);
+    // Use AfterInputMethod so the menu persists even when IME is deactivated
+    // (InputMethod group is auto-cleared on deactivate)
+    ic->statusArea().addAction(fcitx::StatusGroup::AfterInputMethod, &menuAction_);
 }
 
 void JaimEngine::deactivate(const fcitx::InputMethodEntry & /*entry*/,
