@@ -333,7 +333,7 @@ impl JaimEngine {
             return Ok(has_preedit);
         }
 
-        // Symbol/punctuation → full-width equivalent in preedit (F8 for half-width)
+        // Symbol/punctuation/digit → full-width equivalent in preedit (F8 for half-width)
         if let Some(ch) = keyval_to_char(keyval) {
             let fw = match ch {
                 ',' => Some("、"),
@@ -366,6 +366,16 @@ impl JaimEngine {
                 '_' => Some("＿"),
                 '"' => Some("＂"),
                 '`' => Some("｀"),
+                '0' => Some("０"),
+                '1' => Some("１"),
+                '2' => Some("２"),
+                '3' => Some("３"),
+                '4' => Some("４"),
+                '5' => Some("５"),
+                '6' => Some("６"),
+                '7' => Some("７"),
+                '8' => Some("８"),
+                '9' => Some("９"),
                 _ => None,
             };
             if let Some(sym) = fw {

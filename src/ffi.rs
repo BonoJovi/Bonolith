@@ -124,6 +124,16 @@ fn to_fullwidth(ch: char) -> Option<&'static str> {
         '_' => Some("＿"),
         '"' => Some("＂"),
         '`' => Some("｀"),
+        '0' => Some("０"),
+        '1' => Some("１"),
+        '2' => Some("２"),
+        '3' => Some("３"),
+        '4' => Some("４"),
+        '5' => Some("５"),
+        '6' => Some("６"),
+        '7' => Some("７"),
+        '8' => Some("８"),
+        '9' => Some("９"),
         _ => None,
     }
 }
