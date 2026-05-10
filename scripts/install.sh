@@ -79,12 +79,20 @@ echo "=============="
 # (Fcitx5 will SIGSEGV in AddonManager::saveAll if killed mid-init);
 # escalate to KILL only if they linger. Match by exact basename so
 # pkill doesn't grep its own argv and kill itself.
+#
+# ibus-engine-jaim is also killed explicitly: ibus-daemon spawns it
+# as a child, but the child can outlive a daemon restart and end up
+# orphaned with the previous binary mmap'd in (and an old code path
+# that wrote `user_scores.json` after migration — see store.rs
+# recover_stale_jsons for the cleanup).
 echo "[1/4] Stopping services..."
 systemctl --user stop jaim-llm-server.service >/dev/null 2>&1 || true
 sudo pkill -TERM -x ibus-daemon >/dev/null 2>&1 || true
+pkill -TERM -x ibus-engine-jaim >/dev/null 2>&1 || true
 pkill -TERM -x fcitx5 >/dev/null 2>&1 || true
 sleep 2
 sudo pkill -KILL -x ibus-daemon >/dev/null 2>&1 || true
+pkill -KILL -x ibus-engine-jaim >/dev/null 2>&1 || true
 pkill -KILL -x fcitx5 >/dev/null 2>&1 || true
 
 # 2. System paths (sudo). Use `install -D` so missing parent dirs
