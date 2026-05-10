@@ -2,6 +2,22 @@
 ///
 /// Replaces the v1.x `user_dict.json` + `user_scores.json` pair with a
 /// single `dict.sqlite`. JSON is retained only as an import/export format.
+///
+/// ## Multi-process access
+///
+/// The store is opened in WAL (write-ahead log) mode so that fcitx5
+/// (`fcitx5-jaim.so`) and IBus (`ibus-engine-jaim`) — which run in
+/// separate processes — can both open the same database. Writes from
+/// one process are durably persisted; the other process's `Connection`
+/// will see them on the next read. However, **each process keeps its
+/// own in-memory `Dictionary` cache**, which is loaded once at
+/// `SharedCore::global()` init and not refreshed afterwards. This means
+/// if a user registers a word in IBus and immediately switches to
+/// fcitx5, the new word is in SQLite but won't appear in fcitx5's live
+/// suggestions until fcitx5 is restarted. Live cross-process cache
+/// invalidation (file watch / D-Bus signal) is left for future work;
+/// the v2.0.0 contract is "durable single-source-of-truth, restart for
+/// cache refresh".
 
 use std::collections::HashMap;
 use std::fs;
@@ -22,12 +38,36 @@ pub struct DictStore {
 
 impl DictStore {
     /// Open or create the database at the given path. Initializes the
-    /// schema on first creation; safe to call repeatedly.
+    /// schema on first creation; safe to call repeatedly. Configures
+    /// WAL journal mode so multiple processes (fcitx5 + IBus) can hold
+    /// open connections simultaneously.
     pub fn open(path: &Path) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path).map_err(sqlite_to_io)?;
+
+        // PRAGMA journal_mode=WAL returns the mode that's actually in
+        // effect — verify it took (read-only filesystem etc. would
+        // fall back to other modes silently otherwise).
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+            .map_err(sqlite_to_io)?;
+        if mode.to_lowercase() != "wal" {
+            log::warn!(
+                "dict.sqlite did not enter WAL mode (got {:?}); \
+                 multi-process access may be impaired",
+                mode
+            );
+        }
+        // 5s busy_timeout absorbs brief writer contention (eg. fcitx5
+        // and IBus both committing scores at the same instant).
+        conn.execute_batch(
+            "PRAGMA busy_timeout = 5000;
+             PRAGMA synchronous = NORMAL;",
+        )
+        .map_err(sqlite_to_io)?;
+
         let store = Self { conn: Mutex::new(conn) };
         store.init_schema()?;
         Ok(store)
@@ -536,6 +576,94 @@ mod tests {
         assert_eq!(store.load_user_entries().unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn wal_mode_active_after_open() {
+        let path = temp_db_path("wal");
+        let store = DictStore::open(&path).unwrap();
+        let mode: String = {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(mode.to_lowercase(), "wal");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn two_connections_can_both_write_concurrently() {
+        use std::thread;
+
+        let path = temp_db_path("two_conns");
+        // Two independent connections to the same file — simulates
+        // fcitx5 and IBus processes both holding the store open.
+        let store_a = std::sync::Arc::new(DictStore::open(&path).unwrap());
+        let store_b = std::sync::Arc::new(DictStore::open(&path).unwrap());
+
+        let a = store_a.clone();
+        let h1 = thread::spawn(move || {
+            for i in 0..50 {
+                a.upsert_user_entry(&DictionaryEntry {
+                    reading: format!("a{}", i),
+                    surface: format!("A{}", i),
+                    pos: PartOfSpeech::Noun,
+                    frequency: 100,
+                })
+                .unwrap();
+            }
+        });
+
+        let b = store_b.clone();
+        let h2 = thread::spawn(move || {
+            for i in 0..50 {
+                b.upsert_user_entry(&DictionaryEntry {
+                    reading: format!("b{}", i),
+                    surface: format!("B{}", i),
+                    pos: PartOfSpeech::Noun,
+                    frequency: 100,
+                })
+                .unwrap();
+            }
+        });
+
+        h1.join().unwrap();
+        h2.join().unwrap();
+
+        // Both connections see all 100 rows (50 from each writer)
+        assert_eq!(store_a.load_user_entries().unwrap().len(), 100);
+        assert_eq!(store_b.load_user_entries().unwrap().len(), 100);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn concurrent_score_increments_accumulate() {
+        use std::thread;
+
+        let path = temp_db_path("score_conc");
+        let store_a = std::sync::Arc::new(DictStore::open(&path).unwrap());
+        let store_b = std::sync::Arc::new(DictStore::open(&path).unwrap());
+
+        let a = store_a.clone();
+        let h1 = thread::spawn(move || {
+            for _ in 0..100 {
+                a.increment_score("k", "v").unwrap();
+            }
+        });
+        let b = store_b.clone();
+        let h2 = thread::spawn(move || {
+            for _ in 0..100 {
+                b.increment_score("k", "v").unwrap();
+            }
+        });
+        h1.join().unwrap();
+        h2.join().unwrap();
+
+        let scores = store_a.load_user_scores().unwrap();
+        assert_eq!(scores.get("k|v"), Some(&200));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
