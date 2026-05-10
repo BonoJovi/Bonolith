@@ -13,17 +13,29 @@ set(JAIM_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../target/release"
     CACHE PATH "Directory containing libjaim.so")
 
 add_library(fcitx5-jaim MODULE jaim_engine.cpp)
-set_target_properties(fcitx5-jaim PROPERTIES PREFIX "")
+# Drop the lib prefix and any RPATH that would otherwise embed the
+# developer's build-tree absolute path. After install, the runtime
+# loader resolves libjaim.so via the standard search path
+# (/usr/lib/x86_64-linux-gnu, which is where we install it).
+set_target_properties(fcitx5-jaim PROPERTIES
+    PREFIX ""
+    INSTALL_RPATH ""
+    INSTALL_RPATH_USE_LINK_PATH FALSE
+)
 
 target_include_directories(fcitx5-jaim PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+# Link libjaim.so by name (-ljaim) using a link directory hint, rather
+# than passing the absolute build-tree path, so the resulting NEEDED
+# entry is just "libjaim.so" with no path baked in.
+target_link_directories(fcitx5-jaim PRIVATE "${JAIM_LIB_DIR}")
 target_link_libraries(fcitx5-jaim
     Fcitx5::Core
     Fcitx5::Config
     Fcitx5::Utils
-    "${JAIM_LIB_DIR}/libjaim.so"
+    jaim
 )
 
 # Install the addon shared library
