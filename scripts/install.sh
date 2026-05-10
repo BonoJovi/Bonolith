@@ -80,19 +80,23 @@ echo "=============="
 # escalate to KILL only if they linger. Match by exact basename so
 # pkill doesn't grep its own argv and kill itself.
 #
-# ibus-engine-jaim is also killed explicitly: ibus-daemon spawns it
-# as a child, but the child can outlive a daemon restart and end up
-# orphaned with the previous binary mmap'd in (and an old code path
-# that wrote `user_scores.json` after migration — see store.rs
-# recover_stale_jsons for the cleanup).
+# ibus-engine-jaim is killed via -f against its installed path
+# rather than -x against the basename: the kernel truncates
+# /proc/<pid>/comm to TASK_COMM_LEN (15 chars), so pkill -x sees
+# "ibus-engine-jai" (no trailing m) and never matches the 16-char
+# basename. Matching the full cmdline path side-steps that and is
+# specific enough not to false-positive. This catches orphaned
+# engines from before the install (ibus-daemon spawns them as
+# children, but they can outlive a daemon TERM and keep running
+# the previous binary).
 echo "[1/4] Stopping services..."
 systemctl --user stop jaim-llm-server.service >/dev/null 2>&1 || true
 sudo pkill -TERM -x ibus-daemon >/dev/null 2>&1 || true
-pkill -TERM -x ibus-engine-jaim >/dev/null 2>&1 || true
+pkill -TERM -f /usr/bin/ibus-engine-jaim >/dev/null 2>&1 || true
 pkill -TERM -x fcitx5 >/dev/null 2>&1 || true
 sleep 2
 sudo pkill -KILL -x ibus-daemon >/dev/null 2>&1 || true
-pkill -KILL -x ibus-engine-jaim >/dev/null 2>&1 || true
+pkill -KILL -f /usr/bin/ibus-engine-jaim >/dev/null 2>&1 || true
 pkill -KILL -x fcitx5 >/dev/null 2>&1 || true
 
 # 2. System paths (sudo). Use `install -D` so missing parent dirs
