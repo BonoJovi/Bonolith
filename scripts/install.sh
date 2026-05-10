@@ -63,16 +63,17 @@ echo "JaIM installer"
 echo "=============="
 
 # 1. Stop any currently running JaIM bits so we can replace files
-# cleanly. Use TERM first so fcitx5/ibus get a chance to save state
+# cleanly. TERM first to give fcitx5/ibus a chance to save state
 # (Fcitx5 will SIGSEGV in AddonManager::saveAll if killed mid-init);
-# escalate to KILL only if they linger.
+# escalate to KILL only if they linger. Match by exact basename so
+# pkill doesn't grep its own argv and kill itself.
 echo "[1/4] Stopping services..."
 systemctl --user stop jaim-llm-server.service >/dev/null 2>&1 || true
-sudo pkill -TERM -f ibus-daemon >/dev/null 2>&1 || true
-pkill -TERM -f fcitx5 >/dev/null 2>&1 || true
+sudo pkill -TERM -x ibus-daemon >/dev/null 2>&1 || true
+pkill -TERM -x fcitx5 >/dev/null 2>&1 || true
 sleep 2
-sudo pkill -KILL -f ibus-daemon >/dev/null 2>&1 || true
-pkill -KILL -f fcitx5 >/dev/null 2>&1 || true
+sudo pkill -KILL -x ibus-daemon >/dev/null 2>&1 || true
+pkill -KILL -x fcitx5 >/dev/null 2>&1 || true
 
 # 2. System paths (sudo). Use `install -D` so missing parent dirs
 # (e.g., /usr/share/fcitx5/inputmethod when Fcitx5 isn't yet
@@ -95,23 +96,27 @@ install -m 644 scripts/jaim-llm-server.service "$HOME/.config/systemd/user/jaim-
 # as the user's IM in the past (i.e., a profile exists) — otherwise
 # the user is IBus-only and starting fcitx5 would be confusing.
 echo "[4/4] Starting services..."
-systemctl --user daemon-reload
-systemctl --user enable --now jaim-llm-server.service
-ibus-daemon -drx >/dev/null 2>&1 &
-disown 2>/dev/null || true
+systemctl --user daemon-reload >/dev/null 2>&1 || true
+systemctl --user enable --now jaim-llm-server.service >/dev/null 2>&1 || true
+
+# Detach from the script's controlling TTY so the daemons don't
+# inherit the terminal. setsid -f starts a new session with no
+# controlling TTY; redirecting all three fds keeps the daemon from
+# touching the parent terminal's termios state.
+setsid -f ibus-daemon -drx </dev/null >/dev/null 2>&1 || true
 
 if [ -f "$HOME/.config/fcitx5/profile" ]; then
-    fcitx5 -d >/dev/null 2>&1 &
-    disown 2>/dev/null || true
+    setsid -f fcitx5 -d </dev/null >/dev/null 2>&1 || true
 fi
 
-echo ""
+# Daemons we just spawned (or the systemctl/dbus calls above) can
+# leave the controlling tty in -onlcr / no-echo state. Reset it so
+# the user's shell prompt comes back cleanly. Best-effort: silently
+# skip when stdin isn't a tty (e.g. piped install).
+[ -t 0 ] && stty sane 2>/dev/null || true
+
 echo "Install complete."
 echo ""
 echo "Verify:"
 echo "  ibus-engine-jaim export /tmp/jaim-test.json   # should report user entries"
 echo "  systemctl --user status jaim-llm-server.service"
-echo ""
-echo "If Fcitx5's menu shows wrong input methods after install,"
-echo "clear its cache and restart:"
-echo "  pkill -9 fcitx5; rm -rf ~/.cache/fcitx5; fcitx5 -d &"

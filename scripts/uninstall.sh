@@ -35,14 +35,15 @@ echo "================"
 
 # 1. Stop services (best-effort). TERM first so fcitx5 has a chance
 # to flush its addon cache cleanly; escalate to KILL only if needed.
+# Match by exact basename so pkill doesn't kill itself via -f.
 echo "[1/5] Stopping services..."
 systemctl --user stop jaim-llm-server.service >/dev/null 2>&1 || true
 systemctl --user disable jaim-llm-server.service >/dev/null 2>&1 || true
-sudo pkill -TERM -f ibus-daemon >/dev/null 2>&1 || true
-pkill -TERM -f fcitx5 >/dev/null 2>&1 || true
+sudo pkill -TERM -x ibus-daemon >/dev/null 2>&1 || true
+pkill -TERM -x fcitx5 >/dev/null 2>&1 || true
 sleep 2
-sudo pkill -KILL -f ibus-daemon >/dev/null 2>&1 || true
-pkill -KILL -f fcitx5 >/dev/null 2>&1 || true
+sudo pkill -KILL -x ibus-daemon >/dev/null 2>&1 || true
+pkill -KILL -x fcitx5 >/dev/null 2>&1 || true
 
 # 2. Remove system files
 echo "[2/5] Removing system files (sudo required)..."
@@ -90,11 +91,14 @@ else
     fi
 fi
 
-# Restart IBus so the framework stops looking for the missing engine
+# Restart IBus so the framework stops looking for the missing engine.
+# Detach via setsid so the daemon doesn't inherit the script's TTY.
 echo ""
 echo "Restarting IBus..."
-ibus-daemon -drx >/dev/null 2>&1 &
-disown 2>/dev/null || true
+setsid -f ibus-daemon -drx </dev/null >/dev/null 2>&1 || true
+
+# Reset terminal modes the spawned daemons may have left behind.
+[ -t 0 ] && stty sane 2>/dev/null || true
 
 echo ""
 echo "Uninstall complete."
