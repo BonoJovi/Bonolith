@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(fcitx5-jaim VERSION 1.2.3)
+project(fcitx5-jaim VERSION 2.0.0)
 
 set(CMAKE_CXX_STANDARD 17)
 
