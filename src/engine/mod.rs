@@ -495,26 +495,6 @@ impl ConversionEngine {
         self.conversion.as_ref()
     }
 
-    /// Convert the current preedit to half-width katakana (F8, not in conversion mode).
-    pub fn convert_to_halfwidth_katakana(&mut self) -> Option<String> {
-        self.romaji.flush();
-        let kana = self.romaji.output().to_string();
-        if kana.is_empty() {
-            return None;
-        }
-        Some(crate::core::romaji::hiragana_to_halfwidth_katakana(&kana))
-    }
-
-    /// Convert the current preedit to full-width katakana (F7).
-    pub fn convert_to_katakana(&mut self) -> Option<String> {
-        self.romaji.flush();
-        let kana = self.romaji.output().to_string();
-        if kana.is_empty() {
-            return None;
-        }
-        Some(crate::core::romaji::hiragana_to_katakana(&kana))
-    }
-
     /// Commit the selected candidate and update context.
     pub fn commit(&mut self, candidate: &str) -> String {
         match self.shared.llm.try_lock() {

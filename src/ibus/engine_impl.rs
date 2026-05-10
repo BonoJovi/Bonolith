@@ -751,42 +751,6 @@ impl JaimEngine {
         Ok(true)
     }
 
-    /// Convert current preedit to katakana and commit (F7/F8 outside conversion mode).
-    async fn commit_as_kana(
-        &self,
-        emitter: &SignalEmitter<'_>,
-        half: bool,
-    ) -> zbus::fdo::Result<bool> {
-        let converted = {
-            let mut engine = self.engine.lock().unwrap();
-            if half {
-                engine.convert_to_halfwidth_katakana()
-            } else {
-                engine.convert_to_katakana()
-            }
-        };
-        let Some(converted) = converted else {
-            return Ok(false);
-        };
-
-        {
-            let mut engine = self.engine.lock().unwrap();
-            engine.commit(&converted);
-            engine.clear_conversion();
-        }
-
-        Self::commit_text(emitter, ibus_text(&converted)).await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        Self::hide_preedit_text(emitter).await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        Self::hide_lookup_table(emitter).await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-
-        *self.converting.lock().unwrap() = false;
-
-        Ok(true)
-    }
-
     async fn commit_preedit(
         &self,
         emitter: &SignalEmitter<'_>,

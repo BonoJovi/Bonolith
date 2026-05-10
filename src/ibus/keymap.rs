@@ -26,8 +26,6 @@ pub const IBUS_KEY_F7: u32 = 0xFFC4;
 pub const IBUS_KEY_F8: u32 = 0xFFC5;
 pub const IBUS_KEY_F9: u32 = 0xFFC6;
 pub const IBUS_KEY_F10: u32 = 0xFFC7;
-pub const IBUS_KEY_F5: u32 = 0xFFC2;
-pub const IBUS_KEY_F12: u32 = 0xFFC9;
 
 // Japanese keyboard toggle keys
 pub const IBUS_KEY_ZENKAKU_HANKAKU: u32 = 0xFF2A;
