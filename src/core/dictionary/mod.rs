@@ -272,9 +272,7 @@ impl Dictionary {
         if !path.exists() {
             return Ok(0);
         }
-        let json = fs::read_to_string(path)?;
-        let entries: Vec<DictionaryEntry> = serde_json::from_str(&json)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let entries = read_and_parse_dict(path)?;
         let count = entries.len();
         for entry in entries {
             self.add_entry(entry);
@@ -295,9 +293,7 @@ impl Dictionary {
     /// Import entries from a JSON file, adding them as user entries.
     /// Duplicate entries (same reading + surface) are skipped.
     pub fn import(&mut self, path: &Path) -> io::Result<usize> {
-        let json = fs::read_to_string(path)?;
-        let entries: Vec<DictionaryEntry> = serde_json::from_str(&json)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let entries = read_and_parse_dict(path)?;
         let mut added = 0;
         for entry in entries {
             if !self.has_entry(&entry.reading, &entry.surface) {
@@ -427,6 +423,102 @@ impl Dictionary {
 /// excessive splitting.
 fn segment_cost(char_len: usize, frequency: u32) -> f64 {
     (char_len as f64) * -(frequency as f64).ln() + 1.0
+}
+
+/// Read a dictionary JSON file and parse it into entries.
+/// Returns a rich io::Error including file path, line/column, and a hint
+/// when parsing fails (so users can fix manual edits without grepping logs).
+fn read_and_parse_dict(path: &Path) -> io::Result<Vec<DictionaryEntry>> {
+    let json = fs::read_to_string(path)?;
+    parse_dict_json(&json).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "failed to parse {} at line {} col {}: {} \
+                 (hint: check for trailing commas, missing brackets, or unescaped quotes)",
+                path.display(),
+                e.line(),
+                e.column(),
+                e
+            ),
+        )
+    })
+}
+
+/// Parse a dictionary JSON string. Tries strict parsing first; on failure,
+/// strips trailing commas (a common manual-edit mistake) and retries.
+/// Returns the original strict error if both attempts fail.
+fn parse_dict_json(json: &str) -> serde_json::Result<Vec<DictionaryEntry>> {
+    match serde_json::from_str::<Vec<DictionaryEntry>>(json) {
+        Ok(entries) => Ok(entries),
+        Err(strict_err) => {
+            let cleaned = strip_trailing_commas(json);
+            match serde_json::from_str::<Vec<DictionaryEntry>>(&cleaned) {
+                Ok(entries) => {
+                    log::warn!(
+                        "user dictionary JSON had a syntax error (likely a trailing comma); \
+                         auto-recovered. original error: {}",
+                        strict_err
+                    );
+                    Ok(entries)
+                }
+                Err(_) => Err(strict_err),
+            }
+        }
+    }
+}
+
+/// Remove commas that appear immediately before `}` or `]` (with optional
+/// intervening whitespace), preserving any commas that occur inside JSON
+/// string literals.
+fn strip_trailing_commas(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut in_string = false;
+    let mut escape = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if escape {
+            out.push(c);
+            escape = false;
+            i += 1;
+            continue;
+        }
+        if in_string {
+            if c == '\\' {
+                out.push(c);
+                escape = true;
+                i += 1;
+                continue;
+            }
+            if c == '"' {
+                in_string = false;
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == ',' {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j < chars.len() && (chars[j] == '}' || chars[j] == ']') {
+                i += 1;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -625,6 +717,69 @@ mod tests {
         let mut dict = Dictionary::new();
         let result = dict.load_user_entries(Path::new("/tmp/jaim_nonexistent_dict.json"));
         assert_eq!(result.unwrap(), 0);
+    }
+
+    #[test]
+    fn strip_trailing_commas_basic_array_and_object() {
+        let input = r#"[{"a":1,"b":2,},]"#;
+        assert_eq!(strip_trailing_commas(input), r#"[{"a":1,"b":2}]"#);
+    }
+
+    #[test]
+    fn strip_trailing_commas_with_whitespace() {
+        let input = "[\n  1,\n  2,\n]\n";
+        assert_eq!(strip_trailing_commas(input), "[\n  1,\n  2\n]\n");
+    }
+
+    #[test]
+    fn strip_trailing_commas_preserves_string_content() {
+        let input = r#"{"a":"b,]","c":1,}"#;
+        assert_eq!(strip_trailing_commas(input), r#"{"a":"b,]","c":1}"#);
+    }
+
+    #[test]
+    fn strip_trailing_commas_handles_escaped_quote_in_string() {
+        let input = r#"{"a":"x\",y","b":2,}"#;
+        assert_eq!(strip_trailing_commas(input), r#"{"a":"x\",y","b":2}"#);
+    }
+
+    #[test]
+    fn load_user_entries_tolerates_trailing_comma() {
+        let dir = std::env::temp_dir().join("jaim_test_trailing_comma");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("user_dict.json");
+        let json = r#"[
+  {"reading":"てすと","surface":"テスト","pos":"Noun","frequency":100},
+  {"reading":"くろーど","surface":"クロード","pos":"Noun","frequency":200},
+]"#;
+        std::fs::write(&path, json).unwrap();
+
+        let mut dict = Dictionary::new();
+        let n = dict.load_user_entries(&path).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(dict.lookup("てすと")[0].surface, "テスト");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_user_entries_error_includes_path_and_hint() {
+        let dir = std::env::temp_dir().join("jaim_test_bad_json");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("user_dict.json");
+        // Genuinely broken: missing closing bracket — neither strict nor
+        // lenient parsing can recover, so the error path runs.
+        std::fs::write(&path, r#"[{"reading":"x","surface":"y","#).unwrap();
+
+        let mut dict = Dictionary::new();
+        let err = dict.load_user_entries(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(path.to_str().unwrap()), "msg should include path: {}", msg);
+        assert!(msg.contains("hint:"), "msg should include hint: {}", msg);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -62,7 +62,17 @@ async fn main() {
             };
             let mut dict = Dictionary::new();
             let user_dict_path = Dictionary::default_user_dict_path().unwrap();
-            let loaded = dict.load_user_entries(&user_dict_path).unwrap_or(0);
+            let loaded = match dict.load_user_entries(&user_dict_path) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: could not load existing user dictionary; \
+                         exporting builtin entries only.\n  {}",
+                        e
+                    );
+                    0
+                }
+            };
             match dict.export(&path) {
                 Ok(()) => {
                     println!(
@@ -88,7 +98,20 @@ async fn main() {
             };
             let mut dict = Dictionary::new();
             let user_dict_path = Dictionary::default_user_dict_path().unwrap();
-            let _ = dict.load_user_entries(&user_dict_path);
+            // Refuse to import if the existing user dictionary is unreadable —
+            // saving afterward would overwrite it and silently drop entries.
+            if user_dict_path.exists() {
+                if let Err(e) = dict.load_user_entries(&user_dict_path) {
+                    eprintln!(
+                        "Error: could not load existing user dictionary at {}.\n  {}\n\
+                         Aborting import to avoid overwriting it. \
+                         Fix the file (or move it aside) and retry.",
+                        user_dict_path.display(),
+                        e
+                    );
+                    std::process::exit(1);
+                }
+            }
             match dict.import(&path) {
                 Ok(added) => {
                     if let Err(e) = dict.save_user_entries(&user_dict_path) {
