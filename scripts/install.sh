@@ -10,7 +10,7 @@ set -euo pipefail
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--help]
+Usage: $(basename "$0") [--no-llm] [--help]
 
 Installs JaIM. Run from the repository root after building both
 the Rust crate and the Fcitx5 addon:
@@ -25,12 +25,24 @@ User data at ~/.local/share/jaim/ is left untouched. If a v1.x
 user_dict.json or user_scores.json is found there, the JaIM engine
 will migrate it into dict.sqlite on first start (renaming the
 originals to *.migrated).
+
+Options:
+  --no-llm  Don't enable jaim-llm-server.service. JaIM still works
+            (it falls back to the dictionary-only ranker), but no
+            local LLM is started. Useful for older PCs. You can
+            turn it on later with `jaim llm on`.
+  --help    Show this help.
 EOF
 }
 
-if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
-    usage; exit 0
-fi
+NO_LLM=0
+for arg in "$@"; do
+    case "$arg" in
+        --no-llm) NO_LLM=1 ;;
+        --help|-h) usage; exit 0 ;;
+        *) echo "Unknown option: $arg" >&2; usage >&2; exit 1 ;;
+    esac
+done
 
 # Resolve repo root from script location so the installer works
 # regardless of cwd.
@@ -97,7 +109,15 @@ install -m 644 scripts/jaim-llm-server.service "$HOME/.config/systemd/user/jaim-
 # the user is IBus-only and starting fcitx5 would be confusing.
 echo "[4/4] Starting services..."
 systemctl --user daemon-reload >/dev/null 2>&1 || true
-systemctl --user enable --now jaim-llm-server.service >/dev/null 2>&1 || true
+if [ "$NO_LLM" -eq 1 ]; then
+    # Make sure any pre-existing enable/start is undone, otherwise
+    # --no-llm wouldn't actually keep the LLM off after a reinstall.
+    systemctl --user stop jaim-llm-server.service >/dev/null 2>&1 || true
+    systemctl --user disable jaim-llm-server.service >/dev/null 2>&1 || true
+    echo "  (LLM disabled per --no-llm; turn it on later with \`jaim llm on\`)"
+else
+    systemctl --user enable --now jaim-llm-server.service >/dev/null 2>&1 || true
+fi
 
 # Detach from the script's controlling TTY so the daemons don't
 # inherit the terminal. setsid -f starts a new session with no

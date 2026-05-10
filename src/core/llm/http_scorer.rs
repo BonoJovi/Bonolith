@@ -96,6 +96,14 @@ impl HttpLlamaScorer {
     /// Score using generation-based approach:
     /// Generate a completion from context, then measure character overlap with candidate.
     fn score_by_generation(&self, context: &str, candidate: &str) -> f64 {
+        // Fast-fail: once the server has been observed unreachable
+        // (e.g., user ran `jaim llm off` mid-session), skip the HTTP
+        // round-trip entirely and return the neutral score so we
+        // don't pay the connect-timeout per keystroke.
+        if self.warned.load(Ordering::Relaxed) {
+            return 0.5;
+        }
+
         let url = format!("{}/completion", self.endpoint);
         let n_predict = (candidate.chars().count() as u32 + 5).min(30);
 
@@ -167,7 +175,7 @@ impl LlmScorer for HttpLlamaScorer {
     }
 
     fn warm_cache(&self, context: &str) {
-        if context.is_empty() {
+        if context.is_empty() || self.warned.load(Ordering::Relaxed) {
             return;
         }
         // Send a no-generation request to warm the server's KV cache
@@ -178,6 +186,10 @@ impl LlmScorer for HttpLlamaScorer {
             temperature: 0.0,
             cache_prompt: true,
         };
-        let _ = self.agent.post(&url).send_json(&req);
+        if let Err(e) = self.agent.post(&url).send_json(&req) {
+            if !self.warned.swap(true, Ordering::Relaxed) {
+                warn!("HttpLlamaScorer: warm_cache failed: {}", e);
+            }
+        }
     }
 }

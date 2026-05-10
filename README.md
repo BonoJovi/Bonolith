@@ -158,6 +158,20 @@ curl http://127.0.0.1:8080/health
 # → {"status":"ok"}
 ```
 
+### LLM ON/OFF の切り替え
+
+導入後はいつでも切り替えできます：
+
+```bash
+jaim llm on        # 有効化（systemd サービスを enable + start）
+jaim llm off       # 無効化（stop + disable、辞書のみで動作）
+jaim llm status    # 現状確認
+```
+
+実行中の IBus / Fcitx5 セッションには即座に反映されないので、切り替え後は `ibus-daemon -drx` でリロードするか、再ログインしてください。
+
+`./scripts/install.sh --no-llm` で **最初から LLM を無効にした状態でインストール** することもできます（古い PC や LLM を使いたくないユーザ向け）。
+
 ## インストール
 
 ### IBus

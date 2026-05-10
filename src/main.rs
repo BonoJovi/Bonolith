@@ -41,7 +41,64 @@ fn print_usage() {
     eprintln!("  (none)              Start the IBus engine");
     eprintln!("  export <file>       Export dictionary to a JSON file");
     eprintln!("  import <file>       Import dictionary from a JSON file");
+    eprintln!("  llm <on|off|status> Toggle the local LLM server (jaim-llm-server)");
     eprintln!("  help                Show this help message");
+}
+
+fn llm_systemctl(args: &[&str]) -> std::io::Result<std::process::ExitStatus> {
+    std::process::Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .status()
+}
+
+fn llm_on() {
+    match llm_systemctl(&["enable", "--now", "jaim-llm-server.service"]) {
+        Ok(s) if s.success() => {
+            println!(
+                "LLM enabled. jaim-llm-server.service started and will start on login."
+            );
+        }
+        Ok(s) => {
+            eprintln!("Error: systemctl exited with status {}", s);
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Error: could not run systemctl: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn llm_off() {
+    let _ = llm_systemctl(&["stop", "jaim-llm-server.service"]);
+    match llm_systemctl(&["disable", "jaim-llm-server.service"]) {
+        Ok(_) => {
+            println!(
+                "LLM disabled. jaim-llm-server.service stopped.\n\
+                 Restart your IM (e.g. `ibus-daemon -drx`) or reboot for the\n\
+                 change to take effect in already-running input contexts."
+            );
+        }
+        Err(e) => {
+            eprintln!("Error: could not run systemctl: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn llm_status() {
+    use std::process::Command;
+    let read = |action: &str| -> String {
+        Command::new("systemctl")
+            .args(["--user", action, "jaim-llm-server.service"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|_| "unknown".to_string())
+    };
+    println!("LLM service status:");
+    println!("  active:  {}", read("is-active"));
+    println!("  enabled: {}", read("is-enabled"));
 }
 
 #[tokio::main]
@@ -122,6 +179,18 @@ async fn main() {
                 }
                 Err(e) => {
                     eprintln!("Error: failed to import dictionary: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("llm") => {
+            match args.get(2).map(|s| s.as_str()) {
+                Some("on") => llm_on(),
+                Some("off") => llm_off(),
+                Some("status") | None => llm_status(),
+                Some(other) => {
+                    eprintln!("Error: unknown llm subcommand '{}'", other);
+                    eprintln!("Usage: jaim llm <on|off|status>");
                     std::process::exit(1);
                 }
             }
