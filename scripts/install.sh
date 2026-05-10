@@ -92,6 +92,9 @@ pkill -KILL -x fcitx5 >/dev/null 2>&1 || true
 # bootstrapped) are created automatically.
 echo "[2/4] Installing system files (sudo required)..."
 sudo install -D -m 755 target/release/jaim         /usr/bin/ibus-engine-jaim
+# `jaim` is the user-facing CLI name (jaim llm on/off/status, jaim
+# export/import). IBus invokes the same binary as ibus-engine-jaim.
+sudo ln -sf ibus-engine-jaim                       /usr/bin/jaim
 sudo install -D -m 644 data/jaim.xml               /usr/share/ibus/component/jaim.xml
 sudo install -D -m 755 target/release/libjaim.so   /usr/lib/x86_64-linux-gnu/libjaim.so
 sudo install -D -m 755 fcitx5/build/fcitx5-jaim.so /usr/lib/x86_64-linux-gnu/fcitx5/fcitx5-jaim.so
@@ -138,5 +141,21 @@ fi
 echo "Install complete."
 echo ""
 echo "Verify:"
-echo "  ibus-engine-jaim export /tmp/jaim-test.json   # should report user entries"
-echo "  systemctl --user status jaim-llm-server.service"
+echo "  jaim llm status                              # LLM service active/enabled"
+echo "  jaim export /tmp/jaim-test.json              # should report user entries"
+
+# Warn if `jaim` on PATH resolves to something other than the symlink
+# we just installed. A stale ~/.local/bin/jaim (or /usr/local/bin/jaim)
+# from a previous build silently shadows /usr/bin/jaim and produces
+# confusing "unknown command 'llm'" errors after upgrades.
+if resolved="$(command -v jaim 2>/dev/null)"; then
+    if [ "$resolved" != "/usr/bin/jaim" ]; then
+        echo ""
+        echo "Warning: 'jaim' on your PATH resolves to:"
+        echo "    $resolved"
+        echo "  not /usr/bin/jaim. The shadowing copy is likely an older"
+        echo "  build and will not have the latest subcommands. Remove it"
+        echo "  (e.g. \`rm $resolved\`) so \`jaim llm on\` runs the freshly"
+        echo "  installed binary."
+    fi
+fi

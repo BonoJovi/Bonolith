@@ -56,7 +56,11 @@ fn llm_on() {
     match llm_systemctl(&["enable", "--now", "jaim-llm-server.service"]) {
         Ok(s) if s.success() => {
             println!(
-                "LLM enabled. jaim-llm-server.service started and will start on login."
+                "LLM enabled. jaim-llm-server.service started and will start on login.\n\
+                 If you ran `jaim llm off` earlier in this session (or the\n\
+                 server crashed), the running IM has stopped sending scoring\n\
+                 requests. Restart it with `ibus-daemon -drx` so the engine\n\
+                 reconnects."
             );
         }
         Ok(s) => {
@@ -76,8 +80,9 @@ fn llm_off() {
         Ok(_) => {
             println!(
                 "LLM disabled. jaim-llm-server.service stopped.\n\
-                 Restart your IM (e.g. `ibus-daemon -drx`) or reboot for the\n\
-                 change to take effect in already-running input contexts."
+                 The running IM detects the missing server on the next\n\
+                 keystroke and falls back to the dictionary-only ranker —\n\
+                 no IM restart needed."
             );
         }
         Err(e) => {
