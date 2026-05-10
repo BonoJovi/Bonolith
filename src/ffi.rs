@@ -10,7 +10,7 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 use std::ptr;
 
-use crate::core::dictionary::{Dictionary, DictionaryEntry, PartOfSpeech};
+use crate::core::dictionary::{DictionaryEntry, PartOfSpeech};
 use crate::engine::{ConversionEngine, SharedCore};
 
 // X11 keysym values (shared by IBus and Fcitx5)
@@ -633,11 +633,7 @@ pub unsafe extern "C" fn jaim_dict_add_entry(
     let shared = SharedCore::global();
     let mut dict = shared.dictionary.write().unwrap();
     dict.add_entry(entry);
-    if let Ok(path) = Dictionary::default_user_dict_path() {
-        dict.save_user_entries(&path).is_ok()
-    } else {
-        false
-    }
+    dict.sync_user_entries_to_store().is_ok()
 }
 
 /// Delete a user dictionary entry by index. Returns true on success.
@@ -652,11 +648,7 @@ pub unsafe extern "C" fn jaim_dict_delete_entry(index: i32) -> bool {
     }
     entries.remove(idx);
     dict.replace_user_entries(entries);
-    if let Ok(path) = Dictionary::default_user_dict_path() {
-        dict.save_user_entries(&path).is_ok()
-    } else {
-        false
-    }
+    dict.sync_user_entries_to_store().is_ok()
 }
 
 /// Update a user dictionary entry by index. Empty strings mean "no change".
@@ -690,11 +682,7 @@ pub unsafe extern "C" fn jaim_dict_update_entry(
         entries[idx].surface = new_surface;
     }
     dict.replace_user_entries(entries);
-    if let Ok(path) = Dictionary::default_user_dict_path() {
-        dict.save_user_entries(&path).is_ok()
-    } else {
-        false
-    }
+    dict.sync_user_entries_to_store().is_ok()
 }
 
 /// Get all user dictionary entries. Caller must free with jaim_dict_free_entries().
@@ -774,9 +762,7 @@ pub unsafe extern "C" fn jaim_dict_import(path: *const c_char) -> i32 {
     let mut dict = shared.dictionary.write().unwrap();
     match dict.import(&path) {
         Ok(count) => {
-            if let Ok(save_path) = Dictionary::default_user_dict_path() {
-                let _ = dict.save_user_entries(&save_path);
-            }
+            let _ = dict.sync_user_entries_to_store();
             count as i32
         }
         Err(_) => -1,

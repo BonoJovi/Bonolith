@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use trie::Trie;
+
+use crate::core::store::DictStore;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DictionaryEntry {
@@ -58,6 +61,9 @@ pub struct Dictionary {
     trie: Trie,
     /// Index of the first user-added entry (all entries before this are builtin)
     user_start: usize,
+    /// Optional persistent store. When attached, mutations to the user
+    /// portion of the dictionary are written through to SQLite.
+    store: Option<Arc<DictStore>>,
 }
 
 impl Dictionary {
@@ -67,10 +73,44 @@ impl Dictionary {
             entries: Vec::new(),
             trie: Trie::new(),
             user_start: 0,
+            store: None,
         };
         dict.load_builtin();
         dict.user_start = dict.entries.len();
         dict
+    }
+
+    /// Attach a persistent store. Subsequent calls to
+    /// `sync_user_entries_to_store` write the user portion through to it.
+    pub fn attach_store(&mut self, store: Arc<DictStore>) {
+        self.store = Some(store);
+    }
+
+    /// Load all user entries from the attached store and add them to
+    /// the in-memory dictionary. Returns the number of entries loaded.
+    /// No-op when no store is attached.
+    pub fn load_from_store(&mut self) -> io::Result<usize> {
+        let store = match &self.store {
+            Some(s) => s.clone(),
+            None => return Ok(0),
+        };
+        let entries = store.load_user_entries()?;
+        let count = entries.len();
+        for entry in entries {
+            self.add_entry(entry);
+        }
+        Ok(count)
+    }
+
+    /// Persist the current user portion of the dictionary to the store.
+    /// Replaces all rows in user_entries in a single transaction.
+    /// No-op when no store is attached.
+    pub fn sync_user_entries_to_store(&self) -> io::Result<()> {
+        let store = match &self.store {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        store.replace_all_user_entries(&self.entries[self.user_start..])
     }
 
     /// Add a single entry.
@@ -253,31 +293,17 @@ impl Dictionary {
         Ok(data_dir.join("user_dict.json"))
     }
 
-    /// Save user-added entries to a JSON file.
-    pub fn save_user_entries(&self, path: &Path) -> io::Result<()> {
-        let user_entries = &self.entries[self.user_start..];
-        if user_entries.is_empty() {
-            return Ok(());
-        }
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let json = serde_json::to_string_pretty(user_entries)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        fs::write(path, json)
-    }
-
-    /// Load user entries from a JSON file and add them to the dictionary.
-    pub fn load_user_entries(&mut self, path: &Path) -> io::Result<usize> {
-        if !path.exists() {
-            return Ok(0);
-        }
-        let entries = read_and_parse_dict(path)?;
-        let count = entries.len();
-        for entry in entries {
-            self.add_entry(entry);
-        }
-        Ok(count)
+    /// Construct a dictionary attached to the default SQLite store at
+    /// `~/.local/share/jaim/dict.sqlite`, with all user entries loaded
+    /// in memory. Runs legacy JSON migration on first call. Used by the
+    /// CLI and dialog flows that previously built a fresh Dictionary
+    /// with JSON-backed persistence.
+    pub fn with_default_store() -> io::Result<Self> {
+        let store = Arc::new(DictStore::open_default_with_migration()?);
+        let mut dict = Dictionary::new();
+        dict.attach_store(store);
+        dict.load_from_store()?;
+        Ok(dict)
     }
 
     /// Export the entire dictionary (builtin + user) to a JSON file.
@@ -653,12 +679,14 @@ mod tests {
     }
 
     #[test]
-    fn save_and_load_user_entries() {
-        let dir = std::env::temp_dir().join("jaim_test_save_load");
-        let path = dir.join("user_dict.json");
+    fn sync_and_load_via_store() {
+        let dir = std::env::temp_dir().join("jaim_test_dict_sync");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(DictStore::open(&dir.join("dict.sqlite")).unwrap());
 
-        // Create dict and add a user entry
         let mut dict = Dictionary::new();
+        dict.attach_store(store.clone());
         let builtin_count = dict.len();
         dict.add_entry(DictionaryEntry {
             reading: "くろーど".to_string(),
@@ -667,18 +695,15 @@ mod tests {
             frequency: 5000,
         });
         assert_eq!(dict.len(), builtin_count + 1);
+        dict.sync_user_entries_to_store().unwrap();
 
-        // Save user entries
-        dict.save_user_entries(&path).unwrap();
-
-        // Load into a fresh dictionary
         let mut dict2 = Dictionary::new();
-        let loaded = dict2.load_user_entries(&path).unwrap();
+        dict2.attach_store(store);
+        let loaded = dict2.load_from_store().unwrap();
         assert_eq!(loaded, 1);
         let results = dict2.lookup("くろーど");
         assert_eq!(results[0].surface, "クロード");
 
-        // Cleanup
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -713,13 +738,6 @@ mod tests {
     }
 
     #[test]
-    fn load_nonexistent_file_returns_zero() {
-        let mut dict = Dictionary::new();
-        let result = dict.load_user_entries(Path::new("/tmp/jaim_nonexistent_dict.json"));
-        assert_eq!(result.unwrap(), 0);
-    }
-
-    #[test]
     fn strip_trailing_commas_basic_array_and_object() {
         let input = r#"[{"a":1,"b":2,},]"#;
         assert_eq!(strip_trailing_commas(input), r#"[{"a":1,"b":2}]"#);
@@ -744,37 +762,36 @@ mod tests {
     }
 
     #[test]
-    fn load_user_entries_tolerates_trailing_comma() {
+    fn import_tolerates_trailing_comma() {
         let dir = std::env::temp_dir().join("jaim_test_trailing_comma");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("user_dict.json");
+        let path = dir.join("import.json");
+        // Use clearly-unique surfaces so they're not deduped against builtin.
         let json = r#"[
-  {"reading":"てすと","surface":"テスト","pos":"Noun","frequency":100},
-  {"reading":"くろーど","surface":"クロード","pos":"Noun","frequency":200},
+  {"reading":"てすとよみ","surface":"𩸽𠮷𠮟","pos":"Noun","frequency":100},
+  {"reading":"てすとよみ","surface":"𩸽𠮷𠮟2","pos":"Noun","frequency":200},
 ]"#;
         std::fs::write(&path, json).unwrap();
 
         let mut dict = Dictionary::new();
-        let n = dict.load_user_entries(&path).unwrap();
+        let n = dict.import(&path).unwrap();
         assert_eq!(n, 2);
-        assert_eq!(dict.lookup("てすと")[0].surface, "テスト");
+        assert_eq!(dict.lookup("てすとよみ").len(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn load_user_entries_error_includes_path_and_hint() {
+    fn import_error_includes_path_and_hint() {
         let dir = std::env::temp_dir().join("jaim_test_bad_json");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("user_dict.json");
-        // Genuinely broken: missing closing bracket — neither strict nor
-        // lenient parsing can recover, so the error path runs.
+        let path = dir.join("import.json");
         std::fs::write(&path, r#"[{"reading":"x","surface":"y","#).unwrap();
 
         let mut dict = Dictionary::new();
-        let err = dict.load_user_entries(&path).unwrap_err();
+        let err = dict.import(&path).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains(path.to_str().unwrap()), "msg should include path: {}", msg);
         assert!(msg.contains("hint:"), "msg should include hint: {}", msg);

@@ -26,6 +26,8 @@ env_logger = "0.11"
 encoding_rs = "0.8"
 # HTTP client for LLM server communication
 ureq = { version = "3", features = ["json"] }
+# SQLite for persistent user dictionary and scores (v2.0.0+)
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [[bin]]
 name = "generate-dict"

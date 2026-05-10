@@ -1,26 +1,41 @@
 /// User learning scorer for JaIM.
 ///
 /// Records which (reading, surface) pairs the user selects and boosts
-/// those pairs in future candidate ranking. Data is persisted to
-/// `~/.local/share/jaim/user_scores.json`.
+/// those pairs in future candidate ranking. Persists to the SQLite
+/// store (`user_scores` table) when attached; otherwise keeps an
+/// in-memory map only.
 
 use std::collections::HashMap;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::core::store::DictStore;
 
 pub struct UserScorer {
     /// Map of "reading|surface" -> selection count
     counts: HashMap<String, u32>,
-    /// Whether there are unsaved changes
-    dirty: bool,
+    /// Optional persistent store. When attached, every record() also
+    /// writes through to the store.
+    store: Option<Arc<DictStore>>,
 }
 
 impl UserScorer {
     pub fn new() -> Self {
         Self {
             counts: HashMap::new(),
-            dirty: false,
+            store: None,
         }
+    }
+
+    /// Construct a scorer backed by a persistent store. Loads any
+    /// existing scores into memory; subsequent record() calls persist
+    /// per-row updates immediately (cheap with SQLite).
+    pub fn from_store(store: Arc<DictStore>) -> io::Result<Self> {
+        let counts = store.load_user_scores()?;
+        Ok(Self {
+            counts,
+            store: Some(store),
+        })
     }
 
     /// Record a user selection for the given (reading, surface) pair.
@@ -29,7 +44,11 @@ impl UserScorer {
     pub fn record(&mut self, reading: &str, surface: &str) {
         let key = Self::key(reading, surface);
         *self.counts.entry(key).or_insert(0) += 1;
-        self.dirty = true;
+        if let Some(store) = &self.store {
+            if let Err(e) = store.increment_score(reading, surface) {
+                log::warn!("failed to persist score for {}|{}: {}", reading, surface, e);
+            }
+        }
     }
 
     /// Score a (reading, surface) pair based on user history.
@@ -48,59 +67,34 @@ impl UserScorer {
         ((count as f64).ln_1p() / (20.0_f64).ln_1p()).min(1.0)
     }
 
-    /// Default path for user scores file.
-    pub fn default_path() -> io::Result<PathBuf> {
+    /// Default path for the legacy `user_scores.json` (used only by the
+    /// migration path in `DictStore`). New writes go through SQLite.
+    pub fn default_legacy_path() -> io::Result<std::path::PathBuf> {
         let data_dir = std::env::var("XDG_DATA_HOME")
-            .map(PathBuf::from)
+            .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| {
                 let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-                PathBuf::from(home).join(".local/share")
+                std::path::PathBuf::from(home).join(".local/share")
             })
             .join("jaim");
         Ok(data_dir.join("user_scores.json"))
     }
 
-    /// Load user scores from a JSON file. Returns empty scorer if file does not exist.
-    pub fn load(path: &Path) -> io::Result<Self> {
-        if !path.exists() {
-            return Ok(Self::new());
-        }
-        let data = std::fs::read_to_string(path)?;
-        let counts: HashMap<String, u32> = serde_json::from_str(&data)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        Ok(Self {
-            counts,
-            dirty: false,
-        })
-    }
-
-    /// Save user scores to a JSON file. Only writes if there are unsaved changes.
-    /// Uses atomic write (temp file + rename) to prevent corruption.
-    pub fn save(&mut self, path: &Path) -> io::Result<()> {
-        if !self.dirty {
-            return Ok(());
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = path.with_extension("json.tmp");
-        let data = serde_json::to_string_pretty(&self.counts)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        std::fs::write(&tmp, data)?;
-        std::fs::rename(&tmp, path)?;
-        self.dirty = false;
-        Ok(())
-    }
-
     fn key(reading: &str, surface: &str) -> String {
         format!("{}|{}", reading, surface)
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_store(name: &str) -> Arc<DictStore> {
+        let dir = std::env::temp_dir().join(format!("jaim_test_scorer_{}", name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Arc::new(DictStore::open(&dir.join("dict.sqlite")).unwrap())
+    }
 
     #[test]
     fn unrecorded_score_is_zero() {
@@ -141,23 +135,23 @@ mod tests {
     }
 
     #[test]
-    fn save_and_load() {
-        let dir = std::env::temp_dir().join("jaim_test_scores");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("test_scores.json");
-
-        let mut scorer = UserScorer::new();
+    fn record_persists_through_store() {
+        let store = temp_store("persist");
+        let mut scorer = UserScorer::from_store(store.clone()).unwrap();
         scorer.record("きょう", "今日");
         scorer.record("きょう", "今日");
-        scorer.save(&path).unwrap();
+        let s1 = scorer.score("きょう", "今日");
+        drop(scorer);
 
-        let loaded = UserScorer::load(&path).unwrap();
-        assert_eq!(loaded.score("きょう", "今日"), scorer.score("きょう", "今日"));
+        let scorer2 = UserScorer::from_store(store).unwrap();
+        let s2 = scorer2.score("きょう", "今日");
+        assert!((s1 - s2).abs() < 1e-9);
     }
 
     #[test]
-    fn load_nonexistent() {
-        let scorer = UserScorer::load(Path::new("/tmp/nonexistent_jaim_scores.json")).unwrap();
-        assert_eq!(scorer.score("test", "test"), 0.0);
+    fn from_store_starts_empty_when_db_fresh() {
+        let store = temp_store("fresh");
+        let scorer = UserScorer::from_store(store).unwrap();
+        assert_eq!(scorer.score("anything", "anything"), 0.0);
     }
 }

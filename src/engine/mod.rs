@@ -16,6 +16,7 @@ use crate::core::{
     grammar::{GrammarEngine, GrammarToken},
     llm::LlmEngine,
     romaji::RomajiConverter,
+    store::DictStore,
     user_scorer::UserScorer,
 };
 
@@ -75,7 +76,10 @@ pub struct SharedCore {
     pub grammar: GrammarEngine,
     pub llm: Mutex<LlmEngine>,
     pub user_scorer: Mutex<UserScorer>,
-    pub user_scores_path: Option<std::path::PathBuf>,
+    /// Persistent SQLite store for user entries and scores. None when
+    /// the database could not be opened (in which case the engine still
+    /// runs but mutations are not persisted).
+    pub store: Option<Arc<DictStore>>,
 }
 
 /// Global shared core, initialized on first use.
@@ -86,23 +90,34 @@ impl SharedCore {
     pub fn global() -> Arc<SharedCore> {
         SHARED_CORE
             .get_or_init(|| {
-                let scores_path = UserScorer::default_path().ok();
-                let user_scorer = scores_path
-                    .as_ref()
-                    .and_then(|p| match UserScorer::load(p) {
-                        Ok(s) => Some(s),
-                        Err(e) => {
-                            log::warn!("Failed to load user scores: {}", e);
-                            None
-                        }
-                    })
-                    .unwrap_or_else(UserScorer::new);
+                let store = match DictStore::open_default_with_migration() {
+                    Ok(s) => Some(Arc::new(s)),
+                    Err(e) => {
+                        log::warn!(
+                            "failed to open user dictionary store: {}; \
+                             persistence disabled",
+                            e
+                        );
+                        None
+                    }
+                };
+
+                let user_scorer = match &store {
+                    Some(s) => UserScorer::from_store(s.clone()).unwrap_or_else(|e| {
+                        log::warn!("failed to load user scores from store: {}", e);
+                        UserScorer::new()
+                    }),
+                    None => UserScorer::new(),
+                };
 
                 let mut dictionary = Dictionary::new();
-                if let Ok(path) = Dictionary::default_user_dict_path() {
-                    match dictionary.load_user_entries(&path) {
-                        Ok(n) if n > 0 => log::info!("Loaded {} user dictionary entries", n),
-                        Err(e) => log::warn!("Failed to load user dictionary: {}", e),
+                if let Some(s) = &store {
+                    dictionary.attach_store(s.clone());
+                    match dictionary.load_from_store() {
+                        Ok(n) if n > 0 => {
+                            log::info!("loaded {} user dictionary entries from store", n)
+                        }
+                        Err(e) => log::warn!("failed to load user dictionary: {}", e),
                         _ => {}
                     }
                 }
@@ -112,7 +127,7 @@ impl SharedCore {
                     grammar: GrammarEngine::new(),
                     llm: Mutex::new(LlmEngine::new()),
                     user_scorer: Mutex::new(user_scorer),
-                    user_scores_path: scores_path,
+                    store,
                 })
             })
             .clone()
@@ -516,20 +531,15 @@ impl ConversionEngine {
         let state = self.conversion.take()?;
         let text = state.composed_text();
 
-        // Record only segments where the user explicitly chose a candidate
+        // Record only segments where the user explicitly chose a candidate.
+        // record() persists immediately when the scorer is store-attached,
+        // so no separate save step is needed.
         {
             let mut user_scorer = self.shared.user_scorer.lock().unwrap();
             for seg in &state.segments {
                 if seg.user_selected {
                     let surface = &seg.candidates[seg.selected];
                     user_scorer.record(&seg.reading, surface);
-                }
-            }
-
-            // Persist scores
-            if let Some(ref path) = self.shared.user_scores_path {
-                if let Err(e) = user_scorer.save(path) {
-                    log::warn!("Failed to save user scores: {}", e);
                 }
             }
         }

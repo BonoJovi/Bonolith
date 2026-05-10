@@ -60,17 +60,18 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            let mut dict = Dictionary::new();
-            let user_dict_path = Dictionary::default_user_dict_path().unwrap();
-            let loaded = match dict.load_user_entries(&user_dict_path) {
-                Ok(n) => n,
+            let (dict, loaded) = match Dictionary::with_default_store() {
+                Ok(d) => {
+                    let n = d.user_entries().len();
+                    (d, n)
+                }
                 Err(e) => {
                     eprintln!(
-                        "Warning: could not load existing user dictionary; \
+                        "Warning: could not open user dictionary store; \
                          exporting builtin entries only.\n  {}",
                         e
                     );
-                    0
+                    (Dictionary::new(), 0)
                 }
             };
             match dict.export(&path) {
@@ -96,26 +97,21 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            let mut dict = Dictionary::new();
-            let user_dict_path = Dictionary::default_user_dict_path().unwrap();
-            // Refuse to import if the existing user dictionary is unreadable —
-            // saving afterward would overwrite it and silently drop entries.
-            if user_dict_path.exists() {
-                if let Err(e) = dict.load_user_entries(&user_dict_path) {
+            let mut dict = match Dictionary::with_default_store() {
+                Ok(d) => d,
+                Err(e) => {
                     eprintln!(
-                        "Error: could not load existing user dictionary at {}.\n  {}\n\
-                         Aborting import to avoid overwriting it. \
-                         Fix the file (or move it aside) and retry.",
-                        user_dict_path.display(),
+                        "Error: could not open user dictionary store.\n  {}\n\
+                         Cannot import without a working store.",
                         e
                     );
                     std::process::exit(1);
                 }
-            }
+            };
             match dict.import(&path) {
                 Ok(added) => {
-                    if let Err(e) = dict.save_user_entries(&user_dict_path) {
-                        eprintln!("Error: failed to save user dictionary: {}", e);
+                    if let Err(e) = dict.sync_user_entries_to_store() {
+                        eprintln!("Error: failed to persist user dictionary: {}", e);
                         std::process::exit(1);
                     }
                     println!(

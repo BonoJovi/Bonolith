@@ -914,9 +914,13 @@ impl JaimEngine {
                 if path.is_empty() {
                     return;
                 }
-                let mut dict = Dictionary::new();
-                let user_dict_path = Dictionary::default_user_dict_path().unwrap();
-                let _ = dict.load_user_entries(&user_dict_path);
+                let dict = match Dictionary::with_default_store() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!("JaIM: could not open dict store for export: {}", e);
+                        return;
+                    }
+                };
                 match dict.export(std::path::Path::new(&path)) {
                     Ok(()) => {
                         info!("JaIM: Dictionary exported to {}", path);
@@ -952,12 +956,16 @@ impl JaimEngine {
                 if path.is_empty() {
                     return;
                 }
-                let mut dict = Dictionary::new();
-                let user_dict_path = Dictionary::default_user_dict_path().unwrap();
-                let _ = dict.load_user_entries(&user_dict_path);
+                let mut dict = match Dictionary::with_default_store() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!("JaIM: could not open dict store for import: {}", e);
+                        return;
+                    }
+                };
                 match dict.import(std::path::Path::new(&path)) {
                     Ok(added) => {
-                        if let Err(e) = dict.save_user_entries(&user_dict_path) {
+                        if let Err(e) = dict.sync_user_entries_to_store() {
                             warn!("JaIM: Failed to save after import: {}", e);
                             let _ = std::process::Command::new("zenity")
                                 .args(["--error", "--title=JaIM",
@@ -1027,15 +1035,13 @@ impl JaimEngine {
                 {
                     let mut dict = shared.dictionary.write().unwrap();
                     dict.add_entry(entry);
-                    if let Ok(path) = Dictionary::default_user_dict_path() {
-                        if let Err(e) = dict.save_user_entries(&path) {
-                            warn!("JaIM: Failed to save user dict: {}", e);
-                            let _ = std::process::Command::new("zenity")
-                                .args(["--error", "--title=JaIM",
-                                       &format!("--text=保存に失敗しました: {}", e)])
-                                .spawn();
-                            return;
-                        }
+                    if let Err(e) = dict.sync_user_entries_to_store() {
+                        warn!("JaIM: Failed to save user dict: {}", e);
+                        let _ = std::process::Command::new("zenity")
+                            .args(["--error", "--title=JaIM",
+                                   &format!("--text=保存に失敗しました: {}", e)])
+                            .spawn();
+                        return;
                     }
                 }
 
@@ -1188,15 +1194,13 @@ impl JaimEngine {
         let shared = SharedCore::global();
         let mut dict = shared.dictionary.write().unwrap();
         dict.replace_user_entries(entries);
-        if let Ok(path) = Dictionary::default_user_dict_path() {
-            if let Err(e) = dict.save_user_entries(&path) {
-                warn!("JaIM: Failed to save user dict: {}", e);
-                let _ = std::process::Command::new("zenity")
-                    .args(["--error", "--title=JaIM",
-                           &format!("--text=保存に失敗しました: {}", e)])
-                    .spawn();
-                return;
-            }
+        if let Err(e) = dict.sync_user_entries_to_store() {
+            warn!("JaIM: Failed to save user dict: {}", e);
+            let _ = std::process::Command::new("zenity")
+                .args(["--error", "--title=JaIM",
+                       &format!("--text=保存に失敗しました: {}", e)])
+                .spawn();
+            return;
         }
         let _ = std::process::Command::new("zenity")
             .args(["--info", "--title=JaIM",
