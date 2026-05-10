@@ -17,8 +17,13 @@ add_library(fcitx5-jaim MODULE jaim_engine.cpp)
 # developer's build-tree absolute path. After install, the runtime
 # loader resolves libjaim.so via the standard search path
 # (/usr/lib/x86_64-linux-gnu, which is where we install it).
+# BUILD_WITH_INSTALL_RPATH=TRUE makes the build artifact already use
+# the (empty) INSTALL_RPATH, so install.sh's plain `install -D` copy
+# from build/ to /usr/lib delivers a clean binary without needing
+# `make install` to strip the convenience build rpath afterwards.
 set_target_properties(fcitx5-jaim PROPERTIES
     PREFIX ""
+    BUILD_WITH_INSTALL_RPATH TRUE
     INSTALL_RPATH ""
     INSTALL_RPATH_USE_LINK_PATH FALSE
 )
