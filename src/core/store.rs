@@ -147,13 +147,18 @@ impl DictStore {
     /// if not already done. Idempotent: a meta flag prevents repeated
     /// runs. On success, the JSON files are renamed to `*.migrated` so
     /// the user can recover from them if needed.
+    ///
+    /// If the migration flag is already set but the JSON files exist,
+    /// they are stale leftovers from a v1.x process that wrote after
+    /// the upgrade — recover their content into SQLite (without double-
+    /// counting) and rename them to `*.stale`.
     pub fn migrate_legacy_json(
         &self,
         dict_json: &Path,
         scores_json: &Path,
     ) -> io::Result<()> {
         if self.is_migrated()? {
-            return Ok(());
+            return self.recover_stale_jsons(dict_json, scores_json);
         }
 
         let entries = read_legacy_dict_json(dict_json)?;
@@ -204,6 +209,123 @@ impl DictStore {
             entries.len(),
             scores.len()
         );
+        Ok(())
+    }
+
+    /// Merge stale post-migration JSON files (`user_dict.json`,
+    /// `user_scores.json`) into SQLite. Called only when the migration
+    /// flag is already set, i.e. the JSON files are leftovers from a
+    /// v1.x process that ran after the JaIM upgrade.
+    ///
+    /// Semantics:
+    /// - Dict: `INSERT OR IGNORE` so existing SQLite entries win on
+    ///   conflict — the v2.0+ engine is the source of truth.
+    /// - Scores: take `MAX(json_count, sqlite_count)` so we recover
+    ///   keystrokes captured only by the stale process without double-
+    ///   counting keystrokes already recorded in SQLite.
+    ///
+    /// Files are renamed to `*.stale` (not `*.migrated`, to preserve
+    /// the distinction between the original migration backup and a
+    /// post-migration leftover).
+    fn recover_stale_jsons(
+        &self,
+        dict_json: &Path,
+        scores_json: &Path,
+    ) -> io::Result<()> {
+        let dict_existed = dict_json.exists();
+        let scores_existed = scores_json.exists();
+        if !dict_existed && !scores_existed {
+            return Ok(());
+        }
+
+        let entries = if dict_existed {
+            read_legacy_dict_json(dict_json)?
+        } else {
+            Vec::new()
+        };
+        let scores = if scores_existed {
+            read_legacy_scores_json(scores_json)?
+        } else {
+            HashMap::new()
+        };
+
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(sqlite_to_io)?;
+
+        let mut entries_added: usize = 0;
+        for entry in &entries {
+            let n = tx
+                .execute(
+                    "INSERT OR IGNORE INTO user_entries (reading, surface, pos, frequency)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        entry.reading,
+                        entry.surface,
+                        pos_to_str(entry.pos),
+                        entry.frequency
+                    ],
+                )
+                .map_err(sqlite_to_io)?;
+            entries_added += n;
+        }
+
+        let mut scores_inserted: usize = 0;
+        let mut scores_updated: usize = 0;
+        for (key, json_count) in &scores {
+            let Some((reading, surface)) = key.split_once('|') else {
+                continue;
+            };
+            let existing: Option<u32> = tx
+                .query_row(
+                    "SELECT count FROM user_scores WHERE reading = ?1 AND surface = ?2",
+                    params![reading, surface],
+                    |row| row.get(0),
+                )
+                .ok();
+            match existing {
+                None => {
+                    tx.execute(
+                        "INSERT INTO user_scores (reading, surface, count)
+                         VALUES (?1, ?2, ?3)",
+                        params![reading, surface, json_count],
+                    )
+                    .map_err(sqlite_to_io)?;
+                    scores_inserted += 1;
+                }
+                Some(c) if c < *json_count => {
+                    tx.execute(
+                        "UPDATE user_scores SET count = ?1
+                         WHERE reading = ?2 AND surface = ?3",
+                        params![json_count, reading, surface],
+                    )
+                    .map_err(sqlite_to_io)?;
+                    scores_updated += 1;
+                }
+                _ => {}
+            }
+        }
+
+        tx.commit().map_err(sqlite_to_io)?;
+        drop(conn);
+
+        if dict_existed {
+            let _ = fs::rename(dict_json, append_extension(dict_json, ".stale"));
+        }
+        if scores_existed {
+            let _ = fs::rename(scores_json, append_extension(scores_json, ".stale"));
+        }
+
+        if entries_added > 0 || scores_inserted > 0 || scores_updated > 0 {
+            log::warn!(
+                "recovered post-migration stale JSON: \
+                 user_entries +{}, user_scores +{}/~{}; files renamed to *.stale",
+                entries_added,
+                scores_inserted,
+                scores_updated,
+            );
+        } else {
+            log::info!("renamed stale post-migration JSON to *.stale (no new data)");
+        }
         Ok(())
     }
 
@@ -566,14 +688,109 @@ mod tests {
         store.migrate_legacy_json(&dict_json, &scores_json).unwrap();
         assert_eq!(store.load_user_entries().unwrap().len(), 1);
 
-        // Drop a NEW JSON in place — second migration must be a no-op
-        std::fs::write(
-            &dict_json,
-            r#"[{"reading":"b","surface":"い","pos":"Other","frequency":2}]"#,
-        )
-        .unwrap();
+        // Second call with no JSON files (already renamed) is a no-op.
         store.migrate_legacy_json(&dict_json, &scores_json).unwrap();
         assert_eq!(store.load_user_entries().unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn recovers_stale_post_migration_jsons() {
+        let path = temp_db_path("recover_stale");
+        let parent = path.parent().unwrap().to_path_buf();
+        let dict_json = parent.join("user_dict.json");
+        let scores_json = parent.join("user_scores.json");
+
+        // First migration: empty initial state, just sets the flag and
+        // renames source files away.
+        std::fs::write(&dict_json, "[]").unwrap();
+        std::fs::write(&scores_json, "{}").unwrap();
+        let store = DictStore::open(&path).unwrap();
+        store.migrate_legacy_json(&dict_json, &scores_json).unwrap();
+
+        // Simulate a v2.0+ engine recording one score directly into
+        // SQLite after migration finishes.
+        store.increment_score("きょう", "今日").unwrap();
+        store.increment_score("きょう", "今日").unwrap(); // count = 2
+        store
+            .upsert_user_entry(&DictionaryEntry {
+                reading: "shared".to_string(),
+                surface: "共有".to_string(),
+                pos: PartOfSpeech::Noun,
+                frequency: 100,
+            })
+            .unwrap();
+
+        // Now a stale v1.x-style process drops fresh JSON files in
+        // place: a new dict entry, plus scores where one overlaps and
+        // one is unique to the JSON side.
+        std::fs::write(
+            &dict_json,
+            r#"[
+                {"reading":"shared","surface":"共有","pos":"Noun","frequency":100},
+                {"reading":"くろーど","surface":"クロード","pos":"Noun","frequency":50}
+            ]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &scores_json,
+            // きょう|今日 in JSON has count 1, lower than SQLite's 2 → keep SQLite
+            // へんかん|変換 only in JSON → recover
+            r#"{"きょう|今日":1,"へんかん|変換":3}"#,
+        )
+        .unwrap();
+
+        // Re-call migrate_legacy_json — flag is set, so this triggers
+        // the stale-recovery path.
+        store.migrate_legacy_json(&dict_json, &scores_json).unwrap();
+
+        // Dict: shared was already there (skipped), クロード was added.
+        let mut entries = store.load_user_entries().unwrap();
+        entries.sort_by(|a, b| a.surface.cmp(&b.surface));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].surface, "クロード");
+        assert_eq!(entries[1].surface, "共有");
+
+        // Scores: 今日 stayed at 2 (max), 変換 inserted as 3.
+        let scores = store.load_user_scores().unwrap();
+        assert_eq!(scores.get("きょう|今日"), Some(&2));
+        assert_eq!(scores.get("へんかん|変換"), Some(&3));
+
+        // Files renamed to .stale (not .migrated, to preserve the
+        // distinction).
+        assert!(!dict_json.exists());
+        assert!(parent.join("user_dict.json.stale").exists());
+        assert!(!scores_json.exists());
+        assert!(parent.join("user_scores.json.stale").exists());
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn recovery_on_clean_install_is_noop() {
+        // No JSON files anywhere → recover_stale_jsons must not fail
+        // and must not create empty .stale artifacts.
+        let path = temp_db_path("recover_clean");
+        let parent = path.parent().unwrap().to_path_buf();
+        let dict_json = parent.join("user_dict.json");
+        let scores_json = parent.join("user_scores.json");
+
+        let store = DictStore::open(&path).unwrap();
+        // Set the migration flag manually so migrate_legacy_json takes
+        // the recovery path on first call.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, '1')",
+                params![MIGRATION_FLAG],
+            )
+            .unwrap();
+        }
+        store.migrate_legacy_json(&dict_json, &scores_json).unwrap();
+
+        assert!(!parent.join("user_dict.json.stale").exists());
+        assert!(!parent.join("user_scores.json.stale").exists());
 
         let _ = std::fs::remove_dir_all(&parent);
     }
