@@ -712,6 +712,42 @@ impl Dictionary {
                 frequency: 8000,
             });
         }
+
+        // IT/tech katakana supplement — terms absent from IPADIC that cause
+        // mis-segmentation or produce wrong kanji candidates.
+        // Frequencies reflect typical input-method usage weight (8000 = common,
+        // 7000 = moderately common, 6000 = less frequent but important).
+        let katakana_it: &[(&str, &str, u32)] = &[
+            // --- Infrastructure / DevOps ---
+            ("どっかー",           "ドッカー",           8500), // Docker (ど+っ+かー without entry)
+            ("くらうど",           "クラウド",           9000), // Cloud (くら=鞍, うど=独活 without entry)
+            ("くーばーねてす",     "クーバーネテス",     7000), // Kubernetes
+            ("くべるねてす",       "クベルネテス",       7000), // Kubernetes alt reading
+            ("でぷろいめんと",     "デプロイメント",     7500), // Deployment
+            ("くらすたー",         "クラスター",         8000), // Cluster
+            ("みどるうぇあ",       "ミドルウェア",       7500), // Middleware
+            // --- Development tools ---
+            ("ふれーむわーく",     "フレームワーク",     8500), // Framework (フレーム+ワーク split)
+            ("まいくろさーびす",   "マイクロサービス",   7500), // Microservice (マイクロ+サービス split)
+            ("ぎっとはぶ",         "ギットハブ",         8000), // GitHub
+            ("りびゅー",           "レビュー",           8500), // Review (りびゅー not in IPADIC)
+            // --- AI / ML ---
+            ("でぃーぷらーにんぐ", "ディープラーニング", 8000), // Deep Learning (broken without entry)
+            // --- General IT ---
+            ("くらいあんと",       "クライアント",       8500), // Client
+            ("くえりー",           "クエリー",           8000), // Query
+            ("えいぴーあい",       "API",                8000), // API
+            ("すたーとあっぷ",     "スタートアップ",     7500), // Startup
+            ("じゃば",             "ジャバ",             7500), // Java
+        ];
+        for &(reading, surface, freq) in katakana_it {
+            self.add_entry(DictionaryEntry {
+                reading: reading.to_string(),
+                surface: surface.to_string(),
+                pos: PartOfSpeech::Noun,
+                frequency: freq,
+            });
+        }
     }
 }
 
@@ -1107,5 +1143,42 @@ mod tests {
         let words: Vec<&str> = segments.iter().map(|s| s.reading.as_str()).collect();
         // Noun+Particle merge: とうきょう+に → とうきょうに (bunsetsu unit)
         assert_eq!(words, vec!["とうきょうに", "いく"]);
+    }
+
+    #[test]
+    fn segmentation_katakana_coverage() {
+        let dict = Dictionary::new();
+        let tests: &[(&str, &[&str])] = &[
+            ("さーばー",         &["さーばー"]),
+            ("でーたべーす",     &["でーたべーす"]),
+            ("ふれーむわーく",   &["ふれーむわーく"]),
+            ("らいぶらりー",     &["らいぶらりー"]),
+            ("こんてなー",       &["こんてなー"]),
+            ("どっかー",         &["どっかー"]),
+            ("くらうど",         &["くらうど"]),
+            ("えんどぽいんと",   &["えんどぽいんと"]),
+            ("りくえすと",       &["りくえすと"]),
+            ("れすぽんす",       &["れすぽんす"]),
+            ("でぃーぷらーにんぐ", &["でぃーぷらーにんぐ"]),
+            ("あるごりずむ",     &["あるごりずむ"]),
+            ("きゃっしゅ",       &["きゃっしゅ"]),
+            ("でぷろい",         &["でぷろい"]),
+            ("まいくろさーびす", &["まいくろさーびす"]),
+        ];
+        let mut failures = 0;
+        for &(input, expected) in tests {
+            let segs: Vec<String> = dict.segment(input).iter().map(|s| s.reading.clone()).collect();
+            let top: Vec<String> = dict.segment(input).iter().map(|s| {
+                s.candidates.first().map(|c| c.surface.clone()).unwrap_or("?".into())
+            }).collect();
+            let pass = segs.iter().map(|s| s.as_str()).collect::<Vec<_>>() == expected;
+            if !pass {
+                failures += 1;
+                eprintln!("FAIL {:20} → {:?}  (top={:?})", input, segs, top);
+            } else {
+                eprintln!("pass {:20} → {:?}", input, top);
+            }
+        }
+        assert_eq!(failures, 0, "{failures} katakana cases failed");
     }
 }
