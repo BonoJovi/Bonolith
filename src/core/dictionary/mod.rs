@@ -661,6 +661,9 @@ impl Dictionary {
             // 「目の前」: IPADIC splits as め(Noun)+の(Particle)+まえ(Noun).
             // Adding as a single Noun lets 「めのまえに」 = めのまえ+に (Particle).
             ("めのまえ", "目の前"),
+            // 「桃のうち」: proverb phrase. IPADIC splits as もも+のうち (農地).
+            // Single entry fixes the tail segment of すもももももももものうち.
+            ("もものうち", "桃のうち"),
         ];
         for &(reading, surface) in compound_nouns {
             self.add_entry(DictionaryEntry {
