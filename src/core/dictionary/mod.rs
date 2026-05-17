@@ -748,6 +748,61 @@ impl Dictionary {
                 frequency: freq,
             });
         }
+
+        // General Japanese supplement — common words/forms absent from IPADIC
+        // that appeared in user dictionaries and are useful for all users.
+        let general_supplement: &[(&str, &str, u32)] = &[
+            // Common nouns / expressions
+            ("かのうせい",   "可能性",       8500), // extremely common; IPADIC omits hiragana surface
+            ("ざんりょう",   "残量",         7500),
+            ("きに",         "気に",         7500),
+            ("きょうどう",   "協働",         7500), // collaborative; IPADIC has 協同/共同 but not 協働
+            ("とくのう",     "特濃",         7500), // e.g. 明治 特濃
+            ("いしがま",     "石窯",         7500),
+            ("にんにくのめ", "にんにくの芽", 7000),
+            // Common verb/adj inflections missing as surface forms
+            ("つくろう",   "作ろう",   7500), // volitional; 繕う(tsukurou) is a different word
+            ("とろう",     "取ろう",   7500), // volitional; distinct from 徒労
+            ("のこして",   "残して",   7500),
+            ("よわく",     "弱く",     7500),
+            ("いない",     "いない",   7300), // keep below 以内(7631) so 以内 still ranks first
+            ("いなく",     "いなく",   7300),
+            // Internet slang
+            ("わら",   "(笑)",  8000),
+            // Additional katakana (general/IT)
+            ("まいぐれーしょん", "マイグレーション", 7500),
+            ("いれぎゅらー",     "イレギュラー",     7500),
+            ("いんすとーら",     "インストーラ",     7500),
+            ("おーとちゃーじ",   "オートチャージ",   7000),
+        ];
+        for &(reading, surface, freq) in general_supplement {
+            self.add_entry(DictionaryEntry {
+                reading: reading.to_string(),
+                surface: surface.to_string(),
+                pos: PartOfSpeech::Noun,
+                frequency: freq,
+            });
+        }
+
+        // Box-drawing characters (罫線) — useful for text tables and diagrams.
+        let keisen: &[(&str, &str)] = &[
+            ("けいせん", "└"), ("けいせん", "┘"), ("けいせん", "┌"), ("けいせん", "┐"),
+            ("けいせん", "─"), ("けいせん", "│"), ("けいせん", "┼"), ("けいせん", "├"),
+            ("けいせん", "┤"), ("けいせん", "┬"), ("けいせん", "┴"), ("けいせん", "┗"),
+            ("けいせん", "┛"), ("けいせん", "┏"), ("けいせん", "┓"), ("けいせん", "━"),
+            ("けいせん", "┃"), ("けいせん", "╋"), ("けいせん", "┣"), ("けいせん", "┫"),
+            ("けいせん", "┳"), ("けいせん", "┻"), ("けいせん", "┿"), ("けいせん", "┝"),
+            ("けいせん", "┥"), ("けいせん", "┯"), ("けいせん", "┰"),
+            ("けいせん", "┷"), ("けいせん", "┸"), ("けいせん", "╂"),
+        ];
+        for &(reading, surface) in keisen {
+            self.add_entry(DictionaryEntry {
+                reading: reading.to_string(),
+                surface: surface.to_string(),
+                pos: PartOfSpeech::Noun,
+                frequency: 8000,
+            });
+        }
     }
 }
 
@@ -1180,5 +1235,45 @@ mod tests {
             }
         }
         assert_eq!(failures, 0, "{failures} katakana cases failed");
+    }
+
+    #[test]
+    fn general_supplement_coverage() {
+        let dict = Dictionary::new();
+        // Verify each entry promoted from user dict to builtin appears as a
+        // top-ranked candidate so it is safe to remove from the user dict.
+        let cases: &[(&str, &str)] = &[
+            ("かのうせい",   "可能性"),
+            ("ざんりょう",   "残量"),
+            ("きょうどう",   "協働"),
+            ("つくろう",     "作ろう"),
+            ("とろう",       "取ろう"),
+            ("のこして",     "残して"),
+            ("よわく",       "弱く"),
+            ("いなく",       "いなく"),
+            ("とくのう",     "特濃"),
+            ("いしがま",     "石窯"),
+            ("にんにくのめ", "にんにくの芽"),
+            ("わら",         "(笑)"),
+            ("まいぐれーしょん", "マイグレーション"),
+            ("いれぎゅらー",     "イレギュラー"),
+            ("いんすとーら",     "インストーラ"),
+            ("おーとちゃーじ",   "オートチャージ"),
+            ("けいせん",     "┌"),
+        ];
+        let mut failures = 0;
+        for &(reading, expected_surface) in cases {
+            let segs = dict.segment(reading);
+            let all_surfaces: Vec<&str> = segs.iter()
+                .flat_map(|s| s.candidates.iter().map(|c| c.surface.as_str()))
+                .collect();
+            if !all_surfaces.contains(&expected_surface) {
+                failures += 1;
+                eprintln!("FAIL {reading:20}: expected {expected_surface:?} in candidates {all_surfaces:?}");
+            } else {
+                eprintln!("pass {reading:20} → {expected_surface}");
+            }
+        }
+        assert_eq!(failures, 0, "{failures} supplement entries missing from candidates");
     }
 }
