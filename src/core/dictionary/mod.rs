@@ -396,12 +396,12 @@ impl Dictionary {
         Ok(dict)
     }
 
-    /// Export the entire dictionary (builtin + user) to a JSON file.
+    /// Export user dictionary entries to a JSON file.
     pub fn export(&self, path: &Path) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let json = serde_json::to_string_pretty(&self.entries)
+        let json = serde_json::to_string_pretty(&self.entries[self.user_start..])
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         fs::write(path, json)
     }

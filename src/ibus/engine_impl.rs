@@ -1035,7 +1035,17 @@ impl JaimEngine {
             return;
         }
 
+        const MAX_DISPLAY: usize = 500;
+        if user_entries.len() > MAX_DISPLAY {
+            let _ = std::process::Command::new("zenity")
+                .args(["--warning", "--title=JaIM",
+                       &format!("--text=ユーザー辞書のエントリが{}件を超えています ({} 件)。\n先頭 {} 件のみ表示します。\nエクスポートして内容を確認してください。",
+                           MAX_DISPLAY, user_entries.len(), MAX_DISPLAY)])
+                .output();
+        }
+
         // Step 1: Show list and let user select an entry
+        let display_entries = &user_entries[..user_entries.len().min(MAX_DISPLAY)];
         let mut args = vec![
             "--list".to_string(),
             "--title=JaIM: 辞書管理".to_string(),
@@ -1047,7 +1057,7 @@ impl JaimEngine {
             "--width=500".to_string(),
             "--height=400".to_string(),
         ];
-        for (i, entry) in user_entries.iter().enumerate() {
+        for (i, entry) in display_entries.iter().enumerate() {
             args.push(format!("{}", i));
             args.push(entry.reading.clone());
             args.push(entry.surface.clone());
@@ -1075,7 +1085,7 @@ impl JaimEngine {
                 "--list", "--radiolist",
                 "--title=JaIM: 操作を選択",
                 &format!("--text=選択中: {} → {}", selected.reading, selected.surface),
-                "--column=", "--column=操作",
+                "--column=選択", "--column=操作",
                 "TRUE", "編集",
                 "FALSE", "削除",
             ])
