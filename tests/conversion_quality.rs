@@ -53,6 +53,7 @@ struct BucketStats {
     parity_pass: u32,
     boundary_recall_num: u32,
     boundary_recall_den: u32,
+    over_segments_sum: u32,
 }
 
 #[test]
@@ -68,6 +69,7 @@ fn evaluate_conversion_cases() {
     let mut parity_pass = 0u32;
     let mut recall_num_total = 0u32;
     let mut recall_den_total = 0u32;
+    let mut over_segments_total = 0u32;
 
     eprintln!("\n=== Per-case results ===");
     for line in content.lines() {
@@ -124,6 +126,7 @@ fn evaluate_conversion_cases() {
         }
         recall_num_total += matched;
         recall_den_total += exp_count;
+        over_segments_total += over_segments as u32;
 
         let b = buckets.entry(case.pos_solvable.clone()).or_default();
         b.total += 1;
@@ -135,6 +138,7 @@ fn evaluate_conversion_cases() {
         }
         b.boundary_recall_num += matched;
         b.boundary_recall_den += exp_count;
+        b.over_segments_sum += over_segments as u32;
 
         let readings: Vec<&str> = segments.iter().map(|s| s.reading.as_str()).collect();
         let refine_tag = if is_refinement { "REFINE" } else { "miss  " };
@@ -185,12 +189,26 @@ fn evaluate_conversion_cases() {
         total,
         pct(parity_pass, total),
     );
+    let avg_over = if total > 0 {
+        over_segments_total as f64 / total as f64
+    } else {
+        0.0
+    };
+    eprintln!(
+        "Over-segments:     {} total, {:.2} avg/case   [JaIM boundaries that fall inside an expected phrase]",
+        over_segments_total, avg_over,
+    );
 
     eprintln!("\n=== By pos_solvable ===");
-    eprintln!("{:<8}  refinement     boundary-recall  parity", "bucket");
+    eprintln!("{:<8}  refinement     boundary-recall  over  parity", "bucket");
     for (bucket, s) in &buckets {
+        let bucket_avg_over = if s.total > 0 {
+            s.over_segments_sum as f64 / s.total as f64
+        } else {
+            0.0
+        };
         eprintln!(
-            "{:<8}  {:>3}/{:>3} ({:>5.1}%)  {:>3}/{:>3} ({:>5.1}%)  {:>3}/{:>3} ({:>5.1}%)",
+            "{:<8}  {:>3}/{:>3} ({:>5.1}%)  {:>3}/{:>3} ({:>5.1}%)  {:>4.2}  {:>3}/{:>3} ({:>5.1}%)",
             bucket,
             s.refinement_pass,
             s.total,
@@ -198,6 +216,7 @@ fn evaluate_conversion_cases() {
             s.boundary_recall_num,
             s.boundary_recall_den,
             pct(s.boundary_recall_num, s.boundary_recall_den),
+            bucket_avg_over,
             s.parity_pass,
             s.total,
             pct(s.parity_pass, s.total),
