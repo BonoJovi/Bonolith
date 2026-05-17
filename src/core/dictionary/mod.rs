@@ -327,7 +327,7 @@ impl Dictionary {
         boundaries.reverse();
 
         // Build segments
-        boundaries
+        let segments: Vec<Segment> = boundaries
             .into_iter()
             .map(|(start, end)| {
                 let reading: String = chars[start..end].iter().collect();
@@ -343,7 +343,74 @@ impl Dictionary {
                     candidates,
                 }
             })
-            .collect()
+            .collect();
+
+        self.merge_affix_compounds(segments)
+    }
+
+    /// Return the dominant (highest-frequency) PartOfSpeech for a segment, if any.
+    fn dominant_pos(seg: &Segment) -> Option<PartOfSpeech> {
+        seg.candidates.iter().max_by_key(|e| e.frequency).map(|e| e.pos)
+    }
+
+    /// Merge adjacent Noun+Suffix and Prefix+(Noun|Suffix) pairs into compound
+    /// segments. This collapses patterns like 技術+的 → 技術的 and 委員+会 →
+    /// 委員会 that the DP leaves separate because the compound isn't a single
+    /// dictionary entry.
+    fn merge_affix_compounds(&self, mut segs: Vec<Segment>) -> Vec<Segment> {
+        let mut i = 0;
+        while i + 1 < segs.len() {
+            let cur = Self::dominant_pos(&segs[i]);
+            let nxt = Self::dominant_pos(&segs[i + 1]);
+            let should_merge = matches!(
+                (cur, nxt),
+                // Noun + Suffix: 技術+的, 委員+会, 全国+化
+                (Some(PartOfSpeech::Noun), Some(PartOfSpeech::Suffix))
+                // Prefix + Noun: 各+国, 全+体
+                | (Some(PartOfSpeech::Prefix), Some(PartOfSpeech::Noun))
+                // Prefix + Suffix: 何+回, 何+人 (counter combos)
+                | (Some(PartOfSpeech::Prefix), Some(PartOfSpeech::Suffix))
+            );
+            if should_merge {
+                let right = segs.remove(i + 1);
+                let left = &mut segs[i];
+                let merged_reading = format!("{}{}", left.reading, right.reading);
+                let merged_candidates = {
+                    let from_dict: Vec<DictionaryEntry> =
+                        self.lookup(&merged_reading).into_iter().cloned().collect();
+                    if !from_dict.is_empty() {
+                        from_dict
+                    } else {
+                        // Synthetic: Cartesian product of top-3 candidates from each side
+                        let l_tops: Vec<_> = left.candidates.iter().take(3).collect();
+                        let r_tops: Vec<_> = right.candidates.iter().take(3).collect();
+                        let mr = merged_reading.clone();
+                        l_tops
+                            .iter()
+                            .flat_map(|l| {
+                                let mr = mr.clone();
+                                r_tops.iter().map(move |r| DictionaryEntry {
+                                    reading: mr.clone(),
+                                    surface: format!("{}{}", l.surface, r.surface),
+                                    pos: PartOfSpeech::Noun,
+                                    frequency: l.frequency.min(r.frequency),
+                                })
+                            })
+                            .collect()
+                    }
+                };
+                *left = Segment {
+                    reading: merged_reading,
+                    start: left.start,
+                    len: left.len + right.len,
+                    candidates: merged_candidates,
+                };
+                // Don't advance i — the new merged segment may itself be mergeable.
+            } else {
+                i += 1;
+            }
+        }
+        segs
     }
 
     /// Return a slice of user-added entries.

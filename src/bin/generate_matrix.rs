@@ -75,6 +75,10 @@ const OVERRIDES: &[(&str, &str, f64, &str)] = &[
     // (氏/様/的/化/etc.), so a universal 0.000 lets the DP take spurious
     // suffix splits like りょうかい|し(suf)|ました over りょうかい|しました.
     ("Noun", "Suffix",        2.500, "氏/様/的 chain is natural but not free; was 0.000 IPADIC artifact"),
+    // Suffix → Noun: IPADIC average 6.304 is too expensive — after 的/会/回 a
+    // new Noun is common (技術的+審査委員会). Lowering to 3.0 lets しんさ win
+    // over しん+さ(Particle) chains which exploit cheap Suf→Part (1.267).
+    ("Suffix", "Noun",        3.000, "てき→審査, 的→委員会 chains; Suf→Part=1.267 otherwise beats Suf→N=6.3"),
 ];
 
 /// Same mapping as generate_dict.rs::map_pos — keep in sync.
