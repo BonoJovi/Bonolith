@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 
 use crate::core::{
-    dictionary::{Dictionary, DictionaryEntry, PartOfSpeech, Segment},
+    dictionary::{connection_cost, Dictionary, DictionaryEntry, PartOfSpeech, Segment},
     grammar::{GrammarEngine, GrammarToken},
     llm::LlmEngine,
     romaji::RomajiConverter,
@@ -1022,7 +1022,10 @@ impl ConversionEngine {
     }
 
     /// Heuristic score for segmentation quality.
-    /// Prefers: fewer segments, higher word frequencies, longer matched words.
+    /// Prefers: fewer segments, higher word frequencies, longer matched words,
+    /// and natural POS bigram transitions (via the dictionary's CONN table —
+    /// same one the segmentation DP uses, so the filter and the DP agree on
+    /// what "natural" means).
     fn score_segmentation_heuristic(segments: &[Segment]) -> f64 {
         if segments.is_empty() {
             return 0.0;
@@ -1030,13 +1033,11 @@ impl ConversionEngine {
 
         let mut score = 0.0;
         let total_chars: usize = segments.iter().map(|s| s.len).sum();
+        let mut prev_pos: Option<PartOfSpeech> = None;
 
         for seg in segments {
-            let top_freq = seg
-                .candidates
-                .first()
-                .map(|c| c.frequency as f64)
-                .unwrap_or(100.0); // low default for unknown segments
+            let top = seg.candidates.first();
+            let top_freq = top.map(|c| c.frequency as f64).unwrap_or(100.0);
 
             // Weighted frequency: longer segments contribute more (reward compound recognition)
             let weight = seg.len as f64 / total_chars as f64;
@@ -1044,14 +1045,21 @@ impl ConversionEngine {
 
             // Penalty for single-char non-particle segments (likely fragmented)
             if seg.len == 1 {
-                let is_particle = seg
-                    .candidates
-                    .first()
+                let is_particle = top
                     .map(|c| matches!(c.pos, PartOfSpeech::Particle | PartOfSpeech::Auxiliary))
                     .unwrap_or(false);
                 if !is_particle {
                     score -= 1.0;
                 }
+            }
+
+            // POS-bigram penalty using the dictionary CONN table. Scaled by 0.3
+            // so a worst-case transition (~8.0) costs ~2.4 — comparable to a
+            // weighted-frequency term but never dominates it.
+            if let Some(top) = top {
+                let conn = connection_cost(prev_pos, top.pos);
+                score -= conn * 0.3;
+                prev_pos = Some(top.pos);
             }
         }
 

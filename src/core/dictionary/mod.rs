@@ -67,7 +67,11 @@ impl PartOfSpeech {
 }
 
 /// Bigram connection cost lookup. Returns 0.0 at sentence start (prev=None).
-fn connection_cost(prev: Option<PartOfSpeech>, cur: PartOfSpeech) -> f64 {
+///
+/// Exposed publicly so downstream scorers (e.g. the engine's segmentation
+/// filter heuristic) can score candidate segmentations on the same CONN
+/// scale the DP optimizes against, keeping the two stages consistent.
+pub fn connection_cost(prev: Option<PartOfSpeech>, cur: PartOfSpeech) -> f64 {
     match prev {
         None => 0.0,
         Some(p) => CONNECTION_COST[p.idx()][cur.idx()],
