@@ -79,6 +79,12 @@ const OVERRIDES: &[(&str, &str, f64, &str)] = &[
     // new Noun is common (技術的+審査委員会). Lowering to 3.0 lets しんさ win
     // over しん+さ(Particle) chains which exploit cheap Suf→Part (1.267).
     ("Suffix", "Noun",        3.000, "てき→審査, 的→委員会 chains; Suf→Part=1.267 otherwise beats Suf→N=6.3"),
+    // Noun → Conjunction: IPADIC average 6.977 is too high — compound conjunctions
+    // like だから (Conj) naturally follow Nouns (天気だから). The high value let a
+    // spurious だ(打,Suffix,1267)+から(Particle,9345) path via CONN[Suf→Part]=1.267
+    // beat the correct だから(Conj,6003) entry. Lowering to 4.5 fixes this with
+    // a comfortable 2.17-point margin.
+    ("Noun", "Conjunction",   4.500, "天気だから: N→Conj=6.977 let spurious Suf→Part path beat だから(Conj,6003)"),
 ];
 
 /// Same mapping as generate_dict.rs::map_pos — keep in sync.
