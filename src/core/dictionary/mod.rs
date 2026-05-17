@@ -353,31 +353,58 @@ impl Dictionary {
         seg.candidates.iter().max_by_key(|e| e.frequency).map(|e| e.pos)
     }
 
-    /// Merge adjacent Noun+Suffix and Prefix+(Noun|Suffix) pairs into compound
-    /// segments. This collapses patterns like 技術+的 → 技術的 and 委員+会 →
-    /// 委員会 that the DP leaves separate because the compound isn't a single
-    /// dictionary entry.
+    /// Merge adjacent compound pairs into single segments.
+    ///
+    /// Rules:
+    /// - Noun + Suffix     → compound noun (技術+的, 委員+会)
+    /// - Prefix + Noun     → compound noun (各+国, 全+体)
+    /// - Prefix + Suffix   → compound noun (何+回, 何+人)
+    /// - Noun + Particle   → bunsetsu unit (雨+が, 私+は, 感謝+の)
+    ///
+    /// The last rule collapses morpheme-level Noun-Particle splits into
+    /// bunsetsu-level units, matching how Japanese IMEs present candidates.
+    /// Merged POS reflects the right element so the result does not
+    /// re-trigger a further Noun+Particle merge.
     fn merge_affix_compounds(&self, mut segs: Vec<Segment>) -> Vec<Segment> {
         let mut i = 0;
         while i + 1 < segs.len() {
             let cur = Self::dominant_pos(&segs[i]);
             let nxt = Self::dominant_pos(&segs[i + 1]);
-            let should_merge = matches!(
+            let is_noun_particle = matches!(
                 (cur, nxt),
-                // Noun + Suffix: 技術+的, 委員+会, 全国+化
-                (Some(PartOfSpeech::Noun), Some(PartOfSpeech::Suffix))
-                // Prefix + Noun: 各+国, 全+体
-                | (Some(PartOfSpeech::Prefix), Some(PartOfSpeech::Noun))
-                // Prefix + Suffix: 何+回, 何+人 (counter combos)
-                | (Some(PartOfSpeech::Prefix), Some(PartOfSpeech::Suffix))
+                (Some(PartOfSpeech::Noun), Some(PartOfSpeech::Particle))
             );
+            let should_merge = is_noun_particle
+                || matches!(
+                    (cur, nxt),
+                    // Noun + Suffix: 技術+的, 委員+会, 全国+化
+                    (Some(PartOfSpeech::Noun), Some(PartOfSpeech::Suffix))
+                    // Prefix + Noun: 各+国, 全+体
+                    | (Some(PartOfSpeech::Prefix), Some(PartOfSpeech::Noun))
+                    // Prefix + Suffix: 何+回, 何+人 (counter combos)
+                    | (Some(PartOfSpeech::Prefix), Some(PartOfSpeech::Suffix))
+                );
             if should_merge {
                 let right = segs.remove(i + 1);
                 let left = &mut segs[i];
                 let merged_reading = format!("{}{}", left.reading, right.reading);
+                // Noun+Particle merges use the particle's POS to prevent
+                // cascading re-merges with a subsequent particle.
+                let synthetic_pos = if is_noun_particle {
+                    PartOfSpeech::Particle
+                } else {
+                    PartOfSpeech::Noun
+                };
                 let merged_candidates = {
-                    let from_dict: Vec<DictionaryEntry> =
-                        self.lookup(&merged_reading).into_iter().cloned().collect();
+                    // For Noun+Particle, always use Cartesian product: the DP
+                    // already chose N+P over any homophone dict entry (e.g.
+                    // きょうは→教派), so preserving that intent is correct.
+                    let skip_dict = is_noun_particle;
+                    let from_dict: Vec<DictionaryEntry> = if skip_dict {
+                        vec![]
+                    } else {
+                        self.lookup(&merged_reading).into_iter().cloned().collect()
+                    };
                     if !from_dict.is_empty() {
                         from_dict
                     } else {
@@ -392,7 +419,7 @@ impl Dictionary {
                                 r_tops.iter().map(move |r| DictionaryEntry {
                                     reading: mr.clone(),
                                     surface: format!("{}{}", l.surface, r.surface),
-                                    pos: PartOfSpeech::Noun,
+                                    pos: synthetic_pos,
                                     frequency: l.frequency.min(r.frequency),
                                 })
                             })
@@ -870,7 +897,8 @@ mod tests {
         let segments = dict.segment("きょうはいいてんきです");
         let words: Vec<&str> = segments.iter().map(|s| s.reading.as_str()).collect();
 
-        assert_eq!(words, vec!["きょう", "は", "いい", "てんき", "です"]);
+        // Noun+Particle merge: きょう+は → きょうは (bunsetsu unit)
+        assert_eq!(words, vec!["きょうは", "いい", "てんき", "です"]);
     }
 
     #[test]
@@ -878,10 +906,10 @@ mod tests {
         let dict = Dictionary::new();
 
         let segments = dict.segment("きょうはいいてんきです");
-        // きょう segment should have 今日 among its candidates
-        let kyou_seg = segments.iter().find(|s| s.reading == "きょう").unwrap();
+        // Noun+Particle merge produces きょうは; candidates are Cartesian 今日×は
+        let kyou_seg = segments.iter().find(|s| s.reading == "きょうは").unwrap();
         let surfaces: Vec<&str> = kyou_seg.candidates.iter().map(|e| e.surface.as_str()).collect();
-        assert!(surfaces.contains(&"今日"));
+        assert!(surfaces.contains(&"今日は"), "expected 今日は in {:?}", surfaces);
     }
 
     #[test]
@@ -1047,9 +1075,9 @@ mod tests {
             ("りょうかいです", &["りょうかい", "です"]),
             ("かんりょうした", &["かんりょう", "した"]),
             ("かんりょうです", &["かんりょう", "です"]),
-            ("じゅんばんに", &["じゅんばん", "に"]),
+            ("じゅんばんに", &["じゅんばんに"]),
             ("じゅんばんです", &["じゅんばん", "です"]),
-            ("しょうがいがある", &["しょうがい", "が", "ある"]),
+            ("しょうがいがある", &["しょうがいが", "ある"]),
             ("しょうがいです", &["しょうがい", "です"]),
         ];
         for (input, expected) in test_cases {
@@ -1065,6 +1093,7 @@ mod tests {
 
         let segments = dict.segment("とうきょうにいく");
         let words: Vec<&str> = segments.iter().map(|s| s.reading.as_str()).collect();
-        assert_eq!(words, vec!["とうきょう", "に", "いく"]);
+        // Noun+Particle merge: とうきょう+に → とうきょうに (bunsetsu unit)
+        assert_eq!(words, vec!["とうきょうに", "いく"]);
     }
 }
