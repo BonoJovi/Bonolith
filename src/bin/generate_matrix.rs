@@ -41,6 +41,42 @@ fn pos_to_idx(name: &str) -> usize {
         .expect("unknown POS name")
 }
 
+/// Hand-tuned overrides applied **after** IPADIC normalization.
+///
+/// IPADIC's 1316×1316 matrix has fine-grained particle/adjective subtypes
+/// (格助詞 vs 終助詞, 連体形 vs 終止形, …) whose costs span a wide range.
+/// Averaging them into JaIM's 11×11 buckets washes out cells that are
+/// universally cheap in modern written Japanese, producing pathological
+/// asymmetries — most notably N→Part (1.667) vs Part→N (4.679), which
+/// makes the DP prefer wrong merges like は|いい → はい|い.
+///
+/// Each override is a `(left_pos, right_pos, value, reason)` quad. Keep
+/// `reason` short — it is emitted as a comment in the generated table and
+/// also documents the design intent for future regenerations.
+const OVERRIDES: &[(&str, &str, f64, &str)] = &[
+    // Particle → {Noun, Adj, Verb, Adv}: the most common openings after a
+    // case/topic particle. Aggregation artifact from 終助詞 contamination.
+    //
+    // Tuned upward from initial pass (1.5 / 2.0): values too low encouraged
+    // fragmentation through high-frequency single-mora Particle entries
+    // (e.g. たべたい → た|べ|たい, もも → も|も). The values below keep the
+    // important fixes (case_0019, case_0020) while preserving compounds.
+    ("Particle", "Noun",      2.500, "は|わたし; raised from 1.5 to stop べ-as-Particle fragmentation"),
+    ("Particle", "Adjective", 2.500, "は|いい etc — fixes case_0019, segmentation_basic"),
+    ("Particle", "Verb",      3.000, "を|たべる; kept moderate to avoid Particle-glued false splits"),
+    ("Particle", "Adverb",    3.500, "は|すごく etc — valid, less frequent"),
+    // Adjective → Noun: default modification pattern (連体修飾).
+    ("Adjective", "Noun",     2.000, "いい|てんき, あたらしい|ほん — default 連体修飾"),
+    // Adverb → {Verb, Adjective}: standard modification of predicates.
+    ("Adverb", "Verb",        2.500, "はやく|たべる — adverb modifies verb"),
+    ("Adverb", "Adjective",   2.500, "とても|うつくしい — adverb modifies adjective"),
+    // Noun → Suffix: IPADIC normalization gave 0.000 (universal compound-form
+    // magnet). The Suffix bucket is heterogeneous in JaIM's 11-class scheme
+    // (氏/様/的/化/etc.), so a universal 0.000 lets the DP take spurious
+    // suffix splits like りょうかい|し(suf)|ました over りょうかい|しました.
+    ("Noun", "Suffix",        2.500, "氏/様/的 chain is natural but not free; was 0.000 IPADIC artifact"),
+];
+
 /// Same mapping as generate_dict.rs::map_pos — keep in sync.
 fn map_pos(major: &str, sub: &str) -> &'static str {
     match major {
@@ -182,6 +218,20 @@ fn main() -> io::Result<()> {
         mn, mx
     );
 
+    // Apply hand-tuned overrides (post-normalization so they survive regen).
+    let mut override_marks = [[false; POS_COUNT]; POS_COUNT];
+    for (left, right, value, reason) in OVERRIDES {
+        let li = pos_to_idx(left);
+        let ri = pos_to_idx(right);
+        let before = normed[li][ri];
+        normed[li][ri] = *value;
+        override_marks[li][ri] = true;
+        eprintln!(
+            "  override [{:>10} -> {:>10}] {:.3} -> {:.3}  ({})",
+            left, right, before, value, reason
+        );
+    }
+
     // Emit Rust source to stdout
     let out = io::stdout();
     let mut out = out.lock();
@@ -230,7 +280,21 @@ fn main() -> io::Result<()> {
                 write!(out, "  ")?;
             }
         }
-        writeln!(out, "],  // {} ->", short[i])?;
+        // Mark overrides on the row so they are easy to audit at a glance.
+        let overridden_cols: Vec<&str> = (0..POS_COUNT)
+            .filter(|&j| override_marks[i][j])
+            .map(|j| short[j])
+            .collect();
+        if overridden_cols.is_empty() {
+            writeln!(out, "],  // {} ->", short[i])?;
+        } else {
+            writeln!(
+                out,
+                "],  // {} ->   override: {}",
+                short[i],
+                overridden_cols.join(", ")
+            )?;
+        }
     }
     writeln!(out, "];")?;
 

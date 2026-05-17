@@ -20,6 +20,7 @@ v2.x 開発で使用する。
 | `input_hiragana` | string | ✅ | 入力ひらがな (確定前) |
 | `input_romaji` | string | | 入力ローマ字 (任意) |
 | `expected` | string[] | ✅ | 正解の文節区切り + 表記 |
+| `expected_readings` | string[] | ✅ | `expected` と1:1対応する文節ひらがな読み。連結すると `input_hiragana` と一致。refinement check で文節境界を導出 |
 | `actual` | string[] | | JaIMの現状出力 (未計測なら省略可) |
 | `category` | enum | ✅ | `segmentation` / `word_choice` / `inflection` / `both` |
 | `subcategory` | string | | 自由記述 (例: `homophone_misselection`) |
