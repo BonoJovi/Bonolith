@@ -624,6 +624,9 @@ impl Dictionary {
             ("いってらっしゃい", "行ってらっしゃい"),
             ("おかえりなさい", "お帰りなさい"),
             ("おやすみなさい", "おやすみなさい"),
+            // Obligation negation chain. IPADIC splits this into し+なければ+なら+ない
+            // (5 morphemes); a single entry prevents the DP from fragmenting it.
+            ("しなければならない", "しなければならない"),
         ];
         for &(reading, surface) in formulaic {
             self.add_entry(DictionaryEntry {
@@ -650,6 +653,21 @@ impl Dictionary {
                 surface: surface.to_string(),
                 pos: PartOfSpeech::Particle,
                 frequency: 9200,
+            });
+        }
+
+        // Compound nouns (慣用複合名詞) absent from IPADIC as single entries.
+        let compound_nouns: &[(&str, &str)] = &[
+            // 「目の前」: IPADIC splits as め(Noun)+の(Particle)+まえ(Noun).
+            // Adding as a single Noun lets 「めのまえに」 = めのまえ+に (Particle).
+            ("めのまえ", "目の前"),
+        ];
+        for &(reading, surface) in compound_nouns {
+            self.add_entry(DictionaryEntry {
+                reading: reading.to_string(),
+                surface: surface.to_string(),
+                pos: PartOfSpeech::Noun,
+                frequency: 8000,
             });
         }
     }
