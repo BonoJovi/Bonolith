@@ -61,7 +61,7 @@ const OVERRIDES: &[(&str, &str, f64, &str)] = &[
     // fragmentation through high-frequency single-mora Particle entries
     // (e.g. たべたい → た|べ|たい, もも → も|も). The values below keep the
     // important fixes (case_0019, case_0020) while preserving compounds.
-    ("Particle", "Noun",      2.500, "は|わたし; raised from 1.5 to stop べ-as-Particle fragmentation"),
+    ("Particle", "Noun",      3.500, "は|わたし; raised from 2.5 — single-mora Particles (も,に,は freq 8.5k-9.8k) still pulled もも→も|も apart"),
     ("Particle", "Adjective", 2.500, "は|いい etc — fixes case_0019, segmentation_basic"),
     ("Particle", "Verb",      3.000, "を|たべる; kept moderate to avoid Particle-glued false splits"),
     ("Particle", "Adverb",    3.500, "は|すごく etc — valid, less frequent"),
