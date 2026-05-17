@@ -8,6 +8,7 @@
 /// Flow: keystroke → romaji → kana → dictionary segment → grammar score
 ///       → LLM rerank → candidate list → user selects → commit
 
+use std::io::Write as _;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 
@@ -67,6 +68,65 @@ impl ConversionState {
         }
         ranges
     }
+}
+
+/// Opt-in conversion logger for evaluation dataset curation.
+///
+/// When `JAIM_LOG_CONVERSIONS=1` is set in the environment, every committed
+/// conversion is appended as a JSONL record to
+/// `$HOME/.local/share/jaim/conversions.jsonl`. Records contain the reading,
+/// composed output, per-segment alternatives, and which segments the user
+/// explicitly re-selected (a strong signal that the system's first choice was
+/// wrong). See `scripts/curate_cases.py` for the curation workflow.
+///
+/// Privacy: this logs raw committed text. Enable only for short collection
+/// sessions and delete the log file when done. Errors are silently swallowed
+/// so the IME never breaks because of logging.
+fn log_conversion_for_eval(state: &ConversionState) {
+    if std::env::var("JAIM_LOG_CONVERSIONS").ok().as_deref() != Some("1") {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME") else { return };
+    let dir = std::path::Path::new(&home).join(".local/share/jaim");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("conversions.jsonl");
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let segments: Vec<serde_json::Value> = state
+        .segments
+        .iter()
+        .map(|seg| {
+            serde_json::json!({
+                "reading": seg.reading,
+                "selected": seg.candidates.get(seg.selected).cloned().unwrap_or_default(),
+                "user_selected": seg.user_selected,
+                "alternatives": seg.candidates.iter().take(5).cloned().collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    let record = serde_json::json!({
+        "ts": ts,
+        "kana": state.kana,
+        "composed": state.composed_text(),
+        "segments": segments,
+        "version": env!("CARGO_PKG_VERSION"),
+    });
+
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    let _ = writeln!(file, "{}", record);
 }
 
 /// Shared heavy resources (dictionary, grammar, LLM, user scorer).
@@ -510,6 +570,10 @@ impl ConversionEngine {
     pub fn commit_conversion(&mut self) -> Option<String> {
         let state = self.conversion.take()?;
         let text = state.composed_text();
+
+        // Opt-in: dump committed conversion to JSONL for (c) eval dataset curation.
+        // Gated by JAIM_LOG_CONVERSIONS=1 — privacy-sensitive (logs raw text).
+        log_conversion_for_eval(&state);
 
         // Record only segments where the user explicitly chose a candidate.
         // record() persists immediately when the scorer is store-attached,
