@@ -5,7 +5,10 @@
 /// Includes word segmentation via dynamic programming (minimum-cost path).
 
 mod builtin_dict;
+mod connection_cost;
 mod trie;
+
+use connection_cost::CONNECTION_COST;
 
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -42,6 +45,49 @@ pub enum PartOfSpeech {
     Suffix,
     Other,
 }
+
+impl PartOfSpeech {
+    pub const COUNT: usize = 11;
+
+    pub const fn idx(self) -> usize {
+        match self {
+            PartOfSpeech::Noun => 0,
+            PartOfSpeech::Verb => 1,
+            PartOfSpeech::Adjective => 2,
+            PartOfSpeech::Adverb => 3,
+            PartOfSpeech::Particle => 4,
+            PartOfSpeech::Auxiliary => 5,
+            PartOfSpeech::Conjunction => 6,
+            PartOfSpeech::Interjection => 7,
+            PartOfSpeech::Prefix => 8,
+            PartOfSpeech::Suffix => 9,
+            PartOfSpeech::Other => 10,
+        }
+    }
+}
+
+/// Bigram connection cost lookup. Returns 0.0 at sentence start (prev=None).
+fn connection_cost(prev: Option<PartOfSpeech>, cur: PartOfSpeech) -> f64 {
+    match prev {
+        None => 0.0,
+        Some(p) => CONNECTION_COST[p.idx()][cur.idx()],
+    }
+}
+
+/// Index -> PartOfSpeech reverse lookup, used in segmentation DP reconstruction.
+const POS_BY_IDX: [PartOfSpeech; PartOfSpeech::COUNT] = [
+    PartOfSpeech::Noun,
+    PartOfSpeech::Verb,
+    PartOfSpeech::Adjective,
+    PartOfSpeech::Adverb,
+    PartOfSpeech::Particle,
+    PartOfSpeech::Auxiliary,
+    PartOfSpeech::Conjunction,
+    PartOfSpeech::Interjection,
+    PartOfSpeech::Prefix,
+    PartOfSpeech::Suffix,
+    PartOfSpeech::Other,
+];
 
 /// A segment produced by word segmentation
 #[derive(Debug, Clone)]
@@ -178,60 +224,100 @@ impl Dictionary {
             .chain(std::iter::once(input.len()))
             .collect();
 
-        // DP: best_cost[i] = minimum cost to segment chars[0..i]
+        // 2D DP: best_cost[i][pos_idx] = minimum cost to reach char position i
+        // with the last consumed segment having POS = pos_idx. This lets the
+        // optimal path depend on (prev_pos, cur_pos) bigram transitions via
+        // CONNECTION_COST.  back[i][pos_idx] = (start, prev_pos_idx at start).
         const INF: f64 = 1e18;
-        let mut best_cost = vec![INF; n + 1];
-        let mut back: Vec<Option<usize>> = vec![None; n + 1]; // back[i] = start of last segment ending at i
-        best_cost[0] = 0.0;
+        const PC: usize = PartOfSpeech::COUNT;
+        let mut best_cost = vec![[INF; PC]; n + 1];
+        let mut back: Vec<[Option<(usize, usize)>; PC]> = vec![[None; PC]; n + 1];
+
+        // BOS sentinel: seed position 0 in the Other slot; the i==0 check
+        // below skips connection_cost lookup so the slot identity doesn't matter.
+        let bos_slot = PartOfSpeech::Other.idx();
+        best_cost[0][bos_slot] = 0.0;
 
         for i in 0..n {
-            if best_cost[i] >= INF {
-                continue;
-            }
-
+            let is_bos = i == 0;
             let remaining = &input[byte_offsets[i]..];
             let prefixes = self.trie.common_prefix_search(remaining);
 
-            for (len, _indices) in &prefixes {
-                // Cost: prefer longer matches and higher frequency
-                let best_freq = _indices
-                    .iter()
-                    .map(|&idx| self.entries[idx].frequency)
-                    .max()
-                    .unwrap_or(1);
-                let reading: String = chars[i..i + len].iter().collect();
-                let entries: Vec<&DictionaryEntry> = _indices
-                    .iter()
-                    .map(|&idx| &self.entries[idx])
-                    .collect();
-                let boost = boost_fn(&reading, &entries);
-                let cost = segment_cost(*len, best_freq) - boost;
-                let total = best_cost[i] + cost;
-                if total < best_cost[i + len] {
-                    best_cost[i + len] = total;
-                    back[i + len] = Some(i);
+            for prev_p in 0..PC {
+                let prev_cost = best_cost[i][prev_p];
+                if prev_cost >= INF {
+                    continue;
                 }
-            }
+                let prev_pos = if is_bos { None } else { Some(POS_BY_IDX[prev_p]) };
 
-            // Fallback: single character as unknown word (high cost)
-            let unknown_cost = best_cost[i] + 20.0;
-            if unknown_cost < best_cost[i + 1] {
-                best_cost[i + 1] = unknown_cost;
-                back[i + 1] = Some(i);
+                for (len, indices) in &prefixes {
+                    // Group candidates by POS; take the max-frequency entry per POS
+                    // so each POS transition is scored on its strongest candidate.
+                    let mut best_freq_by_pos = [0u32; PC];
+                    for &idx in indices {
+                        let e = &self.entries[idx];
+                        let p = e.pos.idx();
+                        if e.frequency > best_freq_by_pos[p] {
+                            best_freq_by_pos[p] = e.frequency;
+                        }
+                    }
+
+                    let reading: String = chars[i..i + len].iter().collect();
+                    let entries: Vec<&DictionaryEntry> = indices
+                        .iter()
+                        .map(|&idx| &self.entries[idx])
+                        .collect();
+                    let boost = boost_fn(&reading, &entries);
+
+                    for cur_p in 0..PC {
+                        let best_freq = best_freq_by_pos[cur_p];
+                        if best_freq == 0 {
+                            continue;
+                        }
+                        let cur_pos = POS_BY_IDX[cur_p];
+                        let conn = connection_cost(prev_pos, cur_pos);
+                        let cost = segment_cost(*len, best_freq) + conn - boost;
+                        let total = prev_cost + cost;
+                        if total < best_cost[i + len][cur_p] {
+                            best_cost[i + len][cur_p] = total;
+                            back[i + len][cur_p] = Some((i, prev_p));
+                        }
+                    }
+                }
+
+                // Fallback: single unknown character → land in the Other slot.
+                let unknown_conn = connection_cost(prev_pos, PartOfSpeech::Other);
+                let unknown_cost = prev_cost + 20.0 + unknown_conn;
+                let other_idx = PartOfSpeech::Other.idx();
+                if unknown_cost < best_cost[i + 1][other_idx] {
+                    best_cost[i + 1][other_idx] = unknown_cost;
+                    back[i + 1][other_idx] = Some((i, prev_p));
+                }
             }
         }
 
-        // Reconstruct path
+        // Pick the min-cost terminal slot at position n
+        let mut final_p = 0;
+        let mut final_cost = INF;
+        for p in 0..PC {
+            if best_cost[n][p] < final_cost {
+                final_cost = best_cost[n][p];
+                final_p = p;
+            }
+        }
+
+        // Reconstruct boundary list by walking back-pointers
         let mut boundaries = Vec::new();
-        let mut pos = n;
-        while pos > 0 {
-            if let Some(start) = back[pos] {
-                boundaries.push((start, pos));
-                pos = start;
+        let mut cur_idx = n;
+        let mut cur_p = final_p;
+        while cur_idx > 0 {
+            if let Some((start, prev_p)) = back[cur_idx][cur_p] {
+                boundaries.push((start, cur_idx));
+                cur_idx = start;
+                cur_p = prev_p;
             } else {
-                // Should not happen if fallback works, but handle gracefully
-                boundaries.push((pos - 1, pos));
-                pos -= 1;
+                boundaries.push((cur_idx - 1, cur_idx));
+                cur_idx -= 1;
             }
         }
         boundaries.reverse();

@@ -82,6 +82,7 @@ JaIM/
       config.rs              # トグルキー設定
     bin/
       generate_dict.rs       # IPADIC → builtin_dict.rs ジェネレータ
+      generate_matrix.rs     # IPADIC matrix.def → connection_cost.rs ジェネレータ
   fcitx5/
     jaim_engine.cpp          # Fcitx5 C++ アドオン
     jaim_engine.h            # アドオンヘッダ
@@ -107,6 +108,10 @@ JaIM/
 ```bash
 # 辞書生成（IPADIC から組み込み辞書を生成）
 cargo run --bin generate-dict
+
+# 品詞接続コスト表を再生成（IPADIC matrix.def から 11×11 集約、任意）
+# 実行しない場合はチェックイン済みのハンドチューニング版が使われる
+cargo run --bin generate-matrix --release > src/core/dictionary/connection_cost.rs
 
 # リリースビルド
 cargo build --release
