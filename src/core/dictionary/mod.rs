@@ -531,6 +531,42 @@ impl Dictionary {
             });
         }
 
+        // Common サ変動詞 compounds. IPADIC inflects these as noun+する, so
+        // high-frequency short pieces (Adv こう, Noun 一滴…) often beat the
+        // compound. Adding the verb form directly prevents over-segmentation.
+        let sahen_compounds: &[(&str, &[&str])] = &[
+            ("こうかいする", &["公開する", "後悔する", "航海する"]),
+            ("かいしする", &["開始する"]),
+            ("かいしゃする", &["解釈する"]),
+        ];
+        for &(reading, surfaces) in sahen_compounds {
+            for (i, &surface) in surfaces.iter().enumerate() {
+                self.add_entry(DictionaryEntry {
+                    reading: reading.to_string(),
+                    surface: surface.to_string(),
+                    pos: PartOfSpeech::Verb,
+                    frequency: 9000u32.saturating_sub(i as u32 * 100),
+                });
+            }
+        }
+
+        // Formulaic phrases (挨拶・定型句) that IPADIC decomposes into morphemes.
+        // いってき = 一滴 (Noun, 6812) pulls the DP away from いって+き+ます.
+        let formulaic: &[(&str, &str)] = &[
+            ("いってきます", "行ってきます"),
+            ("いってらっしゃい", "行ってらっしゃい"),
+            ("おかえりなさい", "お帰りなさい"),
+            ("おやすみなさい", "おやすみなさい"),
+        ];
+        for &(reading, surface) in formulaic {
+            self.add_entry(DictionaryEntry {
+                reading: reading.to_string(),
+                surface: surface.to_string(),
+                pos: PartOfSpeech::Auxiliary,
+                frequency: 9000,
+            });
+        }
+
         // Compound particles (格助詞連結) absent from IPADIC as single entries.
         // High frequency keeps them competitive against adjacent single-particle splits.
         let compound_particles: &[(&str, &str)] = &[
