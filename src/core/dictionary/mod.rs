@@ -360,11 +360,11 @@ impl Dictionary {
     /// - Prefix + Noun     → compound noun (各+国, 全+体)
     /// - Prefix + Suffix   → compound noun (何+回, 何+人)
     /// - Noun + Particle   → bunsetsu unit (雨+が, 私+は, 感謝+の)
+    /// - Verb + Aux        → verbal complex (食べ+たい, 見た+かった)
+    /// - Noun + Conj       → clause head (天気+だから, 学生+だが)
     ///
-    /// The last rule collapses morpheme-level Noun-Particle splits into
-    /// bunsetsu-level units, matching how Japanese IMEs present candidates.
     /// Merged POS reflects the right element so the result does not
-    /// re-trigger a further Noun+Particle merge.
+    /// re-trigger the same rule.
     fn merge_affix_compounds(&self, mut segs: Vec<Segment>) -> Vec<Segment> {
         let mut i = 0;
         while i + 1 < segs.len() {
@@ -374,27 +374,33 @@ impl Dictionary {
                 (cur, nxt),
                 (Some(PartOfSpeech::Noun), Some(PartOfSpeech::Particle))
             );
-            let should_merge = is_noun_particle
-                || matches!(
-                    (cur, nxt),
-                    // Noun + Suffix: 技術+的, 委員+会, 全国+化
-                    (Some(PartOfSpeech::Noun), Some(PartOfSpeech::Suffix))
-                    // Prefix + Noun: 各+国, 全+体
-                    | (Some(PartOfSpeech::Prefix), Some(PartOfSpeech::Noun))
-                    // Prefix + Suffix: 何+回, 何+人 (counter combos)
-                    | (Some(PartOfSpeech::Prefix), Some(PartOfSpeech::Suffix))
-                );
+            let merge_right_pos = match (cur, nxt) {
+                // Noun+Particle: use Particle so the result doesn't re-trigger N+P
+                (Some(PartOfSpeech::Noun), Some(PartOfSpeech::Particle)) => {
+                    Some(PartOfSpeech::Particle)
+                }
+                // Verb+Aux: verbal complex (食べ+たい, 見た+かった)
+                (Some(PartOfSpeech::Verb), Some(PartOfSpeech::Auxiliary)) => {
+                    Some(PartOfSpeech::Auxiliary)
+                }
+                // Noun+Conj: clause head (天気+だから, 学生+だが)
+                (Some(PartOfSpeech::Noun), Some(PartOfSpeech::Conjunction)) => {
+                    Some(PartOfSpeech::Conjunction)
+                }
+                // Affix compounds: always produce Noun
+                (Some(PartOfSpeech::Noun), Some(PartOfSpeech::Suffix))
+                | (Some(PartOfSpeech::Prefix), Some(PartOfSpeech::Noun))
+                | (Some(PartOfSpeech::Prefix), Some(PartOfSpeech::Suffix)) => {
+                    Some(PartOfSpeech::Noun)
+                }
+                _ => None,
+            };
+            let should_merge = merge_right_pos.is_some();
             if should_merge {
                 let right = segs.remove(i + 1);
                 let left = &mut segs[i];
                 let merged_reading = format!("{}{}", left.reading, right.reading);
-                // Noun+Particle merges use the particle's POS to prevent
-                // cascading re-merges with a subsequent particle.
-                let synthetic_pos = if is_noun_particle {
-                    PartOfSpeech::Particle
-                } else {
-                    PartOfSpeech::Noun
-                };
+                let synthetic_pos = merge_right_pos.unwrap();
                 let merged_candidates = {
                     // For Noun+Particle, always use Cartesian product: the DP
                     // already chose N+P over any homophone dict entry (e.g.
@@ -654,6 +660,12 @@ impl Dictionary {
             // Obligation negation chain. IPADIC splits this into し+なければ+なら+ない
             // (5 morphemes); a single entry prevents the DP from fragmenting it.
             ("しなければならない", "しなければならない"),
+            // Desiderative verbal forms. たい dominant POS=Noun (対,freq=5260);
+            // かった dominant POS=Verb (勝った,freq=8678). Without compound entries
+            // the DP splits たべ+たい and みた+かった rather than treating them as
+            // single verbal complexes.
+            ("たべたい", "食べたい"),
+            ("みたかった", "見たかった"),
         ];
         for &(reading, surface) in formulaic {
             self.add_entry(DictionaryEntry {
