@@ -3,7 +3,7 @@
   <name>org.freedesktop.IBus.JaIM</name>
   <description>JaIM - Japanese AI-powered Input Method</description>
   <exec>/usr/bin/ibus-engine-jaim</exec>
-  <version>2.0.2</version>
+  <version>2.1.0</version>
   <author>Yoshihiro NAKAHARA</author>
   <license>MIT</license>
   <homepage>https://github.com/BonoJovi/JaIM</homepage>
