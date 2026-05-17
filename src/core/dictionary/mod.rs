@@ -530,6 +530,25 @@ impl Dictionary {
                 frequency: 9000,
             });
         }
+
+        // Compound particles (格助詞連結) absent from IPADIC as single entries.
+        // High frequency keeps them competitive against adjacent single-particle splits.
+        let compound_particles: &[(&str, &str)] = &[
+            ("には", "には"),
+            ("へは", "へは"),
+            ("にも", "にも"),
+            ("でも", "でも"),
+            ("からも", "からも"),
+            ("までも", "までも"),
+        ];
+        for &(reading, surface) in compound_particles {
+            self.add_entry(DictionaryEntry {
+                reading: reading.to_string(),
+                surface: surface.to_string(),
+                pos: PartOfSpeech::Particle,
+                frequency: 9200,
+            });
+        }
     }
 }
 
