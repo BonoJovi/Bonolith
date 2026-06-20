@@ -682,12 +682,26 @@ impl ConversionEngine {
             None => return,
         };
 
-        // Collect segment info needed for background scoring
-        let seg_info: Vec<(String, Vec<String>)> = state
-            .segments
-            .iter()
-            .map(|seg| (seg.reading.clone(), seg.candidates.clone()))
-            .collect();
+        // Collect segment info needed for background scoring. Snapshot each
+        // candidate's user-learning score here (we're on the engine thread and
+        // can lock the scorer); the rerank itself runs on a background thread
+        // and uses the magnitude directly, so repeated selections keep adding
+        // weight instead of saturating once the surface reaches rank 0.
+        let seg_info: Vec<(String, Vec<(String, f64)>)> = {
+            let user_scorer = self.shared.user_scorer.lock().unwrap();
+            state
+                .segments
+                .iter()
+                .map(|seg| {
+                    let cands = seg
+                        .candidates
+                        .iter()
+                        .map(|s| (s.clone(), user_scorer.score(&seg.reading, s)))
+                        .collect();
+                    (seg.reading.clone(), cands)
+                })
+                .collect()
+        };
 
         let shared = self.shared.clone();
         let result_slot = self.llm_rerank_result.clone();
@@ -705,6 +719,13 @@ impl ConversionEngine {
                 let mut preceding_text = String::new();
 
                 const LLM_RERANK_TOP_N: usize = 5;
+                // Weight on the user-learning magnitude. The user score
+                // saturates at 1.0 (~20 selections; ~0.23 at one), so a fully
+                // learned surface adds up to this much — chosen so it can
+                // overcome the LLM's max swing (0.6 * 0.6 = 0.36) when the user
+                // has deliberately reinforced a reading, while a single
+                // selection only nudges near-ties.
+                const USER_LEARNING_WEIGHT: f64 = 0.5;
                 let mut reranked_segments: Vec<Vec<String>> = Vec::new();
 
                 for (reading, candidates) in &seg_info {
@@ -714,11 +735,13 @@ impl ConversionEngine {
                         let context = format!("{}{}", committed_context, preceding_text);
                         let mut top_with_scores: Vec<(usize, f64)> = (0..rerank_count)
                             .map(|i| {
-                                let llm_score =
-                                    llm.score_with_context(&context, &candidates[i]);
+                                let (surface, user) = &candidates[i];
+                                let llm_score = llm.score_with_context(&context, surface);
                                 let rank_base =
                                     1.0 - (i as f64 / rerank_count as f64) * 0.3;
-                                let combined = rank_base * 0.4 + llm_score * 0.6;
+                                let combined = rank_base * 0.4
+                                    + llm_score * 0.6
+                                    + user * USER_LEARNING_WEIGHT;
                                 (i, combined)
                             })
                             .collect();
@@ -728,9 +751,10 @@ impl ConversionEngine {
 
                         let mut reranked: Vec<String> = top_with_scores
                             .iter()
-                            .map(|(idx, _)| candidates[*idx].clone())
+                            .map(|(idx, _)| candidates[*idx].0.clone())
                             .collect();
-                        reranked.extend(candidates[rerank_count..].iter().cloned());
+                        reranked
+                            .extend(candidates[rerank_count..].iter().map(|(s, _)| s.clone()));
 
                         log::debug!(
                             "LLM rerank segment '{}': top='{}'",
@@ -741,8 +765,9 @@ impl ConversionEngine {
                         preceding_text.push_str(&reranked[0]);
                         reranked_segments.push(reranked);
                     } else {
-                        preceding_text.push_str(&candidates[0]);
-                        reranked_segments.push(candidates.clone());
+                        preceding_text.push_str(&candidates[0].0);
+                        reranked_segments
+                            .push(candidates.iter().map(|(s, _)| s.clone()).collect());
                     }
                 }
 
@@ -1324,8 +1349,12 @@ mod tests {
                     .iter()
                     .enumerate()
                     .map(|(i, e)| {
+                        // Mirrors trigger_llm_rerank's combine, including the
+                        // user-learning magnitude term (USER_LEARNING_WEIGHT).
                         let rank_base = 1.0 - (i as f64 / rerank_count as f64) * 0.3;
-                        let combined = rank_base * 0.4 + llm[&e.surface] * 0.6;
+                        let combined = rank_base * 0.4
+                            + llm[&e.surface] * 0.6
+                            + user.score(reading, &e.surface) * 0.5;
                         (e.surface.clone(), combined)
                     })
                     .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
