@@ -1326,206 +1326,62 @@ pub struct ConversionCandidate {
 mod tests {
     use super::*;
 
-    /// Learning-curve experiment: for each homophone case, how many user
-    /// selections N does it take before the final (dict + user + LLM) ranking
-    /// puts the correct surface on top?
-    ///
-    /// Ignored by default (needs a running llama-server). Run against either
-    /// model:
-    ///   cargo test --lib engine -- --ignored --nocapture learning_curve
-    ///   BONOLITH_LLM_ENDPOINT=http://127.0.0.1:8081 cargo test --lib engine \
-    ///       -- --ignored --nocapture learning_curve
-    ///
-    /// The combine mirrors production: candidates are ordered by
-    /// effective_score (freq + user*2 + surface_adj), then the top
-    /// LLM_RERANK_TOP_N are reranked by `rank_base*0.4 + llm*0.6`. The LLM
-    /// score is independent of N, so it's fetched once per surface and cached;
-    /// only the effective-score ordering (hence rank_base) moves as N grows.
+    /// Learning regression (hermetic): recording user selections must be able
+    /// to promote a non-default but valid surface to top-1 through the *full*
+    /// pipeline (build_segment_states ordering + background rerank), and must
+    /// never demote it once learned. Deterministic under MockScorer, so it
+    /// guards the user-learning weight in the rerank combine without a server.
+    /// Replaces the old `learning_curve` probe, which hand-rolled the combine
+    /// (a partial pipeline) instead of driving the real engine.
     #[test]
-    #[ignore]
-    fn learning_curve() {
-        use crate::core::llm::{HttpLlamaScorer, LlmScorer};
-
-        let scorer = match HttpLlamaScorer::from_default_endpoint() {
-            Some(s) => s,
-            None => {
-                eprintln!("no llama-server reachable; skipping");
-                return;
-            }
-        };
-        let dict = Dictionary::new();
-
-        // (preceding context, reading, correct surface)
-        let cases = [
-            ("ご飯を食べるための", "はし", "箸"),
-            ("川にかかった", "はし", "橋"),
-            ("工場の最新の", "きかい", "機械"),
-            ("またとない", "きかい", "機会"),
-            ("空から降ってくる", "あめ", "雨"),
-            ("甘くておいしい", "あめ", "飴"),
-            ("神社にお参りして", "かみ", "神"),
-            ("夏はとても", "あつい", "暑い"),
-            ("やかんのお湯が", "あつい", "熱い"),
-            ("時間どおり", "せいかく", "正確"),
-        ];
-
+    fn learning_promotes_surface_to_top1() {
+        // (reading, target) where `target` is a valid homophone that is *not*
+        // the cold-start default (e.g. 飴 sits below 雨) — so any flip to it can
+        // only come from the recorded user selections.
+        let cases = [("はし", "橋"), ("きしゃ", "汽車"), ("あめ", "飴")];
         const MAX_N: u32 = 20;
-        let endpoint =
-            std::env::var("BONOLITH_LLM_ENDPOINT").unwrap_or_else(|_| "default(8080)".into());
-        println!("\n=== learning curve (endpoint={endpoint}) ===");
 
-        for (ctx, reading, correct) in cases {
-            let entries = dict.lookup(reading);
-            if !entries.iter().any(|e| e.surface == correct) {
-                println!("  {reading} -> {correct}: NOT IN DICT (skipped)");
-                continue;
-            }
-
-            // Cache the (N-independent) LLM score per surface once.
-            let llm: std::collections::HashMap<String, f64> = entries
-                .iter()
-                .map(|e| (e.surface.clone(), scorer.score(ctx, &e.surface)))
-                .collect();
-
-            // Winner of the production-style combine for a given learned count.
-            let winner_at = |n: u32| -> String {
-                let mut user = UserScorer::new();
-                for _ in 0..n {
-                    user.record(reading, correct);
+        for (reading, target) in cases {
+            let top1_after = |n: u32| -> String {
+                let shared = SharedCore::new_hermetic();
+                {
+                    let mut user = shared.user_scorer.lock().unwrap();
+                    for _ in 0..n {
+                        user.record(reading, target);
+                    }
                 }
-                let mut ranked: Vec<&&DictionaryEntry> = entries.iter().collect();
-                ranked.sort_by(|a, b| {
-                    let sa = ConversionEngine::effective_score_with(&user, reading, a);
-                    let sb = ConversionEngine::effective_score_with(&user, reading, b);
-                    sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-                });
-                let rerank_count = ranked.len().min(5);
-                ranked[..rerank_count]
-                    .iter()
-                    .enumerate()
-                    .map(|(i, e)| {
-                        // Mirrors trigger_llm_rerank's combine, including the
-                        // user-learning magnitude term (USER_LEARNING_WEIGHT).
-                        let rank_base = 1.0 - (i as f64 / rerank_count as f64) * 0.3;
-                        let combined = rank_base * 0.4
-                            + llm[&e.surface] * 0.6
-                            + user.score(reading, &e.surface) * 0.5;
-                        (e.surface.clone(), combined)
-                    })
-                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(s, _)| s)
+                let mut engine = ConversionEngine::with_shared(shared);
+                engine.append_raw(reading);
+                if engine.start_conversion().is_none() {
+                    return String::new();
+                }
+                // Drain the deterministic background rerank.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while !engine.has_llm_rerank_result() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                engine.apply_llm_rerank();
+                engine
+                    .conversion_state()
+                    .map(|s| s.composed_text())
                     .unwrap_or_default()
             };
 
-            let flip = (0..=MAX_N).find(|&n| winner_at(n) == correct);
-            let n0 = winner_at(0);
-            match flip {
-                Some(0) => println!("  {reading} -> {correct}: ✓ correct at N=0 (no learning needed)"),
-                Some(n) => println!(
-                    "  {reading} -> {correct}: flips at N={n} (N=0 winner was {n0})"
-                ),
-                None => println!(
-                    "  {reading} -> {correct}: never wins within N={MAX_N} (stuck on {n0})"
-                ),
-            }
-        }
-    }
-
-    /// Hiragana-fixation probe: for readings whose raw kana competes with a
-    /// high-frequency kanji homophone (きょう→今日, はし→箸/橋), build the *full*
-    /// candidate list exactly as `build_segment_states` does — including the
-    /// inserted raw-reading kana — then run the production rerank combine with
-    /// the real LLM. Reports the winner and the kana form's rank so we can see
-    /// whether the LLM's high rating of a plain-kana continuation pulls the
-    /// kana above the kanji (the "ひらがな固着" failure).
-    ///
-    /// Ignored by default (needs a running llama-server):
-    ///   cargo test --lib engine -- --ignored --nocapture kana_fixation
-    #[test]
-    #[ignore]
-    fn kana_fixation_probe() {
-        use crate::core::llm::{HttpLlamaScorer, LlmScorer};
-
-        let scorer = match HttpLlamaScorer::from_default_endpoint() {
-            Some(s) => s,
-            None => {
-                eprintln!("no llama-server reachable; skipping");
-                return;
-            }
-        };
-        let dict = Dictionary::new();
-        let user = UserScorer::new(); // no learning: probe the cold-start path
-
-        // (preceding context, reading, expected kanji)
-        let cases = [
-            ("", "きょう", "今日"),
-            ("また", "きょう", "今日"),
-            ("あしたではなく", "きょう", "今日"),
-            ("", "はし", "箸"),
-            ("ご飯を食べるための", "はし", "箸"),
-            ("川にかかった", "はし", "橋"),
-        ];
-
-        println!("\n=== hiragana-fixation probe ===");
-        for (ctx, reading, expected) in cases {
-            // Replicate build_segment_states' ordering + raw-kana insertion.
-            let mut entries = dict.lookup(reading);
-            entries.sort_by(|a, b| {
-                let sa = ConversionEngine::effective_score_with(&user, reading, a);
-                let sb = ConversionEngine::effective_score_with(&user, reading, b);
-                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let mut candidates: Vec<String> =
-                entries.iter().map(|e| e.surface.clone()).collect();
-            if candidates.is_empty() || !candidates.contains(&reading.to_string()) {
-                let kana_score = user.score(reading, reading) * 2.0 + 0.1;
-                let pos = entries
-                    .iter()
-                    .position(|e| {
-                        ConversionEngine::effective_score_with(&user, reading, e) < kana_score
-                    })
-                    .unwrap_or(candidates.len());
-                candidates.insert(pos, reading.to_string());
-            }
-
-            // Production rerank combine over the top-N.
-            let rerank_count = candidates.len().min(5);
-            let scored: Vec<(String, f64, f64)> = candidates[..rerank_count]
-                .iter()
-                .enumerate()
-                .map(|(i, surface)| {
-                    // Mirror trigger_llm_rerank: neutralize the LLM term for the
-                    // plain-kana form so the model's kana bias can't promote it.
-                    let llm = ConversionEngine::rerank_llm_score(reading, surface, || {
-                        scorer.score(ctx, surface)
-                    });
-                    let rank_base = 1.0 - (i as f64 / rerank_count as f64) * 0.3;
-                    let combined = rank_base * 0.4
-                        + llm * 0.6
-                        + user.score(reading, surface) * 0.5;
-                    (surface.clone(), llm, combined)
-                })
-                .collect();
-
-            let mut ranked = scored.clone();
-            ranked.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-            let winner = &ranked[0].0;
-            let kana_rank = ranked.iter().position(|(s, ..)| s == reading);
-            let kana_llm = scored
-                .iter()
-                .find(|(s, ..)| s == reading)
-                .map(|(_, l, _)| *l);
-            let exp_llm = scored
-                .iter()
-                .find(|(s, ..)| s == expected)
-                .map(|(_, l, _)| *l);
-            println!(
-                "  ctx={ctx:?} {reading}: winner={winner} (want {expected}) | \
-                 kana@top5={} rank={:?} llm(kana)={:?} llm({expected})={:?}",
-                candidates[..rerank_count].contains(&reading.to_string()),
-                kana_rank,
-                kana_llm.map(|v| format!("{v:.3}")),
-                exp_llm.map(|v| format!("{v:.3}")),
+            let flip = (0..=MAX_N).find(|&n| top1_after(n) == target);
+            assert!(
+                flip.is_some(),
+                "{reading} -> {target}: learning never promotes it to top-1 within N={MAX_N} (got {:?})",
+                top1_after(MAX_N),
+            );
+            // Once learned, it must stay on top at higher N (no demotion).
+            assert_eq!(
+                top1_after(MAX_N),
+                target,
+                "{reading} -> {target}: not stable at N={MAX_N}",
+            );
+            eprintln!(
+                "learning: {reading} -> {target} reaches top-1 at N={}",
+                flip.unwrap(),
             );
         }
     }
@@ -1546,93 +1402,6 @@ mod tests {
         // Kanji form → the model's real score is used.
         let kanji = ConversionEngine::rerank_llm_score("はし", "橋", || kana_loving("橋"));
         assert_eq!(kanji, 0.9);
-    }
-
-    /// Verb-kanji probe (residual ①): the production pipeline is now just the
-    /// per-segment rerank (stage 1; N-best was reverted as inert). This builds
-    /// each segment's candidates like build_segment_states, runs the stage-1
-    /// rerank left-to-right with left context, and reports the chosen sentence.
-    /// Separates the two failure modes: (A) frequency bug — the everyday verb
-    /// buried below a rare variant (fixed by PRIORITY_OVERRIDES); (B) LLM flip —
-    /// the common verb is already freq-top yet the model flips it (渡る→亙る),
-    /// which the dictionary cannot fix.
-    ///
-    ///   cargo test --lib engine -- --ignored --nocapture verb_kanji
-    #[test]
-    #[ignore]
-    fn verb_kanji_probe() {
-        use crate::core::llm::{HttpLlamaScorer, LlmScorer};
-
-        let scorer = match HttpLlamaScorer::from_default_endpoint() {
-            Some(s) => s,
-            None => {
-                eprintln!("no llama-server reachable; skipping");
-                return;
-            }
-        };
-        let dict = Dictionary::new();
-        let user = UserScorer::new();
-
-        // (kana input, expected verb surface) — the noun half is unambiguous.
-        let cases = [
-            ("かみにいのる", "祈る"),
-            ("プールでおよぐ", "泳ぐ"),
-            ("ドアをとじる", "閉じる"),
-            ("えいがをみる", "見る"),
-            ("りょうりをつくる", "作る"),
-            ("ともだちにあう", "会う"),
-            ("かぎをさがす", "探す"),
-            ("はしをわたる", "渡る"), // (B): 渡る already freq-top; expect LLM may still flip
-        ];
-
-        println!("\n=== verb-kanji probe ===");
-        let mut ok = 0;
-        for (kana, expected) in cases {
-            let segs = dict.segment(kana);
-            let mut preceding = String::new();
-            let mut picked: Vec<String> = Vec::new();
-            for seg in &segs {
-                let mut entries: Vec<&DictionaryEntry> = seg.candidates.iter().collect();
-                entries.sort_by(|a, b| {
-                    let sa = ConversionEngine::effective_score_with(&user, &seg.reading, a);
-                    let sb = ConversionEngine::effective_score_with(&user, &seg.reading, b);
-                    sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-                });
-                let mut cands: Vec<String> = entries.iter().map(|e| e.surface.clone()).collect();
-                if cands.is_empty() {
-                    cands.push(seg.reading.clone());
-                }
-                if cands.len() > 1 && seg.reading.chars().count() >= 2 {
-                    let n = cands.len().min(5);
-                    let best = (0..n)
-                        .map(|i| {
-                            let llm = ConversionEngine::rerank_llm_score(
-                                &seg.reading,
-                                &cands[i],
-                                || scorer.score(&preceding, &cands[i]),
-                            );
-                            let rank_base = 1.0 - (i as f64 / n as f64) * 0.3;
-                            (cands[i].clone(), rank_base * 0.4 + llm * 0.6)
-                        })
-                        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-                        .map(|(s, _)| s)
-                        .unwrap_or_else(|| cands[0].clone());
-                    preceding.push_str(&best);
-                    picked.push(best);
-                } else {
-                    preceding.push_str(&cands[0]);
-                    picked.push(cands[0].clone());
-                }
-            }
-            let sentence: String = picked.concat();
-            let got_verb = picked.iter().any(|p| p == expected);
-            ok += got_verb as usize;
-            println!(
-                "  {kana}: {sentence} | verb {expected} {}",
-                if got_verb { "OK" } else { "MISS" },
-            );
-        }
-        println!("  ---\n  verb correct {ok}/{}", cases.len());
     }
 
     #[test]
