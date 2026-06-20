@@ -126,6 +126,16 @@ const PRIORITY_OVERRIDES: &[(&str, &str, u32)] = &[
     ("かわ", "川", 3900), // was 1150, below 皮 3755
     ("かみ", "髪", 4000), // was 3300, below 加味 3609
     ("かみ", "神", 3800), // was 3065, below 加味 3609 (髪 > 神 kept)
+    // Verbs: the everyday default buried below rare/literary kanji variants.
+    // Same exclusion rule — context-dependent verbs (着る/切る, 図る/測る,
+    // 上る/登る, 治す/直す, 帰る/変える) are left to the LLM.
+    ("みる", "見る", 4200),     // was 2999, below 海松/水松 4120 (seaweed nouns)
+    ("いのる", "祈る", 2900),   // was 2678, below 祷る 2850
+    ("およぐ", "泳ぐ", 2900),   // was 2770, below 游ぐ 2850
+    ("とじる", "閉じる", 2900), // was 2845, below 綴じる 2850
+    ("つくる", "作る", 7300),   // was 2449; also clears the katakana artifact ツクる 7264
+    ("あう", "会う", 2850),     // was 2743, below 遭う/遇う 2768
+    ("さがす", "探す", 2900),   // was 2817, below 捜す 2850
 ];
 
 pub struct Dictionary {
@@ -994,16 +1004,25 @@ mod tests {
     }
 
     #[test]
-    fn priority_overrides_promote_everyday_nouns() {
+    fn priority_overrides_promote_everyday_words() {
         let dict = Dictionary::new();
-        // Each buried everyday noun must now top its homophone group; the
-        // formerly-winning rare/abstract surface must rank below it.
+        // Each buried everyday word must now top its homophone group; the
+        // formerly-winning rare/abstract/literary surface must rank below it.
         for (reading, expected) in [
+            // nouns
             ("みち", "道"), // beats 未知
             ("うみ", "海"), // beats 生み/膿/産み
             ("め", "目"),   // beats 眼/海布
             ("かわ", "川"), // beats 皮
             ("かみ", "髪"), // beats 加味
+            // verbs
+            ("みる", "見る"),     // beats 海松/水松
+            ("いのる", "祈る"),   // beats 祷る
+            ("およぐ", "泳ぐ"),   // beats 游ぐ
+            ("とじる", "閉じる"), // beats 綴じる
+            ("つくる", "作る"),   // beats 創る/造る
+            ("あう", "会う"),     // beats 遭う/遇う
+            ("さがす", "探す"),   // beats 捜す
         ] {
             let results = dict.lookup(reading);
             assert_eq!(
@@ -1013,7 +1032,8 @@ mod tests {
                 results.iter().take(3).map(|e| &e.surface).collect::<Vec<_>>(),
             );
         }
-        // Context-dependent pairs are intentionally NOT force-ordered here.
+        // Context-dependent pairs are intentionally NOT force-ordered here —
+        // the LLM decides these from context.
         let ame = dict.lookup("あめ");
         assert_eq!(ame.first().map(|e| e.surface.as_str()), Some("雨"));
     }

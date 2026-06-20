@@ -1511,6 +1511,93 @@ mod tests {
         assert_eq!(kanji, 0.9);
     }
 
+    /// Verb-kanji probe (residual ①): the production pipeline is now just the
+    /// per-segment rerank (stage 1; N-best was reverted as inert). This builds
+    /// each segment's candidates like build_segment_states, runs the stage-1
+    /// rerank left-to-right with left context, and reports the chosen sentence.
+    /// Separates the two failure modes: (A) frequency bug — the everyday verb
+    /// buried below a rare variant (fixed by PRIORITY_OVERRIDES); (B) LLM flip —
+    /// the common verb is already freq-top yet the model flips it (渡る→亙る),
+    /// which the dictionary cannot fix.
+    ///
+    ///   cargo test --lib engine -- --ignored --nocapture verb_kanji
+    #[test]
+    #[ignore]
+    fn verb_kanji_probe() {
+        use crate::core::llm::{HttpLlamaScorer, LlmScorer};
+
+        let scorer = match HttpLlamaScorer::from_default_endpoint() {
+            Some(s) => s,
+            None => {
+                eprintln!("no llama-server reachable; skipping");
+                return;
+            }
+        };
+        let dict = Dictionary::new();
+        let user = UserScorer::new();
+
+        // (kana input, expected verb surface) — the noun half is unambiguous.
+        let cases = [
+            ("かみにいのる", "祈る"),
+            ("プールでおよぐ", "泳ぐ"),
+            ("ドアをとじる", "閉じる"),
+            ("えいがをみる", "見る"),
+            ("りょうりをつくる", "作る"),
+            ("ともだちにあう", "会う"),
+            ("かぎをさがす", "探す"),
+            ("はしをわたる", "渡る"), // (B): 渡る already freq-top; expect LLM may still flip
+        ];
+
+        println!("\n=== verb-kanji probe ===");
+        let mut ok = 0;
+        for (kana, expected) in cases {
+            let segs = dict.segment(kana);
+            let mut preceding = String::new();
+            let mut picked: Vec<String> = Vec::new();
+            for seg in &segs {
+                let mut entries: Vec<&DictionaryEntry> = seg.candidates.iter().collect();
+                entries.sort_by(|a, b| {
+                    let sa = ConversionEngine::effective_score_with(&user, &seg.reading, a);
+                    let sb = ConversionEngine::effective_score_with(&user, &seg.reading, b);
+                    sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let mut cands: Vec<String> = entries.iter().map(|e| e.surface.clone()).collect();
+                if cands.is_empty() {
+                    cands.push(seg.reading.clone());
+                }
+                if cands.len() > 1 && seg.reading.chars().count() >= 2 {
+                    let n = cands.len().min(5);
+                    let best = (0..n)
+                        .map(|i| {
+                            let llm = ConversionEngine::rerank_llm_score(
+                                &seg.reading,
+                                &cands[i],
+                                || scorer.score(&preceding, &cands[i]),
+                            );
+                            let rank_base = 1.0 - (i as f64 / n as f64) * 0.3;
+                            (cands[i].clone(), rank_base * 0.4 + llm * 0.6)
+                        })
+                        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                        .map(|(s, _)| s)
+                        .unwrap_or_else(|| cands[0].clone());
+                    preceding.push_str(&best);
+                    picked.push(best);
+                } else {
+                    preceding.push_str(&cands[0]);
+                    picked.push(cands[0].clone());
+                }
+            }
+            let sentence: String = picked.concat();
+            let got_verb = picked.iter().any(|p| p == expected);
+            ok += got_verb as usize;
+            println!(
+                "  {kana}: {sentence} | verb {expected} {}",
+                if got_verb { "OK" } else { "MISS" },
+            );
+        }
+        println!("  ---\n  verb correct {ok}/{}", cases.len());
+    }
+
     #[test]
     fn process_key_buffering() {
         let mut engine = ConversionEngine::new();
