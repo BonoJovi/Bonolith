@@ -736,7 +736,9 @@ impl ConversionEngine {
                         let mut top_with_scores: Vec<(usize, f64)> = (0..rerank_count)
                             .map(|i| {
                                 let (surface, user) = &candidates[i];
-                                let llm_score = llm.score_with_context(&context, surface);
+                                let llm_score = Self::rerank_llm_score(reading, surface, || {
+                                    llm.score_with_context(&context, surface)
+                                });
                                 let rank_base =
                                     1.0 - (i as f64 / rerank_count as f64) * 0.3;
                                 let combined = rank_base * 0.4
@@ -825,6 +827,22 @@ impl ConversionEngine {
     /// Check if LLM reranking results are ready (non-blocking).
     pub fn has_llm_rerank_result(&self) -> bool {
         self.llm_rerank_result.lock().unwrap().is_some()
+    }
+
+    /// LLM score to use for a candidate during reranking.
+    ///
+    /// Plain-kana candidates (surface == reading) are the explicit fallback,
+    /// not an LLM-preferred conversion. The model systematically over-rates a
+    /// bare-kana continuation (it's always a plausible next token), which would
+    /// let きょう/はし beat 今日/橋. Neutralize the LLM term for the kana form so
+    /// it can only win on frequency/position or deliberate user learning (the
+    /// user-magnitude term in the combine is untouched).
+    fn rerank_llm_score(reading: &str, surface: &str, score: impl FnOnce() -> f64) -> f64 {
+        if surface == reading {
+            crate::core::llm::NEUTRAL_SCORE
+        } else {
+            score()
+        }
     }
 
     /// Compute effective score combining dictionary frequency, user learning,
@@ -1374,6 +1392,123 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// Hiragana-fixation probe: for readings whose raw kana competes with a
+    /// high-frequency kanji homophone (きょう→今日, はし→箸/橋), build the *full*
+    /// candidate list exactly as `build_segment_states` does — including the
+    /// inserted raw-reading kana — then run the production rerank combine with
+    /// the real LLM. Reports the winner and the kana form's rank so we can see
+    /// whether the LLM's high rating of a plain-kana continuation pulls the
+    /// kana above the kanji (the "ひらがな固着" failure).
+    ///
+    /// Ignored by default (needs a running llama-server):
+    ///   cargo test --lib engine -- --ignored --nocapture kana_fixation
+    #[test]
+    #[ignore]
+    fn kana_fixation_probe() {
+        use crate::core::llm::{HttpLlamaScorer, LlmScorer};
+
+        let scorer = match HttpLlamaScorer::from_default_endpoint() {
+            Some(s) => s,
+            None => {
+                eprintln!("no llama-server reachable; skipping");
+                return;
+            }
+        };
+        let dict = Dictionary::new();
+        let user = UserScorer::new(); // no learning: probe the cold-start path
+
+        // (preceding context, reading, expected kanji)
+        let cases = [
+            ("", "きょう", "今日"),
+            ("また", "きょう", "今日"),
+            ("あしたではなく", "きょう", "今日"),
+            ("", "はし", "箸"),
+            ("ご飯を食べるための", "はし", "箸"),
+            ("川にかかった", "はし", "橋"),
+        ];
+
+        println!("\n=== hiragana-fixation probe ===");
+        for (ctx, reading, expected) in cases {
+            // Replicate build_segment_states' ordering + raw-kana insertion.
+            let mut entries = dict.lookup(reading);
+            entries.sort_by(|a, b| {
+                let sa = ConversionEngine::effective_score_with(&user, reading, a);
+                let sb = ConversionEngine::effective_score_with(&user, reading, b);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut candidates: Vec<String> =
+                entries.iter().map(|e| e.surface.clone()).collect();
+            if candidates.is_empty() || !candidates.contains(&reading.to_string()) {
+                let kana_score = user.score(reading, reading) * 2.0 + 0.1;
+                let pos = entries
+                    .iter()
+                    .position(|e| {
+                        ConversionEngine::effective_score_with(&user, reading, e) < kana_score
+                    })
+                    .unwrap_or(candidates.len());
+                candidates.insert(pos, reading.to_string());
+            }
+
+            // Production rerank combine over the top-N.
+            let rerank_count = candidates.len().min(5);
+            let scored: Vec<(String, f64, f64)> = candidates[..rerank_count]
+                .iter()
+                .enumerate()
+                .map(|(i, surface)| {
+                    // Mirror trigger_llm_rerank: neutralize the LLM term for the
+                    // plain-kana form so the model's kana bias can't promote it.
+                    let llm = ConversionEngine::rerank_llm_score(reading, surface, || {
+                        scorer.score(ctx, surface)
+                    });
+                    let rank_base = 1.0 - (i as f64 / rerank_count as f64) * 0.3;
+                    let combined = rank_base * 0.4
+                        + llm * 0.6
+                        + user.score(reading, surface) * 0.5;
+                    (surface.clone(), llm, combined)
+                })
+                .collect();
+
+            let mut ranked = scored.clone();
+            ranked.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            let winner = &ranked[0].0;
+            let kana_rank = ranked.iter().position(|(s, ..)| s == reading);
+            let kana_llm = scored
+                .iter()
+                .find(|(s, ..)| s == reading)
+                .map(|(_, l, _)| *l);
+            let exp_llm = scored
+                .iter()
+                .find(|(s, ..)| s == expected)
+                .map(|(_, l, _)| *l);
+            println!(
+                "  ctx={ctx:?} {reading}: winner={winner} (want {expected}) | \
+                 kana@top5={} rank={:?} llm(kana)={:?} llm({expected})={:?}",
+                candidates[..rerank_count].contains(&reading.to_string()),
+                kana_rank,
+                kana_llm.map(|v| format!("{v:.3}")),
+                exp_llm.map(|v| format!("{v:.3}")),
+            );
+        }
+    }
+
+    /// Hermetic guard for ひらがな固着: the plain-kana form (surface == reading)
+    /// must get the neutral LLM score so a model that over-rates bare kana can't
+    /// promote it, while kanji forms keep the model's real score. Deliberate
+    /// user learning is applied separately in the combine and stays unaffected.
+    #[test]
+    fn rerank_neutralizes_plain_kana_llm_score() {
+        // A scorer that loves bare kana (the real failure mode).
+        let kana_loving = |_surface: &str| 0.9_f64;
+
+        // Plain kana → neutral, regardless of what the model would say.
+        let kana = ConversionEngine::rerank_llm_score("はし", "はし", || kana_loving("はし"));
+        assert_eq!(kana, crate::core::llm::NEUTRAL_SCORE);
+
+        // Kanji form → the model's real score is used.
+        let kanji = ConversionEngine::rerank_llm_score("はし", "橋", || kana_loving("橋"));
+        assert_eq!(kanji, 0.9);
     }
 
     #[test]

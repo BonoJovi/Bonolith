@@ -10,6 +10,12 @@
 
 mod http_scorer;
 
+/// Neutral LLM score, returned when the model provides no usable signal
+/// (empty context, missing probabilities). Used as the midpoint of the
+/// scorer's 0.3–0.9 output band and as an explicit "no LLM opinion" value
+/// for candidates we deliberately exclude from LLM influence.
+pub const NEUTRAL_SCORE: f64 = 0.5;
+
 /// Trait defining the LLM scoring interface.
 /// Allows swapping between mock and real implementations.
 pub trait LlmScorer: Send + Sync {
