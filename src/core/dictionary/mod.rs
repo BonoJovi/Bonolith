@@ -106,6 +106,28 @@ pub struct Segment {
     pub candidates: Vec<DictionaryEntry>,
 }
 
+/// Frequency overrides for the auto-generated IPADIC dictionary.
+///
+/// IPADIC's per-entry frequency does not reflect everyday *input* frequency:
+/// many core everyday nouns are buried below rarer/abstract homophones (川 sat
+/// at 1150, 海 at 1714; 道 < 未知, 目 < 眼, 髪 < 加味). For homophone groups with
+/// a clear everyday default we raise that surface just above its group so it
+/// wins the cold-start tie; the LLM rerank can still flip it from context.
+///
+/// Deliberately excluded: genuinely context-dependent pairs (雨/飴, 箸/橋,
+/// 切る/着る, 石/医師/意思) — those are left to the LLM, never force-ordered here.
+///
+/// `(reading, surface, frequency)`. builtin_dict.rs is regenerated from IPADIC,
+/// so corrections live here to survive regeneration.
+const PRIORITY_OVERRIDES: &[(&str, &str, u32)] = &[
+    ("みち", "道", 4100), // was 3786, below 未知 3957
+    ("うみ", "海", 5700), // was 1714, below 生み 5576 / 膿 / 産み
+    ("め", "目", 5500),   // was 3921, below 眼 5460 / 海布
+    ("かわ", "川", 3900), // was 1150, below 皮 3755
+    ("かみ", "髪", 4000), // was 3300, below 加味 3609
+    ("かみ", "神", 3800), // was 3065, below 加味 3609 (髪 > 神 kept)
+];
+
 pub struct Dictionary {
     entries: Vec<DictionaryEntry>,
     trie: Trie,
@@ -526,7 +548,15 @@ impl Dictionary {
     }
 
     fn load_builtin(&mut self) {
+        let overrides: std::collections::HashMap<(&str, &str), u32> = PRIORITY_OVERRIDES
+            .iter()
+            .map(|&(r, s, f)| ((r, s), f))
+            .collect();
         for &(reading, surface, pos, frequency) in builtin_dict::BUILTIN_ENTRIES {
+            let frequency = overrides
+                .get(&(reading, surface))
+                .copied()
+                .unwrap_or(frequency);
             self.add_entry(DictionaryEntry {
                 reading: reading.to_string(),
                 surface: surface.to_string(),
@@ -961,6 +991,31 @@ mod tests {
         let results = dict.lookup("きょう");
         assert!(!results.is_empty());
         assert_eq!(results[0].surface, "今日"); // highest frequency
+    }
+
+    #[test]
+    fn priority_overrides_promote_everyday_nouns() {
+        let dict = Dictionary::new();
+        // Each buried everyday noun must now top its homophone group; the
+        // formerly-winning rare/abstract surface must rank below it.
+        for (reading, expected) in [
+            ("みち", "道"), // beats 未知
+            ("うみ", "海"), // beats 生み/膿/産み
+            ("め", "目"),   // beats 眼/海布
+            ("かわ", "川"), // beats 皮
+            ("かみ", "髪"), // beats 加味
+        ] {
+            let results = dict.lookup(reading);
+            assert_eq!(
+                results.first().map(|e| e.surface.as_str()),
+                Some(expected),
+                "expected {expected} to top the {reading} group, got {:?}",
+                results.iter().take(3).map(|e| &e.surface).collect::<Vec<_>>(),
+            );
+        }
+        // Context-dependent pairs are intentionally NOT force-ordered here.
+        let ame = dict.lookup("あめ");
+        assert_eq!(ame.first().map(|e| e.surface.as_str()), Some("雨"));
     }
 
     #[test]
