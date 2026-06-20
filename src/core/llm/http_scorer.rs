@@ -54,6 +54,11 @@ struct CompletionResponse {
 
 #[derive(Deserialize)]
 struct TokenLogprob {
+    /// The emitted token's text. The grammar appends a trailing end-of-text
+    /// token after the candidate literal, which comes back with an empty
+    /// string here; its logprob is noise (probability of *stopping* after the
+    /// surface) and must be excluded from the candidate's score.
+    token: String,
     logprob: f64,
 }
 
@@ -63,13 +68,14 @@ fn gbnf_string_literal(s: &str) -> String {
     format!("root ::= \"{}\"", escaped)
 }
 
-/// Map a mean per-token log-probability to the 0.3–0.9 scoring band used by
-/// the reranker. Typical contextual surfaces score around -5..-7; unlikely
-/// ones fall to -11 or worse. We keep the same band the previous heuristic
-/// used so the reranker's score-blend weights stay calibrated.
+/// Map a mean per-token log-probability (content tokens only) to the 0.3–0.9
+/// scoring band used by the reranker. With the end-of-text token excluded,
+/// a contextually strong surface scores around -1..-3 and an unlikely one
+/// falls to -10 or worse, so the band spans that range to keep candidates
+/// well separated rather than clamping the good ones together.
 fn logprob_to_score(avg_logprob: f64) -> f64 {
-    const LO: f64 = -12.0; // → 0.3
-    const HI: f64 = -4.0; // → 0.9
+    const LO: f64 = -10.0; // → 0.3
+    const HI: f64 = -2.0; // → 0.9
     let t = ((avg_logprob - LO) / (HI - LO)).clamp(0.0, 1.0);
     0.3 + t * 0.6
 }
@@ -179,21 +185,30 @@ impl HttpLlamaScorer {
             }
         };
 
-        let probs = &body.completion_probabilities;
-        if probs.is_empty() {
-            // Server didn't return per-token probs (n_probs unsupported);
-            // fall back to neutral so we neither help nor hurt the ranking.
+        // Sum only the candidate's own (non-empty) tokens. The trailing
+        // end-of-text token the grammar emits comes back with an empty string
+        // and a high-variance logprob unrelated to which reading is correct;
+        // including it corrupts the ranking (e.g. 橋 losing to 端).
+        let content: Vec<f64> = body
+            .completion_probabilities
+            .iter()
+            .filter(|p| !p.token.is_empty())
+            .map(|p| p.logprob)
+            .collect();
+        if content.is_empty() {
+            // Server didn't return per-token probs (n_probs unsupported), or
+            // only the end token came back; stay neutral so we neither help
+            // nor hurt the ranking.
             return 0.5;
         }
 
-        let sum: f64 = probs.iter().map(|p| p.logprob).sum();
-        let avg = sum / probs.len() as f64;
+        let avg = content.iter().sum::<f64>() / content.len() as f64;
         let score = logprob_to_score(avg);
 
         debug!(
             "HttpLlamaScorer: candidate='{}' ntok={} avg_logprob={:.3} score={:.3}",
             candidate,
-            probs.len(),
+            content.len(),
             avg,
             score,
         );
