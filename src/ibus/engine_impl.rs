@@ -968,17 +968,16 @@ impl JaimEngine {
         }
     }
 
-    /// Register a new word to user dictionary via zenity forms dialog.
+    /// Register a new word to user dictionary via the GTK dialog.
+    /// The dialog runs as /usr/share/jaim/scripts/jaim_word_register.py and
+    /// re-activates IBus on every entry focus-in, so 単語 stays 日本語ON
+    /// even after Tab. Output format: "<reading>|<surface>" on OK.
     fn run_word_register() {
-        // zenity --forms to collect reading and surface
-        let output = std::process::Command::new("zenity")
+        let output = std::process::Command::new("/usr/bin/python3")
+            .env("GDK_BACKEND", "x11")  // Force XWayland so xdotool key works on Wayland sessions
             .args([
-                "--forms",
-                "--title=JaIM: 単語登録",
-                "--text=ユーザー辞書に新しい単語を登録します",
-                "--add-entry=よみ (ひらがな)",
-                "--add-entry=単語 (漢字・カタカナなど)",
-                "--separator=|",
+                "/usr/share/jaim/scripts/jaim_word_register.py",
+                "ibus",
             ])
             .output();
 
@@ -1177,18 +1176,20 @@ impl JaimEngine {
     }
 
     /// Edit a user dictionary entry by index.
+    /// Reuses the GTK register dialog in edit mode, prefilled with the
+    /// current reading and surface so 単語 stays 日本語ON after Tab.
     fn edit_user_entry(mut entries: Vec<DictionaryEntry>, idx: usize) {
-        let old = &entries[idx];
+        let old_reading = entries[idx].reading.clone();
+        let old_surface = entries[idx].surface.clone();
 
-        let output = std::process::Command::new("zenity")
+        let output = std::process::Command::new("/usr/bin/python3")
+            .env("GDK_BACKEND", "x11")
             .args([
-                "--forms",
-                "--title=JaIM: 単語の編集",
-                &format!("--text=現在のよみ: {}\n現在の単語: {}\n\n変更する項目のみ入力してください (空欄は変更なし)",
-                    old.reading, old.surface),
-                "--add-entry=よみ (ひらがな)",
-                "--add-entry=単語 (漢字・カタカナなど)",
-                "--separator=|",
+                "/usr/share/jaim/scripts/jaim_word_register.py",
+                "ibus",
+                "--mode", "edit",
+                "--reading", &old_reading,
+                "--surface", &old_surface,
             ])
             .output();
 
@@ -1201,15 +1202,14 @@ impl JaimEngine {
                 }
                 let new_reading = parts[0].trim();
                 let new_surface = parts[1].trim();
-                if new_reading.is_empty() && new_surface.is_empty() {
+                if new_reading.is_empty() || new_surface.is_empty() {
                     return;
                 }
-                if !new_reading.is_empty() {
-                    entries[idx].reading = new_reading.to_string();
+                if new_reading == old_reading && new_surface == old_surface {
+                    return; // no change
                 }
-                if !new_surface.is_empty() {
-                    entries[idx].surface = new_surface.to_string();
-                }
+                entries[idx].reading = new_reading.to_string();
+                entries[idx].surface = new_surface.to_string();
                 Self::save_and_apply_user_entries(entries);
             }
             _ => {}

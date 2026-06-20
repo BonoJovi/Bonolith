@@ -53,7 +53,9 @@ sudo rm -f \
     /usr/lib/x86_64-linux-gnu/libjaim.so \
     /usr/lib/x86_64-linux-gnu/fcitx5/fcitx5-jaim.so \
     /usr/share/fcitx5/addon/jaim.conf \
-    /usr/share/fcitx5/inputmethod/jaim.conf
+    /usr/share/fcitx5/inputmethod/jaim.conf \
+    /usr/share/jaim/scripts/jaim_word_register.py
+sudo rmdir /usr/share/jaim/scripts /usr/share/jaim 2>/dev/null || true
 
 # 3. Remove user-level systemd unit
 echo "[3/5] Removing user systemd unit..."

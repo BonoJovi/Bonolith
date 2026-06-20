@@ -112,6 +112,7 @@ sudo install -D -m 755 target/release/libjaim.so   /usr/lib/x86_64-linux-gnu/lib
 sudo install -D -m 755 fcitx5/build/fcitx5-jaim.so /usr/lib/x86_64-linux-gnu/fcitx5/fcitx5-jaim.so
 sudo install -D -m 644 fcitx5/jaim-addon.conf      /usr/share/fcitx5/addon/jaim.conf
 sudo install -D -m 644 fcitx5/jaim-im.conf         /usr/share/fcitx5/inputmethod/jaim.conf
+sudo install -D -m 755 scripts/jaim_word_register.py /usr/share/jaim/scripts/jaim_word_register.py
 
 # 3. User-level systemd unit. The unit's ExecStartPre handles the
 # llama.cpp ggml-backend symlink dance.

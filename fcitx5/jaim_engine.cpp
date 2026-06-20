@@ -2,6 +2,7 @@
 
 #include "jaim_engine.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <thread>
 
@@ -117,11 +118,29 @@ void JaimState::updateUI() {
 
 // ── JaimEngine (addon) ──────────────────────────────────────────────────
 
+/// Remove inherited env vars that point at snap-namespaced resources.
+/// If the Fcitx5 daemon (or its parent) was launched from a snap
+/// terminal like ghostty, GDK_PIXBUF_MODULE_FILE will point into the
+/// snap's gdk-pixbuf cache; any GTK subprocess we spawn (zenity, the
+/// Python register dialog, etc.) would then dlopen the snap's loaders
+/// — built against a different libc — and crash. Clearing it makes
+/// subprocesses fall back to the distribution loaders.
+static void sanitizeInheritedEnv() {
+    for (const char *var : {"GDK_PIXBUF_MODULE_FILE", "GDK_PIXBUF_MODULEDIR"}) {
+        const char *val = ::getenv(var);
+        if (val && (std::string(val).find("/snap/") != std::string::npos ||
+                    std::string(val).find("/.snap") != std::string::npos)) {
+            ::unsetenv(var);
+        }
+    }
+}
+
 JaimEngine::JaimEngine(fcitx::Instance *instance)
     : instance_(instance),
       factory_([this](fcitx::InputContext &ic) {
           return new JaimState(this, &ic);
       }) {
+    sanitizeInheritedEnv();
     instance_->inputContextManager().registerProperty("jaimState", &factory_);
 
     // Set up menu actions
@@ -215,6 +234,17 @@ void JaimEngine::reset(const fcitx::InputMethodEntry & /*entry*/,
 
 // ── Dictionary management (zenity dialogs) ─────────────────────────────
 
+/// Helper: shell-quote a value so it survives `popen`/shell expansion intact.
+static std::string shellQuote(const std::string &s) {
+    std::string out = "'";
+    for (char c : s) {
+        if (c == '\'') out += "'\\''";
+        else out += c;
+    }
+    out += "'";
+    return out;
+}
+
 /// Helper: run a command and capture stdout. Returns empty string on failure.
 static std::string runZenity(const std::vector<std::string> &args) {
     std::string cmd = "zenity";
@@ -246,15 +276,22 @@ static std::string runZenity(const std::vector<std::string> &args) {
 }
 
 void JaimEngine::runWordRegister() {
-    auto result = runZenity({
-        "--forms",
-        "--title=JaIM: 単語登録",
-        "--text=ユーザー辞書に新しい単語を登録します",
-        "--add-entry=よみ (ひらがな)",
-        "--add-entry=単語 (漢字・カタカナなど)",
-        "--separator=|",
-    });
-    if (result.empty()) return;
+    // Custom GTK dialog that re-activates Fcitx5 on every entry focus-in,
+    // so 単語 stays 日本語ON even after Tab. Output: "<reading>|<surface>".
+    FILE *fp = popen("GDK_BACKEND=x11 /usr/bin/python3 "
+                     "/usr/share/jaim/scripts/jaim_word_register.py "
+                     "fcitx5",
+                     "r");
+    if (!fp) return;
+    std::string result;
+    char buf[256];
+    while (fgets(buf, sizeof(buf), fp)) {
+        result += buf;
+    }
+    int status = pclose(fp);
+    while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
+        result.pop_back();
+    if (status != 0 || result.empty()) return;
 
     auto sep = result.find('|');
     if (sep == std::string::npos) return;
@@ -338,21 +375,31 @@ void JaimEngine::runManageDict() {
             }
         }
     } else if (action == "編集") {
-        auto result = runZenity({
-            "--forms",
-            "--title=JaIM: 単語の編集",
-            "--text=現在のよみ: " + selReading + "\n現在の単語: " + selSurface +
-                "\n\n変更する項目のみ入力してください (空欄は変更なし)",
-            "--add-entry=よみ (ひらがな)",
-            "--add-entry=単語 (漢字・カタカナなど)",
-            "--separator=|",
-        });
-        if (result.empty()) return;
+        // Reuse the GTK register dialog in edit mode (prefilled). GDK_BACKEND=x11
+        // forces XWayland on Wayland sessions so xdotool key delivery works.
+        std::string cmd = "GDK_BACKEND=x11 /usr/bin/python3 "
+                          "/usr/share/jaim/scripts/jaim_word_register.py "
+                          "fcitx5 --mode edit "
+                          "--reading " + shellQuote(selReading) + " "
+                          "--surface " + shellQuote(selSurface);
+        FILE *fp = popen(cmd.c_str(), "r");
+        if (!fp) return;
+        std::string result;
+        char buf[256];
+        while (fgets(buf, sizeof(buf), fp)) {
+            result += buf;
+        }
+        int status = pclose(fp);
+        while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
+            result.pop_back();
+        if (status != 0 || result.empty()) return;
+
         auto sep = result.find('|');
         if (sep == std::string::npos) return;
         std::string newReading = result.substr(0, sep);
         std::string newSurface = result.substr(sep + 1);
-        if (newReading.empty() && newSurface.empty()) return;
+        if (newReading.empty() || newSurface.empty()) return;
+        if (newReading == selReading && newSurface == selSurface) return;
 
         if (jaim_dict_update_entry(idx, newReading.c_str(), newSurface.c_str())) {
             runZenity({"--info", "--title=JaIM", "--text=辞書を更新しました"});

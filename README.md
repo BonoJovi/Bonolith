@@ -101,6 +101,8 @@ JaIM/
 - [Rust](https://rustup.rs/)（最新 stable）
 - Linux + IBus または Fcitx5
 - IPADIC 辞書（`sudo apt install mecab-ipadic`）
+- 辞書登録 / 編集ダイアログ（GTK3）: `sudo apt install python3-gi gir1.2-gtk-3.0 xdotool`
+  - Wayland セッションでも `GDK_BACKEND=x11` で XWayland 経由で起動するため、xdotool が動作する Xorg / XWayland が必要
 - LLM 用（オプション）: llama-server + Qwen2.5-0.5B Q4 モデル（約 512MB）
 
 ## ビルド
@@ -198,6 +200,9 @@ sleep 2 && ibus-daemon -drx
 ### Fcitx5
 
 ```bash
+# 開発パッケージ（Fcitx5Core/Utils/Config の cmake config・ヘッダー）
+sudo apt install libfcitx5core-dev   # Utils/Config dev も依存で入る
+
 # Fcitx5 アドオンをビルド・インストール
 cd fcitx5
 mkdir -p build && cd build

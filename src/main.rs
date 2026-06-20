@@ -34,6 +34,26 @@ fn init_logging() {
         .init();
 }
 
+/// Remove inherited env vars that point at namespaced (snap/flatpak)
+/// resources. When jaim is launched from a snap-packaged terminal
+/// (e.g. ghostty), `GDK_PIXBUF_MODULE_FILE` points into the snap's
+/// private gdk-pixbuf cache; any GTK subprocess (zenity, the GTK
+/// register dialog, etc.) then tries to dlopen the snap's loaders,
+/// which were built against a different libc and crash. Clearing the
+/// variable here makes subsequent subprocesses fall back to the
+/// distribution defaults.
+fn sanitize_inherited_env() {
+    for var in ["GDK_PIXBUF_MODULE_FILE", "GDK_PIXBUF_MODULEDIR"] {
+        if let Ok(val) = std::env::var(var) {
+            if val.contains("/snap/") || val.contains("/.snap") {
+                // SAFETY: invoked once at startup before any threads
+                // could read the environment.
+                unsafe { std::env::remove_var(var) };
+            }
+        }
+    }
+}
+
 fn print_usage() {
     eprintln!("Usage: jaim [COMMAND]");
     eprintln!();
@@ -109,6 +129,7 @@ fn llm_status() {
 #[tokio::main]
 async fn main() {
     init_logging();
+    sanitize_inherited_env();
 
     let args: Vec<String> = std::env::args().collect();
 
