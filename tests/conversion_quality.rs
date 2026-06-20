@@ -20,7 +20,11 @@
 //!   cargo test --test conversion_quality -- --nocapture
 
 use bonolith::core::dictionary::Dictionary;
+use bonolith::engine::{ConversionEngine, SharedCore};
 use std::fs;
+use std::time::{Duration, Instant};
+
+const CASES_PATH: &str = "tests/conversion_cases/cases.jsonl";
 
 #[derive(serde::Deserialize)]
 struct Case {
@@ -31,6 +35,15 @@ struct Case {
     pos_solvable: String,
     #[serde(default)]
     category: String,
+}
+
+fn load_cases() -> Vec<Case> {
+    let content = fs::read_to_string(CASES_PATH).expect("read cases.jsonl");
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("parse case"))
+        .collect()
 }
 
 /// Cumulative char offsets after each chunk: returns `[len(c0), len(c0)+len(c1), …]`.
@@ -225,4 +238,181 @@ fn evaluate_conversion_cases() {
 
     // PoC harness — visibility only. The CONN tuning cycle will gate on this
     // once the metric stabilizes, but for now regressions shouldn't break CI.
+}
+
+// ---------------------------------------------------------------------------
+// Top-1 conversion accuracy suite (hermetic layer).
+//
+// Unlike `evaluate_conversion_cases` (which only checks bunsetsu *boundaries*),
+// this drives the **full production conversion pipeline** — segmentation,
+// effective-score ordering, and LLM rerank — through `ConversionEngine`, then
+// checks the actual top-1 *surface* against each case's `expected` kanji.
+//
+// Hermetic by construction: `SharedCore::new_hermetic` wires the embedded
+// dictionary to an empty `UserScorer` (no learned history) and the
+// deterministic `MockScorer` (no llama-server). Results are reproducible on any
+// machine and in CI. Semantic-only cases (`pos_solvable == "no"`, e.g. はし/
+// きしゃ disambiguation) cannot be solved without a real LLM, so they are
+// reported but excluded from the gate — the live layer (a future `#[ignore]`
+// test wired to HttpLlamaScorer) is what measures those.
+// ---------------------------------------------------------------------------
+
+/// Run one reading through the full pipeline and return the top-1 surface.
+///
+/// A fresh engine per case (sharing the hermetic core) keeps romaji/conversion
+/// state clean; the shared core's user-learning and LLM context stay empty
+/// because we never commit. The background rerank uses the deterministic
+/// MockScorer, so the bounded wait below always resolves quickly.
+fn convert_top1(shared: &std::sync::Arc<SharedCore>, kana: &str) -> String {
+    let mut engine = ConversionEngine::with_shared(shared.clone());
+    engine.append_raw(kana);
+    if engine.start_conversion().is_none() {
+        return String::new();
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !engine.has_llm_rerank_result() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    engine.apply_llm_rerank();
+    engine
+        .conversion_state()
+        .map(|s| s.composed_text())
+        .unwrap_or_default()
+}
+
+#[derive(Default, Clone, Copy)]
+struct Top1Stats {
+    total: u32,
+    exact: u32,
+    phrase_hit: u32,
+    phrase_total: u32,
+}
+
+impl Top1Stats {
+    fn record(&mut self, exact: bool, phrase_hit: u32, phrase_total: u32) {
+        self.total += 1;
+        if exact {
+            self.exact += 1;
+        }
+        self.phrase_hit += phrase_hit;
+        self.phrase_total += phrase_total;
+    }
+}
+
+#[test]
+fn evaluate_top1_accuracy() {
+    let cases = load_cases();
+    let shared = SharedCore::new_hermetic();
+
+    let pct = |num: u32, den: u32| -> f64 {
+        if den == 0 {
+            0.0
+        } else {
+            100.0 * num as f64 / den as f64
+        }
+    };
+
+    let mut overall = Top1Stats::default();
+    let mut by_pos: std::collections::BTreeMap<String, Top1Stats> = std::collections::BTreeMap::new();
+    let mut by_cat: std::collections::BTreeMap<String, Top1Stats> = std::collections::BTreeMap::new();
+    let mut yes_failures: Vec<String> = Vec::new();
+
+    eprintln!("\n=== Top-1 conversion accuracy (hermetic: MockScorer, no learning) ===");
+    for case in &cases {
+        let want: String = case.expected.concat();
+        let got = convert_top1(&shared, &case.input_hiragana);
+        let exact = got == want;
+
+        // Phrase recall: expected surfaces present (in order) as the output is
+        // scanned left-to-right. Granularity-independent partial credit.
+        let mut cursor = 0usize;
+        let mut phrase_hit = 0u32;
+        for phrase in &case.expected {
+            if let Some(rel) = got[cursor..].find(phrase.as_str()) {
+                phrase_hit += 1;
+                cursor += rel + phrase.len();
+            }
+        }
+        let phrase_total = case.expected.len() as u32;
+
+        overall.record(exact, phrase_hit, phrase_total);
+        by_pos
+            .entry(case.pos_solvable.clone())
+            .or_default()
+            .record(exact, phrase_hit, phrase_total);
+        by_cat
+            .entry(case.category.clone())
+            .or_default()
+            .record(exact, phrase_hit, phrase_total);
+
+        if !exact && case.pos_solvable == "yes" {
+            yes_failures.push(format!("{} {:?} -> got {:?}", case.id, want, got));
+        }
+
+        let tag = if exact { "OK  " } else { "MISS" };
+        eprintln!(
+            "{:>10} [{:>7} / {:>12}] {} phrases={}/{}  want={:<18} got={}",
+            case.id, case.pos_solvable, case.category, tag, phrase_hit, phrase_total, want, got,
+        );
+    }
+
+    eprintln!("\n=== Summary ===");
+    eprintln!(
+        "Top-1 exact:    {}/{} ({:.1}%)   [full-sentence surface == expected]",
+        overall.exact,
+        overall.total,
+        pct(overall.exact, overall.total),
+    );
+    eprintln!(
+        "Phrase recall:  {}/{} ({:.1}%)   [expected phrases present in order]",
+        overall.phrase_hit,
+        overall.phrase_total,
+        pct(overall.phrase_hit, overall.phrase_total),
+    );
+
+    let print_bucket = |title: &str, m: &std::collections::BTreeMap<String, Top1Stats>| {
+        eprintln!("\n=== By {} ===", title);
+        eprintln!("{:<14}  exact            phrase-recall", "bucket");
+        for (k, s) in m {
+            eprintln!(
+                "{:<14}  {:>3}/{:>3} ({:>5.1}%)  {:>3}/{:>3} ({:>5.1}%)",
+                k,
+                s.exact,
+                s.total,
+                pct(s.exact, s.total),
+                s.phrase_hit,
+                s.phrase_total,
+                pct(s.phrase_hit, s.phrase_total),
+            );
+        }
+    };
+    print_bucket("pos_solvable", &by_pos);
+    print_bucket("category", &by_cat);
+
+    // Gate: the `yes` bucket is the POS/dictionary-solvable set — it must not
+    // regress. `partial`/`no` lean on the real LLM and are tracked in the live
+    // layer, so they are informational here. Threshold is calibrated to the
+    // current hermetic baseline; tighten it as dictionary/POS quality improves.
+    let yes = by_pos.get("yes").copied().unwrap_or_default();
+    // Baseline 2026-06-21: yes=7/13 (53.8%). Floor just below it, so any
+    // single-case regression in the solvable bucket (→ 6/13 = 46.2%) trips CI.
+    // Raise as dictionary/POS quality improves.
+    const YES_GATE_PCT: f64 = 53.0;
+    let yes_pct = pct(yes.exact, yes.total);
+    eprintln!(
+        "\nGate: pos_solvable=yes top-1 = {:.1}% (floor {:.1}%)",
+        yes_pct, YES_GATE_PCT,
+    );
+    if !yes_failures.is_empty() {
+        eprintln!("yes-bucket misses:");
+        for f in &yes_failures {
+            eprintln!("  {}", f);
+        }
+    }
+    assert!(
+        yes_pct >= YES_GATE_PCT,
+        "pos_solvable=yes top-1 accuracy {:.1}% fell below floor {:.1}%",
+        yes_pct,
+        YES_GATE_PCT,
+    );
 }

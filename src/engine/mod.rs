@@ -204,6 +204,28 @@ impl SharedCore {
             })
             .clone()
     }
+
+    /// Build a fresh, isolated core for hermetic evaluation harnesses.
+    ///
+    /// Unlike [`global`], this does not touch the process-wide singleton, the
+    /// user's SQLite store, or any live llama-server: it pairs the embedded
+    /// dictionary/grammar with an empty [`UserScorer`] (no learned history) and
+    /// the deterministic [`MockScorer`]. This makes conversion-quality results
+    /// reproducible across machines and CI, while still exercising the real
+    /// production pipeline (`start_conversion` → `trigger_llm_rerank` →
+    /// `apply_llm_rerank`). The `#[ignore]` live-quality tests construct their
+    /// own core wired to an HttpLlamaScorer instead.
+    pub fn new_hermetic() -> Arc<SharedCore> {
+        Arc::new(SharedCore {
+            dictionary: RwLock::new(Dictionary::new()),
+            grammar: GrammarEngine::new(),
+            llm: Mutex::new(LlmEngine::with_scorer(Box::new(
+                crate::core::llm::MockScorer,
+            ))),
+            user_scorer: Mutex::new(UserScorer::new()),
+            store: None,
+        })
+    }
 }
 
 /// Result of background LLM reranking: reranked candidate lists per segment.
@@ -220,9 +242,19 @@ pub struct ConversionEngine {
 
 impl ConversionEngine {
     pub fn new() -> Self {
+        Self::with_shared(SharedCore::global())
+    }
+
+    /// Construct an engine bound to a specific [`SharedCore`].
+    ///
+    /// Production uses [`new`] (the global core). Evaluation harnesses pass a
+    /// [`SharedCore::new_hermetic`] core to run the full conversion pipeline
+    /// deterministically, without the global singleton, user store, or a live
+    /// LLM server.
+    pub fn with_shared(shared: Arc<SharedCore>) -> Self {
         Self {
             romaji: RomajiConverter::new(),
-            shared: SharedCore::global(),
+            shared,
             conversion: None,
             llm_rerank_result: Arc::new(Mutex::new(None)),
         }
