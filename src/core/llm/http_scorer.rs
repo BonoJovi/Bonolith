@@ -69,12 +69,13 @@ fn gbnf_string_literal(s: &str) -> String {
 }
 
 /// Map a mean per-token log-probability (content tokens only) to the 0.3–0.9
-/// scoring band used by the reranker. With the end-of-text token excluded,
-/// a contextually strong surface scores around -1..-3 and an unlikely one
-/// falls to -10 or worse, so the band spans that range to keep candidates
-/// well separated rather than clamping the good ones together.
+/// scoring band used by the reranker. With the end-of-text token excluded, a
+/// contextually strong surface scores around -1..-3; the band's lower end is
+/// set to -13 because the default 1.5B model's logprobs run more negative than
+/// the 0.5B's, and clamping correct-but-low candidates (~-11) to the floor
+/// would collapse them into ties.
 fn logprob_to_score(avg_logprob: f64) -> f64 {
-    const LO: f64 = -10.0; // → 0.3
+    const LO: f64 = -13.0; // → 0.3
     const HI: f64 = -2.0; // → 0.9
     let t = ((avg_logprob - LO) / (HI - LO)).clamp(0.0, 1.0);
     0.3 + t * 0.6

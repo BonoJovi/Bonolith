@@ -8,7 +8,7 @@ Environment=LD_LIBRARY_PATH=%h/.local/lib
 # llama.cpp's ggml_backend_load_all() dlopens ggml backends from the binary's
 # own directory, not LD_LIBRARY_PATH. Symlink them into ~/.local/bin first.
 ExecStartPre=-/bin/sh -c 'for f in %h/.local/lib/libggml-cpu-*.so %h/.local/lib/libggml-rpc.so; do [ -e "$f" ] && ln -sf "$f" "%h/.local/bin/$(basename "$f")"; done'
-ExecStart=%h/.local/bin/llama-server -m %h/.local/share/bonolith/models/qwen2.5-0.5b-instruct-q4_k_m.gguf --host 127.0.0.1 --port 8080 --ctx-size 512 --threads 2 -ngl 0
+ExecStart=%h/.local/bin/llama-server -m %h/.local/share/bonolith/models/qwen2.5-1.5b-instruct-q4_k_m.gguf --host 127.0.0.1 --port 8080 --ctx-size 512 --threads 2 -ngl 0
 Restart=on-failure
 RestartSec=5
 

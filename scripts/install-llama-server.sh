@@ -21,18 +21,27 @@ set -euo pipefail
 DEFAULT_TAG="b9736"
 TAG="$DEFAULT_TAG"
 FORCE=0
+NO_MODEL=0
+
+# The GGUF the service loads. Must match the -m path in
+# bonolith-llm-server.service. Qwen2.5-1.5B clears the homophone benchmark
+# (8/10 at N=0) where the 0.5B needed user learning or failed outright.
+MODEL_FILE="qwen2.5-1.5b-instruct-q4_k_m.gguf"
+MODEL_URL="https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/${MODEL_FILE}"
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--tag bNNNN] [--force] [--help]
+Usage: $(basename "$0") [--tag bNNNN] [--force] [--no-model] [--help]
 
 Downloads the prebuilt llama.cpp CPU release (ubuntu-x64) and installs
-llama-server into ~/.local/bin so bonolith-llm-server.service can run.
+llama-server into ~/.local/bin, plus the GGUF model the service loads, so
+bonolith-llm-server.service can run.
 
 Options:
   --tag bNNNN  llama.cpp release tag to install (default: $DEFAULT_TAG).
                Use 'latest' to resolve the newest release.
-  --force      Reinstall even if the target version is already present.
+  --force      Reinstall the binary even if the target version is present.
+  --no-model   Don't fetch the GGUF model (binary only).
   --help       Show this help.
 
 After installing, (re)start the service with:
@@ -44,6 +53,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --tag) TAG="${2:?--tag needs a value}"; shift ;;
         --force) FORCE=1 ;;
+        --no-model) NO_MODEL=1 ;;
         --help|-h) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
     esac
@@ -69,13 +79,41 @@ if [ "$TAG" = "latest" ]; then
     echo "  latest = $TAG"
 fi
 
-# Skip if the requested version is already installed (unless --force).
+# Fetch the GGUF the service loads (unless --no-model or already present).
+# Kept separate from the binary install so it runs even when the binary is
+# already up to date.
+provision_model() {
+    if [ "$NO_MODEL" -eq 1 ]; then return 0; fi
+    model_dir="$HOME/.local/share/bonolith/models"
+    dest="$model_dir/$MODEL_FILE"
+    if [ -f "$dest" ]; then
+        echo "Model already present: $dest"
+        return 0
+    fi
+    echo "Downloading model $MODEL_FILE (~1 GB) ..."
+    mkdir -p "$model_dir"
+    # Download to a .part file and move into place so an interrupted download
+    # never leaves a truncated GGUF the server would fail to load.
+    if curl -fSL -m 1800 -o "$dest.part" "$MODEL_URL"; then
+        mv "$dest.part" "$dest"
+        echo "Installed model: $dest"
+    else
+        rm -f "$dest.part"
+        echo "Warning: model download failed; the service won't start until" >&2
+        echo "  $MODEL_FILE is present under $model_dir" >&2
+        return 1
+    fi
+}
+
+# Skip the binary install if the requested version is already present (unless
+# --force), but still provision the model.
 if [ "$FORCE" -eq 0 ] && [ -x "$SERVER_BIN" ]; then
     current="$("$SERVER_BIN" --version 2>&1 | sed -n 's/^version: *\([0-9]*\).*/\1/p' | head -1)"
     want="${TAG#b}"
     if [ -n "$current" ] && [ "$current" = "$want" ]; then
         echo "llama-server $TAG already installed at $SERVER_BIN (use --force to reinstall)."
-        exit 0
+        provision_model
+        exit $?
     fi
 fi
 
@@ -111,6 +149,8 @@ done
 
 echo "Verifying ..."
 "$SERVER_BIN" --version 2>&1 | head -2
+
+provision_model
 
 echo ""
 echo "Installed llama-server $TAG."
