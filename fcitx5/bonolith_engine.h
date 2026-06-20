@@ -1,7 +1,7 @@
-/// Fcitx5 addon for JaIM — thin C++ wrapper over the Rust engine.
+/// Fcitx5 addon for Bonolith — thin C++ wrapper over the Rust engine.
 
-#ifndef JAIM_ENGINE_H
-#define JAIM_ENGINE_H
+#ifndef BONOLITH_ENGINE_H
+#define BONOLITH_ENGINE_H
 
 #include <fcitx/action.h>
 #include <fcitx/addonfactory.h>
@@ -13,33 +13,34 @@
 #include <fcitx/statusarea.h>
 #include <fcitx/userinterfacemanager.h>
 
-#include "jaim_ffi.h"
+#include "bonolith_ffi.h"
 
-namespace jaim {
+namespace bonolith {
 
-class JaimEngine;
+class BonolithEngine;
 
-/// Per-InputContext state wrapping a JaimContext (Rust engine).
-class JaimState : public fcitx::InputContextProperty {
+/// Per-InputContext state wrapping a BonolithContext (Rust engine).
+class BonolithState : public fcitx::InputContextProperty {
 public:
-    JaimState(JaimEngine *engine, fcitx::InputContext *ic);
-    ~JaimState();
+    BonolithState(BonolithEngine *engine, fcitx::InputContext *ic);
+    ~BonolithState();
 
     void keyEvent(fcitx::KeyEvent &event);
     void reset();
+    void commitInput();
 
 private:
     void updateUI();
 
-    JaimEngine *engine_;
+    BonolithEngine *engine_;
     fcitx::InputContext *ic_;
-    JaimContext *ctx_;
+    BonolithContext *ctx_;
 };
 
 /// Fcitx5 input method engine addon.
-class JaimEngine : public fcitx::InputMethodEngineV2 {
+class BonolithEngine : public fcitx::InputMethodEngineV2 {
 public:
-    JaimEngine(fcitx::Instance *instance);
+    BonolithEngine(fcitx::Instance *instance);
 
     void keyEvent(const fcitx::InputMethodEntry &entry,
                   fcitx::KeyEvent &event) override;
@@ -63,7 +64,7 @@ private:
     static void runClearLearning();
 
     fcitx::Instance *instance_;
-    fcitx::FactoryFor<JaimState> factory_;
+    fcitx::FactoryFor<BonolithState> factory_;
 
     // Menu actions
     fcitx::SimpleAction actionRegister_;
@@ -75,13 +76,13 @@ private:
     fcitx::SimpleAction menuAction_;
 };
 
-class JaimEngineFactory : public fcitx::AddonFactory {
+class BonolithEngineFactory : public fcitx::AddonFactory {
     fcitx::AddonInstance *
     create(fcitx::AddonManager *manager) override {
-        return new JaimEngine(manager->instance());
+        return new BonolithEngine(manager->instance());
     }
 };
 
-} // namespace jaim
+} // namespace bonolith
 
-#endif // JAIM_ENGINE_H
+#endif // BONOLITH_ENGINE_H

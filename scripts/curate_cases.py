@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Interactive curation tool for JaIM conversion eval dataset.
+"""Interactive curation tool for Bonolith conversion eval dataset.
 
-Reads captured conversions from $HOME/.local/share/jaim/conversions.jsonl
-(produced when JaIM runs with JAIM_LOG_CONVERSIONS=1) and lets you mark
+Reads captured conversions from $HOME/.local/share/bonolith/conversions.jsonl
+(produced when Bonolith runs with BONOLITH_LOG_CONVERSIONS=1) and lets you mark
 mis-conversions as eval cases, appended to tests/conversion_cases/cases.jsonl.
 
 Usage:
@@ -22,8 +22,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EVAL_PATH = REPO_ROOT / "tests" / "conversion_cases" / "cases.jsonl"
-LOG_PATH = Path(os.path.expanduser("~/.local/share/jaim/conversions.jsonl"))
-CURSOR_PATH = Path(os.path.expanduser("~/.local/share/jaim/curation_cursor"))
+LOG_PATH = Path(os.path.expanduser("~/.local/share/bonolith/conversions.jsonl"))
+CURSOR_PATH = Path(os.path.expanduser("~/.local/share/bonolith/curation_cursor"))
 
 CATEGORIES = ["segmentation", "word_choice", "inflection", "both"]
 POS_SOLVABLE = ["yes", "partial", "no"]
@@ -31,7 +31,7 @@ POS_SOLVABLE = ["yes", "partial", "no"]
 
 def load_log() -> list[dict]:
     if not LOG_PATH.exists():
-        sys.exit(f"No capture log at {LOG_PATH}. Run JaIM with JAIM_LOG_CONVERSIONS=1 first.")
+        sys.exit(f"No capture log at {LOG_PATH}. Run Bonolith with BONOLITH_LOG_CONVERSIONS=1 first.")
     out = []
     for line in LOG_PATH.read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -128,7 +128,7 @@ def curate_entry(entry: dict) -> dict | None:
         "pos_hypothesis": "" if pos_hypothesis == "-" else pos_hypothesis,
         "notes": "" if notes == "-" else notes,
         "date_collected": dt.date.today().isoformat(),
-        "jaim_version": entry.get("version", ""),
+        "bonolith_version": entry.get("version", ""),
         "source": "captured",
     }
 

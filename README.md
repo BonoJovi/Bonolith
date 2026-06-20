@@ -1,10 +1,10 @@
-# JaIM - Japanese AI-powered Input Method
+# Bonolith - Japanese AI-powered Input Method
 
 <div align="center">
 
 **Japanese Input Method / Japanese a Input Method / Japanese AI Method**
 
-[![Version](https://img.shields.io/badge/Version-2.1.0-blue)](https://github.com/BonoJovi/JaIM/releases)
+[![Version](https://img.shields.io/badge/Version-3.0.0-blue)](https://github.com/BonoJovi/Bonolith/releases)
 [![Rust](https://img.shields.io/badge/Rust-2024-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/bonojovi)
@@ -63,7 +63,7 @@
 ## プロジェクト構成
 
 ```
-JaIM/
+Bonolith/
   src/
     main.rs                  # エントリポイント（IBus D-Bus サービス）
     lib.rs                   # ライブラリクレート（Fcitx5 用 cdylib エクスポート）
@@ -84,16 +84,16 @@ JaIM/
       generate_dict.rs       # IPADIC → builtin_dict.rs ジェネレータ
       generate_matrix.rs     # IPADIC matrix.def → connection_cost.rs ジェネレータ
   fcitx5/
-    jaim_engine.cpp          # Fcitx5 C++ アドオン
-    jaim_engine.h            # アドオンヘッダ
-    jaim_ffi.h               # Rust FFI ヘッダ
+    bonolith_engine.cpp          # Fcitx5 C++ アドオン
+    bonolith_engine.h            # アドオンヘッダ
+    bonolith_ffi.h               # Rust FFI ヘッダ
     CMakeLists.txt           # Fcitx5 ビルド設定
-    jaim-addon.conf          # アドオン記述ファイル
-    jaim-im.conf             # 入力メソッド記述ファイル
+    bonolith-addon.conf          # アドオン記述ファイル
+    bonolith-im.conf             # 入力メソッド記述ファイル
   scripts/
-    jaim-llm-server.service  # llama-server 用 systemd ユーザーサービス
+    bonolith-llm-server.service  # llama-server 用 systemd ユーザーサービス
   data/
-    jaim.xml                 # IBus コンポーネント記述ファイル
+    bonolith.xml                 # IBus コンポーネント記述ファイル
 ```
 
 ## 動作要件
@@ -122,7 +122,7 @@ cargo build --release
 ## LLM サーバーセットアップ（オプション）
 
 LLM リランキングを有効にするには、llama-server をセットアップします。
-LLM サーバーが起動していなくても JaIM は正常に動作します（辞書＋文法＋ユーザ学習のみで変換）。
+LLM サーバーが起動していなくても Bonolith は正常に動作します（辞書＋文法＋ユーザ学習のみで変換）。
 
 ### 1. llama-server のインストール
 
@@ -144,8 +144,8 @@ cp llama-*/lib*.so* ~/.local/lib/
 ### 2. モデルのダウンロード
 
 ```bash
-mkdir -p ~/.local/share/jaim/models
-cd ~/.local/share/jaim/models
+mkdir -p ~/.local/share/bonolith/models
+cd ~/.local/share/bonolith/models
 curl -LO https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
 ```
 
@@ -153,9 +153,9 @@ curl -LO https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwe
 
 ```bash
 mkdir -p ~/.config/systemd/user/
-cp scripts/jaim-llm-server.service ~/.config/systemd/user/
+cp scripts/bonolith-llm-server.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now jaim-llm-server
+systemctl --user enable --now bonolith-llm-server
 ```
 
 動作確認：
@@ -170,9 +170,9 @@ curl http://127.0.0.1:8080/health
 導入後はいつでも切り替えできます：
 
 ```bash
-jaim llm on        # 有効化（systemd サービスを enable + start）
-jaim llm off       # 無効化（stop + disable、辞書のみで動作）
-jaim llm status    # 現状確認
+bonolith llm on        # 有効化（systemd サービスを enable + start）
+bonolith llm off       # 無効化（stop + disable、辞書のみで動作）
+bonolith llm status    # 現状確認
 ```
 
 実行中の IBus / Fcitx5 セッションには即座に反映されないので、切り替え後は `ibus-daemon -drx` でリロードするか、再ログインしてください。
@@ -187,11 +187,11 @@ jaim llm status    # 現状確認
 # IBus デーモンを停止してバイナリをインストール
 sudo pkill -f ibus-daemon
 sleep 1
-sudo rm -f /usr/bin/ibus-engine-jaim
-sudo cp target/release/jaim /usr/bin/ibus-engine-jaim
+sudo rm -f /usr/bin/ibus-engine-bonolith
+sudo cp target/release/bonolith /usr/bin/ibus-engine-bonolith
 
 # IBus コンポーネント記述ファイルをインストール
-sudo cp data/jaim.xml /usr/share/ibus/component/jaim.xml
+sudo cp data/bonolith.xml /usr/share/ibus/component/bonolith.xml
 
 # IBus を再起動
 sleep 2 && ibus-daemon -drx
@@ -221,19 +221,19 @@ Ubuntu 22.04 では言語パックが自動インストールされないため�
 
 設定 → 地域と言語 → インストールされている言語の管理 → 「はい」で言語パックをインストール
 
-### 2. JaIM を登録
+### 2. Bonolith を登録
 
 #### IBus の場合
 
-設定 → キーボード → 入力ソース → 「+」 → 日本語 → Japanese (JaIM - Japanese AI Input) → 追加
+設定 → キーボード → 入力ソース → 「+」 → 日本語 → Japanese (Bonolith - Japanese AI Input) → 追加
 
 #### Fcitx5 の場合
 
-Fcitx5 設定 → 入力メソッド → 「+」 → JaIM を検索 → 追加
+Fcitx5 設定 → 入力メソッド → 「+」 → Bonolith を検索 → 追加
 
 ### 3. 確認
 
-トップバー（ディストロによってはタスクバー / タスクトレイ）の入力メソッドアイコンをクリックし、JaIM が表示されていれば登録完了です。PC の再起動が必要な場合があります。
+トップバー（ディストロによってはタスクバー / タスクトレイ）の入力メソッドアイコンをクリックし、Bonolith が表示されていれば登録完了です。PC の再起動が必要な場合があります。
 
 ## キーバインド
 
@@ -251,6 +251,12 @@ Fcitx5 設定 → 入力メソッド → 「+」 → JaIM を検索 → 追加
 | F8 | 半角カタカナに変換 |
 | F9 | 全角英数に変換 |
 | F10 | 半角英数に変換 |
+
+## 既知の制約
+
+### 再起動後に入力ソースが消える（Ubuntu / GNOME の仕様）
+
+IME フレームワークを Fcitx5 にしたまま、その自動起動を OFF にして Ubuntu を再起動すると、GNOME のデフォルトである IBus が起動し、入力ソース一覧から Bonolith が消えて再登録が必要になることがあります。これは GNOME の入力ソース管理（`org.gnome.desktop.input-sources`）が「現在アクティブな IME フレームワーク」前提で動くためで、Bonolith 側のバグではありません。`im-config` で選んだフレームワークと実際に自動起動するフレームワークを一致させておけば回避できます。
 
 ## テスト
 

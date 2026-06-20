@@ -6,7 +6,7 @@
 /// ## Multi-process access
 ///
 /// The store is opened in WAL (write-ahead log) mode so that fcitx5
-/// (`fcitx5-jaim.so`) and IBus (`ibus-engine-jaim`) — which run in
+/// (`fcitx5-bonolith.so`) and IBus (`ibus-engine-bonolith`) — which run in
 /// separate processes — can both open the same database. Writes from
 /// one process are durably persisted; the other process's `Connection`
 /// will see them on the next read. However, **each process keeps its
@@ -94,8 +94,8 @@ impl DictStore {
         Ok(store)
     }
 
-    /// Default path: `$XDG_DATA_HOME/jaim/dict.sqlite` (typically
-    /// `~/.local/share/jaim/dict.sqlite`).
+    /// Default path: `$XDG_DATA_HOME/bonolith/dict.sqlite` (typically
+    /// `~/.local/share/bonolith/dict.sqlite`).
     pub fn default_path() -> io::Result<PathBuf> {
         let data_dir = std::env::var("XDG_DATA_HOME")
             .map(PathBuf::from)
@@ -103,7 +103,7 @@ impl DictStore {
                 let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
                 PathBuf::from(home).join(".local/share")
             })
-            .join("jaim");
+            .join("bonolith");
         Ok(data_dir.join("dict.sqlite"))
     }
 
@@ -215,7 +215,7 @@ impl DictStore {
     /// Merge stale post-migration JSON files (`user_dict.json`,
     /// `user_scores.json`) into SQLite. Called only when the migration
     /// flag is already set, i.e. the JSON files are leftovers from a
-    /// v1.x process that ran after the JaIM upgrade.
+    /// v1.x process that ran after the Bonolith upgrade.
     ///
     /// Semantics:
     /// - Dict: `INSERT OR IGNORE` so existing SQLite entries win on
@@ -537,7 +537,7 @@ mod tests {
     use super::*;
 
     fn temp_db_path(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("jaim_test_store_{}", name));
+        let dir = std::env::temp_dir().join(format!("bonolith_test_store_{}", name));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("dict.sqlite")

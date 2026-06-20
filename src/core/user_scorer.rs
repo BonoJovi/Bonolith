@@ -1,4 +1,4 @@
-/// User learning scorer for JaIM.
+/// User learning scorer for Bonolith.
 ///
 /// Records which (reading, surface) pairs the user selects and boosts
 /// those pairs in future candidate ranking. Persists to the SQLite
@@ -87,7 +87,7 @@ impl UserScorer {
                 let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
                 std::path::PathBuf::from(home).join(".local/share")
             })
-            .join("jaim");
+            .join("bonolith");
         Ok(data_dir.join("user_scores.json"))
     }
 
@@ -101,7 +101,7 @@ mod tests {
     use super::*;
 
     fn temp_store(name: &str) -> Arc<DictStore> {
-        let dir = std::env::temp_dir().join(format!("jaim_test_scorer_{}", name));
+        let dir = std::env::temp_dir().join(format!("bonolith_test_scorer_{}", name));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Arc::new(DictStore::open(&dir.join("dict.sqlite")).unwrap())

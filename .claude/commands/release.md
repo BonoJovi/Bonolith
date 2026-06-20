@@ -1,6 +1,6 @@
 # Release Workflow
 
-Release checklist for JaIM. Run this before creating a release tag.
+Release checklist for Bonolith. Run this before creating a release tag.
 
 ## Steps
 
@@ -9,13 +9,13 @@ Release checklist for JaIM. Run this before creating a release tag.
 Update version in ALL 5 files simultaneously:
 - `Cargo.toml` → `version = "X.Y.Z"`
 - `README.md` → Version badge
-- `data/jaim.xml` → `<version>X.Y.Z</version>`
-- `fcitx5/jaim-addon.conf` → `Version=X.Y.Z`
-- `fcitx5/CMakeLists.txt` → `project(fcitx5-jaim VERSION X.Y.Z)`
+- `data/bonolith.xml` → `<version>X.Y.Z</version>`
+- `fcitx5/bonolith-addon.conf` → `Version=X.Y.Z`
+- `fcitx5/CMakeLists.txt` → `project(fcitx5-bonolith VERSION X.Y.Z)`
 
 Verify all updated:
 ```bash
-grep -n "X.Y.Z" Cargo.toml README.md data/jaim.xml fcitx5/jaim-addon.conf fcitx5/CMakeLists.txt
+grep -n "X.Y.Z" Cargo.toml README.md data/bonolith.xml fcitx5/bonolith-addon.conf fcitx5/CMakeLists.txt
 ```
 
 ### 2. Build & Test
@@ -30,7 +30,7 @@ All tests must pass before proceeding.
 ### 3. Commit & Merge
 
 ```bash
-git add Cargo.toml README.md data/jaim.xml fcitx5/jaim-addon.conf fcitx5/CMakeLists.txt
+git add Cargo.toml README.md data/bonolith.xml fcitx5/bonolith-addon.conf fcitx5/CMakeLists.txt
 git commit -m "release: vX.Y.Z"
 git pull origin dev
 git push origin dev

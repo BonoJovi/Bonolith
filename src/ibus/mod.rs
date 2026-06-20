@@ -4,8 +4,8 @@
 //! using the zbus crate for pure-Rust D-Bus communication.
 //!
 //! Architecture:
-//! - JaimEngine: implements org.freedesktop.IBus.Engine (key events, preedit, commit)
-//! - JaimFactory: implements org.freedesktop.IBus.Factory (engine creation)
+//! - BonolithEngine: implements org.freedesktop.IBus.Engine (key events, preedit, commit)
+//! - BonolithFactory: implements org.freedesktop.IBus.Factory (engine creation)
 //! - Component XML: registration file for IBus daemon
 
 mod config;

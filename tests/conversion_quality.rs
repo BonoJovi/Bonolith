@@ -2,15 +2,15 @@
 //!
 //! Primary metric: **bunsetsu refinement check**.
 //! Each case carries `expected_readings` (hiragana per phrase); their cumulative
-//! char counts define the human-expected phrase boundaries. JaIM's segmenter
+//! char counts define the human-expected phrase boundaries. Bonolith's segmenter
 //! returns morpheme-level boundaries — finer than phrases. We declare a case
-//! "boundary-correct" when every expected boundary appears in JaIM's boundary
-//! set (i.e. JaIM is a *refinement* of the expected segmentation). This lines
+//! "boundary-correct" when every expected boundary appears in Bonolith's boundary
+//! set (i.e. Bonolith is a *refinement* of the expected segmentation). This lines
 //! up the two granularities instead of demanding equal segment counts.
 //!
 //! Secondary signals (informational, not gating):
-//! - `boundary_recall` — fraction of expected boundaries present in JaIM output
-//! - `over_segments` — extra JaIM splits inside expected phrases (lower = closer
+//! - `boundary_recall` — fraction of expected boundaries present in Bonolith output
+//! - `over_segments` — extra Bonolith splits inside expected phrases (lower = closer
 //!   to phrase-level; high values still pass refinement)
 //! - `segs_parity` — legacy segment-count parity, kept for historical comparison
 //!
@@ -19,7 +19,7 @@
 //! Run with:
 //!   cargo test --test conversion_quality -- --nocapture
 
-use jaim::core::dictionary::Dictionary;
+use bonolith::core::dictionary::Dictionary;
 use std::fs;
 
 #[derive(serde::Deserialize)]
@@ -100,21 +100,21 @@ fn evaluate_conversion_cases() {
         exp_offsets.pop();
         let exp_boundaries: std::collections::BTreeSet<usize> = exp_offsets.into_iter().collect();
 
-        // JaIM internal boundaries: cumulative segment lengths minus terminal.
-        let mut jaim_offsets = Vec::with_capacity(segments.len());
+        // Bonolith internal boundaries: cumulative segment lengths minus terminal.
+        let mut bonolith_offsets = Vec::with_capacity(segments.len());
         let mut acc = 0usize;
         for s in &segments {
             acc += s.reading.chars().count();
-            jaim_offsets.push(acc);
+            bonolith_offsets.push(acc);
         }
-        jaim_offsets.pop();
-        let jaim_boundaries: std::collections::BTreeSet<usize> =
-            jaim_offsets.into_iter().collect();
+        bonolith_offsets.pop();
+        let bonolith_boundaries: std::collections::BTreeSet<usize> =
+            bonolith_offsets.into_iter().collect();
 
         let exp_count = exp_boundaries.len() as u32;
-        let matched = exp_boundaries.intersection(&jaim_boundaries).count() as u32;
-        let is_refinement = exp_boundaries.is_subset(&jaim_boundaries);
-        let over_segments = jaim_boundaries.difference(&exp_boundaries).count();
+        let matched = exp_boundaries.intersection(&bonolith_boundaries).count() as u32;
+        let is_refinement = exp_boundaries.is_subset(&bonolith_boundaries);
+        let over_segments = bonolith_boundaries.difference(&exp_boundaries).count();
         let parity_ok = segments.len() == case.expected.len();
 
         total += 1;
@@ -172,7 +172,7 @@ fn evaluate_conversion_cases() {
 
     eprintln!("\n=== Summary ===");
     eprintln!(
-        "Refinement pass:   {}/{} ({:.1}%)   [JaIM boundaries ⊇ expected]",
+        "Refinement pass:   {}/{} ({:.1}%)   [Bonolith boundaries ⊇ expected]",
         refinement_pass,
         total,
         pct(refinement_pass, total),
@@ -195,7 +195,7 @@ fn evaluate_conversion_cases() {
         0.0
     };
     eprintln!(
-        "Over-segments:     {} total, {:.2} avg/case   [JaIM boundaries that fall inside an expected phrase]",
+        "Over-segments:     {} total, {:.2} avg/case   [Bonolith boundaries that fall inside an expected phrase]",
         over_segments_total, avg_over,
     );
 

@@ -1,4 +1,4 @@
-/// JaIM Conversion Engine
+/// Bonolith Conversion Engine
 ///
 /// Orchestrates the 3-stage conversion pipeline:
 /// 1. Dictionary lookup + segmentation (fast, < 1ms)
@@ -72,9 +72,9 @@ impl ConversionState {
 
 /// Opt-in conversion logger for evaluation dataset curation.
 ///
-/// When `JAIM_LOG_CONVERSIONS=1` is set in the environment, every committed
+/// When `BONOLITH_LOG_CONVERSIONS=1` is set in the environment, every committed
 /// conversion is appended as a JSONL record to
-/// `$HOME/.local/share/jaim/conversions.jsonl`. Records contain the reading,
+/// `$HOME/.local/share/bonolith/conversions.jsonl`. Records contain the reading,
 /// composed output, per-segment alternatives, and which segments the user
 /// explicitly re-selected (a strong signal that the system's first choice was
 /// wrong). See `scripts/curate_cases.py` for the curation workflow.
@@ -83,11 +83,11 @@ impl ConversionState {
 /// sessions and delete the log file when done. Errors are silently swallowed
 /// so the IME never breaks because of logging.
 fn log_conversion_for_eval(state: &ConversionState) {
-    if std::env::var("JAIM_LOG_CONVERSIONS").ok().as_deref() != Some("1") {
+    if std::env::var("BONOLITH_LOG_CONVERSIONS").ok().as_deref() != Some("1") {
         return;
     }
     let Some(home) = std::env::var_os("HOME") else { return };
-    let dir = std::path::Path::new(&home).join(".local/share/jaim");
+    let dir = std::path::Path::new(&home).join(".local/share/bonolith");
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
@@ -572,7 +572,7 @@ impl ConversionEngine {
         let text = state.composed_text();
 
         // Opt-in: dump committed conversion to JSONL for (c) eval dataset curation.
-        // Gated by JAIM_LOG_CONVERSIONS=1 — privacy-sensitive (logs raw text).
+        // Gated by BONOLITH_LOG_CONVERSIONS=1 — privacy-sensitive (logs raw text).
         log_conversion_for_eval(&state);
 
         // Record only segments where the user explicitly chose a candidate.

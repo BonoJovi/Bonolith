@@ -102,7 +102,7 @@ jobs:
       if: matrix.language == 'c-cpp'
       run: |
         cmake -S fcitx5 -B fcitx5/build \
-          -DJAIM_LIB_DIR="$PWD/target/release"
+          -DBONOLITH_LIB_DIR="$PWD/target/release"
         cmake --build fcitx5/build
 
     - name: Perform CodeQL Analysis

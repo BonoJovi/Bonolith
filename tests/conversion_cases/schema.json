@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "JaIM ConversionCase",
+  "title": "Bonolith ConversionCase",
   "type": "object",
   "required": ["id", "input_hiragana", "expected", "expected_readings", "category", "pos_solvable", "date_collected"],
   "properties": {
@@ -16,7 +16,7 @@
     "pos_hypothesis": { "type": "string" },
     "notes": { "type": "string" },
     "date_collected": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
-    "jaim_version": { "type": "string" },
+    "bonolith_version": { "type": "string" },
     "source": { "enum": ["generated", "user_reported", "captured"] }
   }
 }

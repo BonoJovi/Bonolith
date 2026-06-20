@@ -1,17 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <component>
-  <name>org.freedesktop.IBus.JaIM</name>
-  <description>JaIM - Japanese AI-powered Input Method</description>
-  <exec>/usr/bin/ibus-engine-jaim</exec>
-  <version>2.1.0</version>
+  <name>org.freedesktop.IBus.Bonolith</name>
+  <description>Bonolith - Japanese AI-powered Input Method</description>
+  <exec>/usr/bin/ibus-engine-bonolith</exec>
+  <version>3.0.0</version>
   <author>Yoshihiro NAKAHARA</author>
   <license>MIT</license>
-  <homepage>https://github.com/BonoJovi/JaIM</homepage>
-  <textdomain>jaim</textdomain>
+  <homepage>https://github.com/BonoJovi/Bonolith</homepage>
+  <textdomain>bonolith</textdomain>
   <engines>
     <engine>
-      <name>jaim</name>
-      <longname>JaIM - Japanese AI Input</longname>
+      <name>bonolith</name>
+      <longname>Bonolith - Japanese AI Input</longname>
       <description>LLM-powered intelligent Japanese input method</description>
       <language>ja</language>
       <license>MIT</license>

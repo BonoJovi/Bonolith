@@ -1,4 +1,4 @@
-/// IPADIC dictionary generator for JaIM.
+/// IPADIC dictionary generator for Bonolith.
 ///
 /// Reads IPADIC CSV files (EUC-JP), filters and transforms entries,
 /// and outputs `builtin_dict.rs` with a static const array.
@@ -382,7 +382,7 @@ fn katakana_to_hiragana(s: &str) -> String {
         .collect()
 }
 
-/// Map IPADIC POS tags to JaIM PartOfSpeech variant name.
+/// Map IPADIC POS tags to Bonolith PartOfSpeech variant name.
 fn map_pos(major: &str, sub: &str) -> &'static str {
     match major {
         "名詞" => {
@@ -406,7 +406,7 @@ fn map_pos(major: &str, sub: &str) -> &'static str {
 
 /// Convert IPADIC cost to frequency score.
 /// IPADIC: lower cost = more common. Range roughly -7000 to +16000.
-/// JaIM: higher frequency = more common.
+/// Bonolith: higher frequency = more common.
 fn cost_to_frequency(cost: i32) -> u32 {
     let freq = 10000 - cost;
     freq.clamp(1, 20000) as u32

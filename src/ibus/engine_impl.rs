@@ -1,7 +1,7 @@
 /// IBus Engine D-Bus interface implementation.
 ///
 /// Implements org.freedesktop.IBus.Engine via zbus #[interface].
-/// Bridges IBus key events to JaIM's ConversionEngine and sends
+/// Bridges IBus key events to Bonolith's ConversionEngine and sends
 /// preedit/commit/candidates back via D-Bus signals.
 use std::sync::Mutex;
 
@@ -9,15 +9,15 @@ use log::{debug, info, warn};
 use zbus::object_server::SignalEmitter;
 use zbus::{interface, zvariant};
 
-use jaim::core::dictionary::{Dictionary, DictionaryEntry, PartOfSpeech};
-use jaim::engine::{ConversionEngine, ConversionState, SharedCore};
+use bonolith::core::dictionary::{Dictionary, DictionaryEntry, PartOfSpeech};
+use bonolith::engine::{ConversionEngine, ConversionState, SharedCore};
 
-use super::config::{CompiledToggleKey, JaimConfig};
+use super::config::{CompiledToggleKey, BonolithConfig};
 use super::factory::ForceEnable;
 use super::keymap::*;
 
 /// IBus Engine state
-pub struct JaimEngine {
+pub struct BonolithEngine {
     engine: Mutex<ConversionEngine>,
     /// Whether the engine is active (enabled by IBus)
     enabled: Mutex<bool>,
@@ -30,11 +30,11 @@ pub struct JaimEngine {
     force: ForceEnable,
 }
 
-impl JaimEngine {
-    pub fn new(config: &JaimConfig, force: ForceEnable) -> Self {
+impl BonolithEngine {
+    pub fn new(config: &BonolithConfig, force: ForceEnable) -> Self {
         let toggle_keys = config.compile_toggle_keys();
         info!(
-            "JaIM: Engine created with {} toggle key binding(s)",
+            "Bonolith: Engine created with {} toggle key binding(s)",
             toggle_keys.len()
         );
         Self {
@@ -58,7 +58,7 @@ impl JaimEngine {
             let mut enabled = self.enabled.lock().unwrap();
             if !*enabled {
                 *enabled = true;
-                info!("JaIM: force-enable window → enabled=true");
+                info!("Bonolith: force-enable window → enabled=true");
             }
         }
         active
@@ -204,7 +204,7 @@ fn ibus_lookup_table(candidates: &[String], selected: usize) -> zvariant::Value<
 }
 
 #[interface(name = "org.freedesktop.IBus.Engine")]
-impl JaimEngine {
+impl BonolithEngine {
     /// Process a key event. Returns true if handled.
     async fn process_key_event(
         &self,
@@ -236,26 +236,26 @@ impl JaimEngine {
         self.apply_force_enable();
 
         debug!(
-            "JaIM: KeyEvent keyval=0x{:04X} keycode={} state=0x{:08X}",
+            "Bonolith: KeyEvent keyval=0x{:04X} keycode={} state=0x{:08X}",
             keyval, _keycode, state
         );
 
         // Absolute IME on/off via the Japanese-keyboard 変換 / 無変換 keys.
         // Unlike the toggle key, these set a *known* state regardless of the
         // current one — handy on a physical JP keyboard. (The word-register
-        // dialog no longer relies on this; it uses the org.jaim.Control
+        // dialog no longer relies on this; it uses the org.bonolith.Control
         // session-bus surface instead.) Skipped if the user explicitly bound
         // these as toggle keys.
         if !has_modifier(state) && !self.is_toggle_key(keyval, state) {
             if keyval == IBUS_KEY_HENKAN_MODE {
                 *self.enabled.lock().unwrap() = true;
-                info!("JaIM: Henkan → enabled=true (absolute ON)");
+                info!("Bonolith: Henkan → enabled=true (absolute ON)");
                 return Ok(true);
             }
             if keyval == IBUS_KEY_MUHENKAN {
                 let _ = self.cancel_input(&emitter).await;
                 *self.enabled.lock().unwrap() = false;
-                info!("JaIM: Muhenkan → enabled=false (absolute OFF)");
+                info!("Bonolith: Muhenkan → enabled=false (absolute OFF)");
                 return Ok(true);
             }
         }
@@ -270,7 +270,7 @@ impl JaimEngine {
                 *self.enabled.lock().unwrap() = true;
             }
             let now = *self.enabled.lock().unwrap();
-            info!("JaIM: Toggle → enabled={}", now);
+            info!("Bonolith: Toggle → enabled={}", now);
             return Ok(true);
         }
 
@@ -285,6 +285,41 @@ impl JaimEngine {
         }
 
         let converting = *self.converting.lock().unwrap();
+
+        // Tab while a preedit/conversion is active → commit current text and
+        // consume the key (Ok(true)). Focus does NOT move: this matches the
+        // standard Japanese IME convention (Mozc / Google IME / ATOK), where
+        // Tab during composition is an IME key, not a focus-navigation key.
+        // When nothing is composing we fall through to Ok(false) so Tab works
+        // normally. Both engines consume Tab here, so IBus and Fcitx5 stay
+        // consistent instead of diverging on framework preedit defaults.
+        if keyval == IBUS_KEY_TAB {
+            let text = {
+                let mut engine = self.engine.lock().unwrap();
+                if converting {
+                    engine.commit_conversion()
+                } else {
+                    let p = engine.preedit().to_string();
+                    if p.is_empty() {
+                        None
+                    } else {
+                        engine.commit(&p);
+                        Some(p)
+                    }
+                }
+            };
+            if let Some(text) = text {
+                Self::commit_text(&emitter, ibus_text(&text)).await
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                Self::hide_preedit_text(&emitter).await
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                Self::hide_lookup_table(&emitter).await
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                *self.converting.lock().unwrap() = false;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
 
         // F6 → hiragana
         if keyval == IBUS_KEY_F6 {
@@ -305,7 +340,7 @@ impl JaimEngine {
 
         // F7 → full-width katakana, F8 → half-width katakana, F9 → full-width romaji, F10 → half-width romaji
         if keyval == IBUS_KEY_F7 || keyval == IBUS_KEY_F8 || keyval == IBUS_KEY_F9 || keyval == IBUS_KEY_F10 {
-            info!("JaIM: F-key 0x{:04X} converting={}", keyval, converting);
+            info!("Bonolith: F-key 0x{:04X} converting={}", keyval, converting);
             let form = match keyval {
                 IBUS_KEY_F8 => 2,
                 IBUS_KEY_F9 => 4,
@@ -470,37 +505,37 @@ impl JaimEngine {
         // Adopt an open force-on window so the dialog's field shows 日本語ON the
         // moment it gains focus (no keystroke needed).
         self.apply_force_enable();
-        info!("JaIM: FocusIn (enabled={})", *self.enabled.lock().unwrap());
+        info!("Bonolith: FocusIn (enabled={})", *self.enabled.lock().unwrap());
         if let Err(e) = self.register_menu(&emitter).await {
-            warn!("JaIM: Failed to register properties: {}", e);
+            warn!("Bonolith: Failed to register properties: {}", e);
         }
     }
 
     /// Called when a menu item is activated.
     async fn property_activate(&self, prop_name: &str, _state: u32) {
-        info!("JaIM: PropertyActivate({})", prop_name);
+        info!("Bonolith: PropertyActivate({})", prop_name);
         match prop_name {
-            "jaim-export" => {
+            "bonolith-export" => {
                 std::thread::spawn(|| {
                     Self::run_dict_export();
                 });
             }
-            "jaim-import" => {
+            "bonolith-import" => {
                 std::thread::spawn(|| {
                     Self::run_dict_import();
                 });
             }
-            "jaim-register-word" => {
+            "bonolith-register-word" => {
                 std::thread::spawn(|| {
                     Self::run_word_register();
                 });
             }
-            "jaim-manage-dict" => {
+            "bonolith-manage-dict" => {
                 std::thread::spawn(|| {
                     Self::run_manage_dict();
                 });
             }
-            "jaim-clear-learning" => {
+            "bonolith-clear-learning" => {
                 let shared = self.engine.lock().unwrap().shared_core();
                 std::thread::spawn(move || {
                     Self::run_clear_learning(shared);
@@ -511,12 +546,19 @@ impl JaimEngine {
     }
 
     /// Called when the engine loses focus.
-    async fn focus_out(
-        &self,
-        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
-    ) {
-        info!("JaIM: FocusOut");
-        let _ = self.cancel_input(&emitter).await;
+    async fn focus_out(&self) {
+        info!("Bonolith: FocusOut");
+        // We send preedit with IBUS_ENGINE_PREEDIT_COMMIT (mode=1), so IBus
+        // itself commits any visible composition on focus loss — clicking away
+        // (e.g. onto a modal) preserves typed text, like Mozc/Google IME.
+        // Emitting CommitText here too would double-commit; instead we just
+        // clear our internal buffer so stale preedit can't reappear next focus.
+        {
+            let mut engine = self.engine.lock().unwrap();
+            engine.reset();
+            engine.clear_conversion();
+        }
+        *self.converting.lock().unwrap() = false;
         *self.enabled.lock().unwrap() = false;
     }
 
@@ -525,14 +567,14 @@ impl JaimEngine {
         &self,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) {
-        debug!("JaIM: Reset");
+        debug!("Bonolith: Reset");
         let _ = self.cancel_input(&emitter).await;
     }
 
     /// Enable the engine.
     async fn enable(&self) {
         self.apply_force_enable();
-        info!("JaIM: Enable (enabled={})", *self.enabled.lock().unwrap());
+        info!("Bonolith: Enable (enabled={})", *self.enabled.lock().unwrap());
     }
 
     /// Disable the engine.
@@ -540,7 +582,7 @@ impl JaimEngine {
         &self,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) {
-        info!("JaIM: Disable");
+        info!("Bonolith: Disable");
         let _ = self.cancel_input(&emitter).await;
         *self.enabled.lock().unwrap() = false;
     }
@@ -594,7 +636,7 @@ impl JaimEngine {
 }
 
 // Private helper methods (not exposed via D-Bus)
-impl JaimEngine {
+impl BonolithEngine {
     /// Check if the given key event matches any configured toggle binding.
     fn is_toggle_key(&self, keyval: u32, state: u32) -> bool {
         let relevant_mask = IBUS_CONTROL_MASK | IBUS_MOD1_MASK | IBUS_SHIFT_MASK;
@@ -741,12 +783,14 @@ impl JaimEngine {
 
         // Preedit with segment highlighting
         let cursor = text.chars().count() as u32;
+        // mode=1 (IBUS_ENGINE_PREEDIT_COMMIT): commit-on-focus-loss, so clicking
+        // away mid-conversion keeps the composed text instead of dropping it.
         Self::update_preedit_text(
             emitter,
             ibus_text_with_segments(&text, &ranges, focus),
             cursor,
             true,
-            0,
+            1,
         ).await.map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
         // Lookup table for the focused segment's candidates
@@ -883,7 +927,10 @@ impl JaimEngine {
         } else {
             ibus_text(text)
         };
-        Self::update_preedit_text(emitter, preedit_text, cursor, visible, 0).await
+        // mode=1 (IBUS_ENGINE_PREEDIT_COMMIT): on focus loss IBus commits this
+        // preedit instead of discarding it, so clicking away (e.g. onto a modal)
+        // preserves typed text. See focus_out — we no longer commit manually.
+        Self::update_preedit_text(emitter, preedit_text, cursor, visible, 1).await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Ok(())
     }
@@ -895,28 +942,28 @@ impl JaimEngine {
     ) -> zbus::fdo::Result<()> {
         // prop_type: 0=normal, 1=toggle, 2=radio, 3=separator, 4=menu
         let export_prop = ibus_property(
-            "jaim-export", 0,
+            "bonolith-export", 0,
             "辞書エクスポート...", "",
             "辞書をJSONファイルにエクスポート",
         );
         let import_prop = ibus_property(
-            "jaim-import", 0,
+            "bonolith-import", 0,
             "辞書インポート...", "",
             "JSONファイルから辞書をインポート",
         );
         let register_prop = ibus_property(
-            "jaim-register-word", 0,
+            "bonolith-register-word", 0,
             "単語登録...", "",
             "ユーザー辞書に新しい単語を登録",
         );
         let manage_prop = ibus_property(
-            "jaim-manage-dict", 0,
+            "bonolith-manage-dict", 0,
             "辞書管理...", "",
             "ユーザー辞書の編集・削除",
         );
 
         let clear_prop = ibus_property(
-            "jaim-clear-learning", 0,
+            "bonolith-clear-learning", 0,
             "学習履歴をクリア...", "",
             "変換の学習履歴をすべて消去する",
         );
@@ -932,9 +979,9 @@ impl JaimEngine {
     fn run_dict_export() {
         let output = std::process::Command::new("zenity")
             .args(["--file-selection", "--save", "--confirm-overwrite",
-                   "--title=JaIM: 辞書エクスポート",
+                   "--title=Bonolith: 辞書エクスポート",
                    "--file-filter=JSON files (*.json) | *.json",
-                   "--filename=jaim_dict.json"])
+                   "--filename=bonolith_dict.json"])
             .output();
 
         match output {
@@ -946,22 +993,22 @@ impl JaimEngine {
                 let dict = match Dictionary::with_default_store() {
                     Ok(d) => d,
                     Err(e) => {
-                        warn!("JaIM: could not open dict store for export: {}", e);
+                        warn!("Bonolith: could not open dict store for export: {}", e);
                         return;
                     }
                 };
                 match dict.export(std::path::Path::new(&path)) {
                     Ok(()) => {
-                        info!("JaIM: Dictionary exported to {}", path);
+                        info!("Bonolith: Dictionary exported to {}", path);
                         let _ = std::process::Command::new("zenity")
-                            .args(["--info", "--title=JaIM",
+                            .args(["--info", "--title=Bonolith",
                                    &format!("--text=辞書をエクスポートしました: {}", path)])
                             .spawn();
                     }
                     Err(e) => {
-                        warn!("JaIM: Export failed: {}", e);
+                        warn!("Bonolith: Export failed: {}", e);
                         let _ = std::process::Command::new("zenity")
-                            .args(["--error", "--title=JaIM",
+                            .args(["--error", "--title=Bonolith",
                                    &format!("--text=エクスポートに失敗しました: {}", e)])
                             .spawn();
                     }
@@ -975,7 +1022,7 @@ impl JaimEngine {
     fn run_dict_import() {
         let output = std::process::Command::new("zenity")
             .args(["--file-selection",
-                   "--title=JaIM: 辞書インポート",
+                   "--title=Bonolith: 辞書インポート",
                    "--file-filter=JSON files (*.json) | *.json"])
             .output();
 
@@ -988,30 +1035,30 @@ impl JaimEngine {
                 let mut dict = match Dictionary::with_default_store() {
                     Ok(d) => d,
                     Err(e) => {
-                        warn!("JaIM: could not open dict store for import: {}", e);
+                        warn!("Bonolith: could not open dict store for import: {}", e);
                         return;
                     }
                 };
                 match dict.import(std::path::Path::new(&path)) {
                     Ok(added) => {
                         if let Err(e) = dict.sync_user_entries_to_store() {
-                            warn!("JaIM: Failed to save after import: {}", e);
+                            warn!("Bonolith: Failed to save after import: {}", e);
                             let _ = std::process::Command::new("zenity")
-                                .args(["--error", "--title=JaIM",
+                                .args(["--error", "--title=Bonolith",
                                        &format!("--text=保存に失敗しました: {}", e)])
                                 .spawn();
                             return;
                         }
-                        info!("JaIM: Imported {} entries from {}", added, path);
+                        info!("Bonolith: Imported {} entries from {}", added, path);
                         let _ = std::process::Command::new("zenity")
-                            .args(["--info", "--title=JaIM",
+                            .args(["--info", "--title=Bonolith",
                                    &format!("--text={}件の単語をインポートしました ({})", added, path)])
                             .spawn();
                     }
                     Err(e) => {
-                        warn!("JaIM: Import failed: {}", e);
+                        warn!("Bonolith: Import failed: {}", e);
                         let _ = std::process::Command::new("zenity")
-                            .args(["--error", "--title=JaIM",
+                            .args(["--error", "--title=Bonolith",
                                    &format!("--text=インポートに失敗しました: {}", e)])
                             .spawn();
                     }
@@ -1022,16 +1069,16 @@ impl JaimEngine {
     }
 
     /// Register a new word to user dictionary via the GTK dialog.
-    /// The dialog runs as /usr/share/jaim/scripts/jaim_word_register.py and
+    /// The dialog runs as /usr/share/bonolith/scripts/bonolith_word_register.py and
     /// re-activates IBus on every entry focus-in, so 単語 stays 日本語ON
     /// even after Tab. Output format: "<reading>|<surface>" on OK.
     fn run_word_register() {
         // No GDK_BACKEND override: the dialog turns the IME on via the
-        // org.jaim.Control session-bus call (engine-side, backend-agnostic),
+        // org.bonolith.Control session-bus call (engine-side, backend-agnostic),
         // so it runs as a native client and works on Wayland and X11 alike.
         let output = std::process::Command::new("/usr/bin/python3")
             .args([
-                "/usr/share/jaim/scripts/jaim_word_register.py",
+                "/usr/share/bonolith/scripts/bonolith_word_register.py",
                 "ibus",
             ])
             .output();
@@ -1047,7 +1094,7 @@ impl JaimEngine {
                 let surface = parts[1].trim();
                 if reading.is_empty() || surface.is_empty() {
                     let _ = std::process::Command::new("zenity")
-                        .args(["--error", "--title=JaIM",
+                        .args(["--error", "--title=Bonolith",
                                "--text=よみと単語の両方を入力してください"])
                         .spawn();
                     return;
@@ -1066,18 +1113,18 @@ impl JaimEngine {
                     let mut dict = shared.dictionary.write().unwrap();
                     dict.add_entry(entry);
                     if let Err(e) = dict.sync_user_entries_to_store() {
-                        warn!("JaIM: Failed to save user dict: {}", e);
+                        warn!("Bonolith: Failed to save user dict: {}", e);
                         let _ = std::process::Command::new("zenity")
-                            .args(["--error", "--title=JaIM",
+                            .args(["--error", "--title=Bonolith",
                                    &format!("--text=保存に失敗しました: {}", e)])
                             .spawn();
                         return;
                     }
                 }
 
-                info!("JaIM: Registered word: {} → {}", reading, surface);
+                info!("Bonolith: Registered word: {} → {}", reading, surface);
                 let _ = std::process::Command::new("zenity")
-                    .args(["--info", "--title=JaIM",
+                    .args(["--info", "--title=Bonolith",
                            &format!("--text=登録しました: {} → {}", reading, surface)])
                     .spawn();
             }
@@ -1090,7 +1137,7 @@ impl JaimEngine {
         let confirmed = std::process::Command::new("zenity")
             .args([
                 "--question",
-                "--title=JaIM 学習履歴クリア",
+                "--title=Bonolith 学習履歴クリア",
                 "--text=変換の学習履歴をすべて消去します。\nこの操作は元に戻せません。よろしいですか？",
                 "--ok-label=クリア",
                 "--cancel-label=キャンセル",
@@ -1109,7 +1156,7 @@ impl JaimEngine {
                 let _ = std::process::Command::new("zenity")
                     .args([
                         "--info",
-                        "--title=JaIM",
+                        "--title=Bonolith",
                         &format!("--text=学習履歴を消去しました（{} 件）。\n次回起動時から反映されます。", n),
                     ])
                     .status();
@@ -1118,7 +1165,7 @@ impl JaimEngine {
                 let _ = std::process::Command::new("zenity")
                     .args([
                         "--error",
-                        "--title=JaIM",
+                        "--title=Bonolith",
                         &format!("--text=エラー: {}", e),
                     ])
                     .status();
@@ -1136,7 +1183,7 @@ impl JaimEngine {
 
         if user_entries.is_empty() {
             let _ = std::process::Command::new("zenity")
-                .args(["--info", "--title=JaIM",
+                .args(["--info", "--title=Bonolith",
                        "--text=ユーザー辞書にエントリがありません"])
                 .spawn();
             return;
@@ -1145,7 +1192,7 @@ impl JaimEngine {
         const MAX_DISPLAY: usize = 500;
         if user_entries.len() > MAX_DISPLAY {
             let _ = std::process::Command::new("zenity")
-                .args(["--warning", "--title=JaIM",
+                .args(["--warning", "--title=Bonolith",
                        &format!("--text=ユーザー辞書のエントリが{}件を超えています ({} 件)。\n先頭 {} 件のみ表示します。\nエクスポートして内容を確認してください。",
                            MAX_DISPLAY, user_entries.len(), MAX_DISPLAY)])
                 .output();
@@ -1155,7 +1202,7 @@ impl JaimEngine {
         let display_entries = &user_entries[..user_entries.len().min(MAX_DISPLAY)];
         let mut args = vec![
             "--list".to_string(),
-            "--title=JaIM: 辞書管理".to_string(),
+            "--title=Bonolith: 辞書管理".to_string(),
             "--text=エントリを選択してOKを押してください".to_string(),
             "--column=#".to_string(),
             "--column=よみ".to_string(),
@@ -1190,7 +1237,7 @@ impl JaimEngine {
         let action = std::process::Command::new("zenity")
             .args([
                 "--list", "--radiolist",
-                "--title=JaIM: 操作を選択",
+                "--title=Bonolith: 操作を選択",
                 &format!("--text=選択中: {} → {}", selected.reading, selected.surface),
                 "--column=選択", "--column=操作",
                 "TRUE", "編集",
@@ -1216,7 +1263,7 @@ impl JaimEngine {
         let entry = &entries[idx];
         let confirm = std::process::Command::new("zenity")
             .args([
-                "--question", "--title=JaIM: 削除の確認",
+                "--question", "--title=Bonolith: 削除の確認",
                 &format!("--text=「{}」→「{}」を削除しますか？", entry.reading, entry.surface),
             ])
             .status();
@@ -1239,7 +1286,7 @@ impl JaimEngine {
 
         let output = std::process::Command::new("/usr/bin/python3")
             .args([
-                "/usr/share/jaim/scripts/jaim_word_register.py",
+                "/usr/share/bonolith/scripts/bonolith_word_register.py",
                 "ibus",
                 "--mode", "edit",
                 "--reading", &old_reading,
@@ -1276,15 +1323,15 @@ impl JaimEngine {
         let mut dict = shared.dictionary.write().unwrap();
         dict.replace_user_entries(entries);
         if let Err(e) = dict.sync_user_entries_to_store() {
-            warn!("JaIM: Failed to save user dict: {}", e);
+            warn!("Bonolith: Failed to save user dict: {}", e);
             let _ = std::process::Command::new("zenity")
-                .args(["--error", "--title=JaIM",
+                .args(["--error", "--title=Bonolith",
                        &format!("--text=保存に失敗しました: {}", e)])
                 .spawn();
             return;
         }
         let _ = std::process::Command::new("zenity")
-            .args(["--info", "--title=JaIM",
+            .args(["--info", "--title=Bonolith",
                    "--text=辞書を更新しました"])
             .spawn();
     }

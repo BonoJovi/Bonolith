@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# JaIM uninstaller.
+# Bonolith uninstaller.
 #
 # Removes installed binaries, Fcitx5/IBus configs, and the systemd
-# user unit. User data at ~/.local/share/jaim/ is preserved by
+# user unit. User data at ~/.local/share/bonolith/ is preserved by
 # default; pass --remove-data to also delete it.
 
 set -euo pipefail
@@ -11,12 +11,12 @@ usage() {
     cat <<EOF
 Usage: $(basename "$0") [--remove-data] [--help]
 
-Removes JaIM from the system. By default user data at
-~/.local/share/jaim/ (dictionary, scores, models) is preserved so a
+Removes Bonolith from the system. By default user data at
+~/.local/share/bonolith/ (dictionary, scores, models) is preserved so a
 later reinstall picks up the same words and learning history.
 
 Options:
-  --remove-data   Also delete ~/.local/share/jaim/ (dict + scores + models)
+  --remove-data   Also delete ~/.local/share/bonolith/ (dict + scores + models)
   --help          Show this help
 EOF
 }
@@ -30,15 +30,15 @@ for arg in "$@"; do
     esac
 done
 
-echo "JaIM uninstaller"
+echo "Bonolith uninstaller"
 echo "================"
 
 # 1. Stop services (best-effort). TERM first so fcitx5 has a chance
 # to flush its addon cache cleanly; escalate to KILL only if needed.
 # Match by exact basename so pkill doesn't kill itself via -f.
 echo "[1/5] Stopping services..."
-systemctl --user stop jaim-llm-server.service >/dev/null 2>&1 || true
-systemctl --user disable jaim-llm-server.service >/dev/null 2>&1 || true
+systemctl --user stop bonolith-llm-server.service >/dev/null 2>&1 || true
+systemctl --user disable bonolith-llm-server.service >/dev/null 2>&1 || true
 sudo pkill -TERM -x ibus-daemon >/dev/null 2>&1 || true
 pkill -TERM -x fcitx5 >/dev/null 2>&1 || true
 sleep 2
@@ -48,18 +48,18 @@ pkill -KILL -x fcitx5 >/dev/null 2>&1 || true
 # 2. Remove system files
 echo "[2/5] Removing system files (sudo required)..."
 sudo rm -f \
-    /usr/bin/ibus-engine-jaim \
-    /usr/share/ibus/component/jaim.xml \
-    /usr/lib/x86_64-linux-gnu/libjaim.so \
-    /usr/lib/x86_64-linux-gnu/fcitx5/fcitx5-jaim.so \
-    /usr/share/fcitx5/addon/jaim.conf \
-    /usr/share/fcitx5/inputmethod/jaim.conf \
-    /usr/share/jaim/scripts/jaim_word_register.py
-sudo rmdir /usr/share/jaim/scripts /usr/share/jaim 2>/dev/null || true
+    /usr/bin/ibus-engine-bonolith \
+    /usr/share/ibus/component/bonolith.xml \
+    /usr/lib/x86_64-linux-gnu/libbonolith.so \
+    /usr/lib/x86_64-linux-gnu/fcitx5/fcitx5-bonolith.so \
+    /usr/share/fcitx5/addon/bonolith.conf \
+    /usr/share/fcitx5/inputmethod/bonolith.conf \
+    /usr/share/bonolith/scripts/bonolith_word_register.py
+sudo rmdir /usr/share/bonolith/scripts /usr/share/bonolith 2>/dev/null || true
 
 # 3. Remove user-level systemd unit
 echo "[3/5] Removing user systemd unit..."
-rm -f ~/.config/systemd/user/jaim-llm-server.service
+rm -f ~/.config/systemd/user/bonolith-llm-server.service
 systemctl --user daemon-reload >/dev/null 2>&1 || true
 
 # 4. Remove ggml backend symlinks created by ExecStartPre.
@@ -82,13 +82,13 @@ echo "  removed $removed symlinks"
 # 5. User data
 echo "[5/5] User data..."
 if [ "$REMOVE_DATA" -eq 1 ]; then
-    if [ -d "$HOME/.local/share/jaim" ]; then
-        rm -rf "$HOME/.local/share/jaim"
-        echo "  removed $HOME/.local/share/jaim/"
+    if [ -d "$HOME/.local/share/bonolith" ]; then
+        rm -rf "$HOME/.local/share/bonolith"
+        echo "  removed $HOME/.local/share/bonolith/"
     fi
 else
-    if [ -d "$HOME/.local/share/jaim" ]; then
-        echo "  preserved $HOME/.local/share/jaim/"
+    if [ -d "$HOME/.local/share/bonolith" ]; then
+        echo "  preserved $HOME/.local/share/bonolith/"
         echo "  (run with --remove-data to also delete dict, scores, models)"
     fi
 fi

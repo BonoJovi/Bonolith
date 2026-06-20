@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# JaIM installer.
+# Bonolith installer.
 #
 # Copies built artifacts to system paths and installs the systemd
 # user unit. Build prerequisites first:
@@ -12,7 +12,7 @@ usage() {
     cat <<EOF
 Usage: $(basename "$0") [--no-llm] [--help]
 
-Installs JaIM. Run from the repository root after building both
+Installs Bonolith. Run from the repository root after building both
 the Rust crate and the Fcitx5 addon:
 
   cargo build --release
@@ -21,16 +21,18 @@ the Rust crate and the Fcitx5 addon:
   cd ../..
   ./scripts/install.sh
 
-User data at ~/.local/share/jaim/ is left untouched. If a v1.x
-user_dict.json or user_scores.json is found there, the JaIM engine
-will migrate it into dict.sqlite on first start (renaming the
-originals to *.migrated).
+User data at ~/.local/share/bonolith/ is left untouched. On the first
+install after the JaIM->Bonolith rebrand, learned data found under the
+old ~/.local/share/jaim/ (dict.sqlite + models) is copied across once
+(the originals are left in place). If a v1.x user_dict.json or
+user_scores.json is present, the Bonolith engine migrates it into
+dict.sqlite on first start (renaming the originals to *.migrated).
 
 Options:
-  --no-llm  Don't enable jaim-llm-server.service. JaIM still works
+  --no-llm  Don't enable bonolith-llm-server.service. Bonolith still works
             (it falls back to the dictionary-only ranker), but no
             local LLM is started. Useful for older PCs. You can
-            turn it on later with `jaim llm on`.
+            turn it on later with `bonolith llm on`.
   --help    Show this help.
 EOF
 }
@@ -58,29 +60,29 @@ check() {
         missing=1
     fi
 }
-check target/release/jaim                  "run 'cargo build --release'"
-check target/release/libjaim.so            "run 'cargo build --release'"
-check fcitx5/build/fcitx5-jaim.so          "build fcitx5 addon: cd fcitx5/build && cmake .. && make"
-check data/jaim.xml                        "missing source file"
-check fcitx5/jaim-addon.conf               "missing source file"
-check fcitx5/jaim-im.conf                  "missing source file"
-check scripts/jaim-llm-server.service      "missing source file"
+check target/release/bonolith                  "run 'cargo build --release'"
+check target/release/libbonolith.so            "run 'cargo build --release'"
+check fcitx5/build/fcitx5-bonolith.so          "build fcitx5 addon: cd fcitx5/build && cmake .. && make"
+check data/bonolith.xml                        "missing source file"
+check fcitx5/bonolith-addon.conf               "missing source file"
+check fcitx5/bonolith-im.conf                  "missing source file"
+check scripts/bonolith-llm-server.service      "missing source file"
 if [ "$missing" -eq 1 ]; then
     echo "" >&2
     echo "Install aborted — see missing artifacts above." >&2
     exit 1
 fi
 
-echo "JaIM installer"
+echo "Bonolith installer"
 echo "=============="
 
-# 1. Stop any currently running JaIM bits so we can replace files
+# 1. Stop any currently running Bonolith bits so we can replace files
 # cleanly. TERM first to give fcitx5/ibus a chance to save state
 # (Fcitx5 will SIGSEGV in AddonManager::saveAll if killed mid-init);
 # escalate to KILL only if they linger. Match by exact basename so
 # pkill doesn't grep its own argv and kill itself.
 #
-# ibus-engine-jaim is killed via -f against its installed path
+# ibus-engine-bonolith is killed via -f against its installed path
 # rather than -x against the basename: the kernel truncates
 # /proc/<pid>/comm to TASK_COMM_LEN (15 chars), so pkill -x sees
 # "ibus-engine-jai" (no trailing m) and never matches the 16-char
@@ -90,35 +92,71 @@ echo "=============="
 # children, but they can outlive a daemon TERM and keep running
 # the previous binary).
 echo "[1/4] Stopping services..."
-systemctl --user stop jaim-llm-server.service >/dev/null 2>&1 || true
+systemctl --user stop bonolith-llm-server.service >/dev/null 2>&1 || true
 sudo pkill -TERM -x ibus-daemon >/dev/null 2>&1 || true
+pkill -TERM -f /usr/bin/ibus-engine-bonolith >/dev/null 2>&1 || true
+# Also stop the legacy pre-rebrand engine if it's still running, so its
+# SQLite handle on ~/.local/share/jaim/ is released before the one-time
+# data migration below snapshots it.
 pkill -TERM -f /usr/bin/ibus-engine-jaim >/dev/null 2>&1 || true
 pkill -TERM -x fcitx5 >/dev/null 2>&1 || true
 sleep 2
 sudo pkill -KILL -x ibus-daemon >/dev/null 2>&1 || true
+pkill -KILL -f /usr/bin/ibus-engine-bonolith >/dev/null 2>&1 || true
 pkill -KILL -f /usr/bin/ibus-engine-jaim >/dev/null 2>&1 || true
 pkill -KILL -x fcitx5 >/dev/null 2>&1 || true
+
+# 1b. One-time migration from the old JaIM data directory. Pre-rebrand
+# installs kept the learned dictionary, user scores and GGUF models under
+# ~/.local/share/jaim/; Bonolith reads ~/.local/share/bonolith/. Carry the
+# data across once so existing users don't lose their learning. Guarded by
+# a marker file so reinstalls never clobber freshly learned Bonolith data
+# with the stale JaIM snapshot.
+OLD_DATA="$HOME/.local/share/jaim"
+NEW_DATA="$HOME/.local/share/bonolith"
+if [ -f "$OLD_DATA/dict.sqlite" ] && [ ! -f "$NEW_DATA/.migrated-from-jaim" ]; then
+    echo "[1b] Migrating learned data from ~/.local/share/jaim/ ..."
+    mkdir -p "$NEW_DATA"
+    # Drop any placeholder/empty db so the snapshot lands cleanly.
+    rm -f "$NEW_DATA/dict.sqlite" "$NEW_DATA/dict.sqlite-wal" "$NEW_DATA/dict.sqlite-shm"
+    if command -v sqlite3 >/dev/null 2>&1; then
+        # VACUUM INTO yields a consistent standalone copy that folds in any
+        # WAL contents — safe even if a stale -wal/-shm is present.
+        sqlite3 "$OLD_DATA/dict.sqlite" "VACUUM INTO '$NEW_DATA/dict.sqlite'"
+    else
+        # Fallback: copy the db with its WAL/SHM so SQLite recovers on open.
+        cp -f "$OLD_DATA/dict.sqlite" "$NEW_DATA/dict.sqlite"
+        [ -f "$OLD_DATA/dict.sqlite-wal" ] && cp -f "$OLD_DATA/dict.sqlite-wal" "$NEW_DATA/dict.sqlite-wal"
+        [ -f "$OLD_DATA/dict.sqlite-shm" ] && cp -f "$OLD_DATA/dict.sqlite-shm" "$NEW_DATA/dict.sqlite-shm"
+    fi
+    # Reuse the (large) downloaded GGUF models rather than re-fetching.
+    if [ -d "$OLD_DATA/models" ] && [ ! -d "$NEW_DATA/models" ]; then
+        cp -r "$OLD_DATA/models" "$NEW_DATA/models"
+    fi
+    touch "$NEW_DATA/.migrated-from-jaim"
+    echo "      done (original ~/.local/share/jaim/ left untouched)."
+fi
 
 # 2. System paths (sudo). Use `install -D` so missing parent dirs
 # (e.g., /usr/share/fcitx5/inputmethod when Fcitx5 isn't yet
 # bootstrapped) are created automatically.
 echo "[2/4] Installing system files (sudo required)..."
-sudo install -D -m 755 target/release/jaim         /usr/bin/ibus-engine-jaim
-# `jaim` is the user-facing CLI name (jaim llm on/off/status, jaim
-# export/import). IBus invokes the same binary as ibus-engine-jaim.
-sudo ln -sf ibus-engine-jaim                       /usr/bin/jaim
-sudo install -D -m 644 data/jaim.xml               /usr/share/ibus/component/jaim.xml
-sudo install -D -m 755 target/release/libjaim.so   /usr/lib/x86_64-linux-gnu/libjaim.so
-sudo install -D -m 755 fcitx5/build/fcitx5-jaim.so /usr/lib/x86_64-linux-gnu/fcitx5/fcitx5-jaim.so
-sudo install -D -m 644 fcitx5/jaim-addon.conf      /usr/share/fcitx5/addon/jaim.conf
-sudo install -D -m 644 fcitx5/jaim-im.conf         /usr/share/fcitx5/inputmethod/jaim.conf
-sudo install -D -m 755 scripts/jaim_word_register.py /usr/share/jaim/scripts/jaim_word_register.py
+sudo install -D -m 755 target/release/bonolith         /usr/bin/ibus-engine-bonolith
+# `bonolith` is the user-facing CLI name (bonolith llm on/off/status, bonolith
+# export/import). IBus invokes the same binary as ibus-engine-bonolith.
+sudo ln -sf ibus-engine-bonolith                       /usr/bin/bonolith
+sudo install -D -m 644 data/bonolith.xml               /usr/share/ibus/component/bonolith.xml
+sudo install -D -m 755 target/release/libbonolith.so   /usr/lib/x86_64-linux-gnu/libbonolith.so
+sudo install -D -m 755 fcitx5/build/fcitx5-bonolith.so /usr/lib/x86_64-linux-gnu/fcitx5/fcitx5-bonolith.so
+sudo install -D -m 644 fcitx5/bonolith-addon.conf      /usr/share/fcitx5/addon/bonolith.conf
+sudo install -D -m 644 fcitx5/bonolith-im.conf         /usr/share/fcitx5/inputmethod/bonolith.conf
+sudo install -D -m 755 scripts/bonolith_word_register.py /usr/share/bonolith/scripts/bonolith_word_register.py
 
 # 3. User-level systemd unit. The unit's ExecStartPre handles the
 # llama.cpp ggml-backend symlink dance.
 echo "[3/4] Installing user systemd unit..."
 mkdir -p "$HOME/.config/systemd/user"
-install -m 644 scripts/jaim-llm-server.service "$HOME/.config/systemd/user/jaim-llm-server.service"
+install -m 644 scripts/bonolith-llm-server.service "$HOME/.config/systemd/user/bonolith-llm-server.service"
 
 # 4. Bring services back up. Start fcitx5 only if it was registered
 # as the user's IM in the past (i.e., a profile exists) — otherwise
@@ -128,11 +166,11 @@ systemctl --user daemon-reload >/dev/null 2>&1 || true
 if [ "$NO_LLM" -eq 1 ]; then
     # Make sure any pre-existing enable/start is undone, otherwise
     # --no-llm wouldn't actually keep the LLM off after a reinstall.
-    systemctl --user stop jaim-llm-server.service >/dev/null 2>&1 || true
-    systemctl --user disable jaim-llm-server.service >/dev/null 2>&1 || true
-    echo "  (LLM disabled per --no-llm; turn it on later with \`jaim llm on\`)"
+    systemctl --user stop bonolith-llm-server.service >/dev/null 2>&1 || true
+    systemctl --user disable bonolith-llm-server.service >/dev/null 2>&1 || true
+    echo "  (LLM disabled per --no-llm; turn it on later with \`bonolith llm on\`)"
 else
-    systemctl --user enable --now jaim-llm-server.service >/dev/null 2>&1 || true
+    systemctl --user enable --now bonolith-llm-server.service >/dev/null 2>&1 || true
 fi
 
 # Detach from the script's controlling TTY so the daemons don't
@@ -154,21 +192,21 @@ fi
 echo "Install complete."
 echo ""
 echo "Verify:"
-echo "  jaim llm status                              # LLM service active/enabled"
-echo "  jaim export /tmp/jaim-test.json              # should report user entries"
+echo "  bonolith llm status                              # LLM service active/enabled"
+echo "  bonolith export /tmp/bonolith-test.json              # should report user entries"
 
-# Warn if `jaim` on PATH resolves to something other than the symlink
-# we just installed. A stale ~/.local/bin/jaim (or /usr/local/bin/jaim)
-# from a previous build silently shadows /usr/bin/jaim and produces
+# Warn if `bonolith` on PATH resolves to something other than the symlink
+# we just installed. A stale ~/.local/bin/bonolith (or /usr/local/bin/bonolith)
+# from a previous build silently shadows /usr/bin/bonolith and produces
 # confusing "unknown command 'llm'" errors after upgrades.
-if resolved="$(command -v jaim 2>/dev/null)"; then
-    if [ "$resolved" != "/usr/bin/jaim" ]; then
+if resolved="$(command -v bonolith 2>/dev/null)"; then
+    if [ "$resolved" != "/usr/bin/bonolith" ]; then
         echo ""
-        echo "Warning: 'jaim' on your PATH resolves to:"
+        echo "Warning: 'bonolith' on your PATH resolves to:"
         echo "    $resolved"
-        echo "  not /usr/bin/jaim. The shadowing copy is likely an older"
+        echo "  not /usr/bin/bonolith. The shadowing copy is likely an older"
         echo "  build and will not have the latest subcommands. Remove it"
-        echo "  (e.g. \`rm $resolved\`) so \`jaim llm on\` runs the freshly"
+        echo "  (e.g. \`rm $resolved\`) so \`bonolith llm on\` runs the freshly"
         echo "  installed binary."
     fi
 fi

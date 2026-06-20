@@ -2,7 +2,7 @@ mod ibus;
 
 use log::info;
 
-use jaim::core::dictionary::Dictionary;
+use bonolith::core::dictionary::Dictionary;
 use std::path::PathBuf;
 
 fn init_logging() {
@@ -15,9 +15,9 @@ fn init_logging() {
     //         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     //         PathBuf::from(home).join(".cache")
     //     })
-    //     .join("jaim");
+    //     .join("bonolith");
     // let _ = fs::create_dir_all(&log_dir);
-    // let log_path = log_dir.join("jaim.log");
+    // let log_path = log_dir.join("bonolith.log");
     // let file = fs::OpenOptions::new()
     //     .create(true)
     //     .append(true)
@@ -35,7 +35,7 @@ fn init_logging() {
 }
 
 /// Remove inherited env vars that point at namespaced (snap/flatpak)
-/// resources. When jaim is launched from a snap-packaged terminal
+/// resources. When bonolith is launched from a snap-packaged terminal
 /// (e.g. ghostty), `GDK_PIXBUF_MODULE_FILE` points into the snap's
 /// private gdk-pixbuf cache; any GTK subprocess (zenity, the GTK
 /// register dialog, etc.) then tries to dlopen the snap's loaders,
@@ -55,13 +55,13 @@ fn sanitize_inherited_env() {
 }
 
 fn print_usage() {
-    eprintln!("Usage: jaim [COMMAND]");
+    eprintln!("Usage: bonolith [COMMAND]");
     eprintln!();
     eprintln!("Commands:");
     eprintln!("  (none)              Start the IBus engine");
     eprintln!("  export <file>       Export dictionary to a JSON file");
     eprintln!("  import <file>       Import dictionary from a JSON file");
-    eprintln!("  llm <on|off|status> Toggle the local LLM server (jaim-llm-server)");
+    eprintln!("  llm <on|off|status> Toggle the local LLM server (bonolith-llm-server)");
     eprintln!("  help                Show this help message");
 }
 
@@ -73,11 +73,11 @@ fn llm_systemctl(args: &[&str]) -> std::io::Result<std::process::ExitStatus> {
 }
 
 fn llm_on() {
-    match llm_systemctl(&["enable", "--now", "jaim-llm-server.service"]) {
+    match llm_systemctl(&["enable", "--now", "bonolith-llm-server.service"]) {
         Ok(s) if s.success() => {
             println!(
-                "LLM enabled. jaim-llm-server.service started and will start on login.\n\
-                 If you ran `jaim llm off` earlier in this session (or the\n\
+                "LLM enabled. bonolith-llm-server.service started and will start on login.\n\
+                 If you ran `bonolith llm off` earlier in this session (or the\n\
                  server crashed), the running IM has stopped sending scoring\n\
                  requests. Restart it with `ibus-daemon -drx` so the engine\n\
                  reconnects."
@@ -95,11 +95,11 @@ fn llm_on() {
 }
 
 fn llm_off() {
-    let _ = llm_systemctl(&["stop", "jaim-llm-server.service"]);
-    match llm_systemctl(&["disable", "jaim-llm-server.service"]) {
+    let _ = llm_systemctl(&["stop", "bonolith-llm-server.service"]);
+    match llm_systemctl(&["disable", "bonolith-llm-server.service"]) {
         Ok(_) => {
             println!(
-                "LLM disabled. jaim-llm-server.service stopped.\n\
+                "LLM disabled. bonolith-llm-server.service stopped.\n\
                  The running IM detects the missing server on the next\n\
                  keystroke and falls back to the dictionary-only ranker —\n\
                  no IM restart needed."
@@ -116,7 +116,7 @@ fn llm_status() {
     use std::process::Command;
     let read = |action: &str| -> String {
         Command::new("systemctl")
-            .args(["--user", action, "jaim-llm-server.service"])
+            .args(["--user", action, "bonolith-llm-server.service"])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_else(|_| "unknown".to_string())
@@ -139,7 +139,7 @@ async fn main() {
                 Some(p) => PathBuf::from(p),
                 None => {
                     eprintln!("Error: export requires a file path");
-                    eprintln!("Usage: jaim export <file>");
+                    eprintln!("Usage: bonolith export <file>");
                     std::process::exit(1);
                 }
             };
@@ -176,7 +176,7 @@ async fn main() {
                 Some(p) => PathBuf::from(p),
                 None => {
                     eprintln!("Error: import requires a file path");
-                    eprintln!("Usage: jaim import <file>");
+                    eprintln!("Usage: bonolith import <file>");
                     std::process::exit(1);
                 }
             };
@@ -216,7 +216,7 @@ async fn main() {
                 Some("status") | None => llm_status(),
                 Some(other) => {
                     eprintln!("Error: unknown llm subcommand '{}'", other);
-                    eprintln!("Usage: jaim llm <on|off|status>");
+                    eprintln!("Usage: bonolith llm <on|off|status>");
                     std::process::exit(1);
                 }
             }
@@ -230,20 +230,20 @@ async fn main() {
             std::process::exit(1);
         }
         None => {
-            info!("JaIM - Japanese AI-powered Input Method");
-            info!("Starting JaIM engine...");
+            info!("Bonolith - Japanese AI-powered Input Method");
+            info!("Starting Bonolith engine...");
 
             match ibus::start_ibus_service().await {
                 Ok((connection, _control)) => {
-                    info!("JaIM: IBus service started successfully");
-                    // `_control` (session-bus org.jaim.Control) is held for the
+                    info!("Bonolith: IBus service started successfully");
+                    // `_control` (session-bus org.bonolith.Control) is held for the
                     // loop's lifetime so its bus name stays claimed.
                     loop {
                         connection.monitor_activity().await;
                     }
                 }
                 Err(e) => {
-                    eprintln!("JaIM: Failed to start IBus service: {}", e);
+                    eprintln!("Bonolith: Failed to start IBus service: {}", e);
                     std::process::exit(1);
                 }
             }

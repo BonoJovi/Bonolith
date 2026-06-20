@@ -1,6 +1,6 @@
-# JaIM 誤変換ケースデータセット
+# Bonolith 誤変換ケースデータセット
 
-JaIMの変換品質を体系的に評価・改善するためのケース集。
+Bonolithの変換品質を体系的に評価・改善するためのケース集。
 品詞ベース文脈解析(IPADIC接続コスト導入)の効果を測る評価セットとして
 v2.x 開発で使用する。
 
@@ -21,14 +21,14 @@ v2.x 開発で使用する。
 | `input_romaji` | string | | 入力ローマ字 (任意) |
 | `expected` | string[] | ✅ | 正解の文節区切り + 表記 |
 | `expected_readings` | string[] | ✅ | `expected` と1:1対応する文節ひらがな読み。連結すると `input_hiragana` と一致。refinement check で文節境界を導出 |
-| `actual` | string[] | | JaIMの現状出力 (未計測なら省略可) |
+| `actual` | string[] | | Bonolithの現状出力 (未計測なら省略可) |
 | `category` | enum | ✅ | `segmentation` / `word_choice` / `inflection` / `both` |
 | `subcategory` | string | | 自由記述 (例: `homophone_misselection`) |
 | `pos_solvable` | enum | ✅ | `yes` / `partial` / `no` |
 | `pos_hypothesis` | string | | 品詞でどう解けるか/解けないかの仮説 |
 | `notes` | string | | 補足説明 |
 | `date_collected` | string | ✅ | `YYYY-MM-DD` |
-| `jaim_version` | string | | 計測時のバージョン |
+| `bonolith_version` | string | | 計測時のバージョン |
 | `source` | enum | | `generated` / `user_reported` / `captured` |
 
 ## カテゴリ定義
@@ -57,8 +57,8 @@ v2.x 開発で使用する。
 
 ### 3. ランタイムキャプチャ
 
-`JAIM_LOG_CONVERSIONS=1` 環境変数で JaIM を起動すると、
-`~/.local/share/jaim/conversions.jsonl` に commit 時の変換を記録する。
+`BONOLITH_LOG_CONVERSIONS=1` 環境変数で Bonolith を起動すると、
+`~/.local/share/bonolith/conversions.jsonl` に commit 時の変換を記録する。
 後で `scripts/curate_cases.sh` で対話的に評価用ケースへ昇格させる。
 
 **プライバシー注意**: ランタイムキャプチャは確定したテキストを生で記録する。

@@ -5,7 +5,7 @@
 /.claude/settings.local.json
 
 # Stray runtime database (created when running from the repo root)
-/data/jaim.db
+/data/bonolith.db
 
 # Python bytecode cache from helper scripts
 scripts/__pycache__/

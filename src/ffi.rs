@@ -1,7 +1,7 @@
-//! C FFI layer for JaIM engine.
+//! C FFI layer for Bonolith engine.
 //!
 //! Provides a C-compatible API so that Fcitx5 (or other C/C++ frameworks)
-//! can use JaIM's conversion engine without Rust-specific dependencies.
+//! can use Bonolith's conversion engine without Rust-specific dependencies.
 //!
 //! The FFI handles all key dispatch logic (Space→convert, Enter→commit, etc.)
 //! so the C++ side only needs to forward key events and read back UI state.
@@ -15,6 +15,7 @@ use crate::engine::{ConversionEngine, SharedCore};
 
 // X11 keysym values (shared by IBus and Fcitx5)
 const KEY_SPACE: u32 = 0x0020;
+const KEY_TAB: u32 = 0xFF09;
 const KEY_RETURN: u32 = 0xFF0D;
 const KEY_ESCAPE: u32 = 0xFF1B;
 const KEY_BACKSPACE: u32 = 0xFF08;
@@ -42,17 +43,17 @@ const MAX_CANDIDATES: usize = 64;
 
 /// Segment info for batch UI state.
 #[repr(C)]
-pub struct JaimSegmentInfo {
+pub struct BonolithSegmentInfo {
     /// Character start position in composed text.
     pub start_chars: i32,
     /// Character length in composed text.
     pub char_len: i32,
 }
 
-/// Batch UI state returned by jaim_get_ui_state().
-/// All string pointers are valid until the next call to jaim_handle_key() or jaim_get_ui_state().
+/// Batch UI state returned by bonolith_get_ui_state().
+/// All string pointers are valid until the next call to bonolith_handle_key() or bonolith_get_ui_state().
 #[repr(C)]
-pub struct JaimUiState {
+pub struct BonolithUiState {
     /// Committed text (null if none).
     pub committed: *const c_char,
     /// Whether the engine is in conversion mode.
@@ -67,7 +68,7 @@ pub struct JaimUiState {
     /// Focused segment index.
     pub focus_index: i32,
     /// Segment info array (up to MAX_SEGMENTS).
-    pub segments: [JaimSegmentInfo; MAX_SEGMENTS],
+    pub segments: [BonolithSegmentInfo; MAX_SEGMENTS],
     /// Number of candidates for the focused segment.
     pub candidate_count: i32,
     /// Selected candidate index.
@@ -76,8 +77,8 @@ pub struct JaimUiState {
     pub candidates: [*const c_char; MAX_CANDIDATES],
 }
 
-/// Opaque handle to the JaIM engine context.
-pub struct JaimContext {
+/// Opaque handle to the Bonolith engine context.
+pub struct BonolithContext {
     engine: ConversionEngine,
     converting: bool,
     /// Pending committed text, polled by the framework after handle_key.
@@ -145,8 +146,8 @@ fn is_printable_ascii(keyval: u32) -> bool {
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jaim_context_new() -> *mut JaimContext {
-    let ctx = Box::new(JaimContext {
+pub unsafe extern "C" fn bonolith_context_new() -> *mut BonolithContext {
+    let ctx = Box::new(BonolithContext {
         engine: ConversionEngine::new(),
         converting: false,
         pending_commit: None,
@@ -160,7 +161,7 @@ pub unsafe extern "C" fn jaim_context_new() -> *mut JaimContext {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jaim_context_free(ctx: *mut JaimContext) {
+pub unsafe extern "C" fn bonolith_context_free(ctx: *mut BonolithContext) {
     if !ctx.is_null() {
         unsafe { drop(Box::from_raw(ctx)) }
     }
@@ -170,11 +171,11 @@ pub unsafe extern "C" fn jaim_context_free(ctx: *mut JaimContext) {
 
 /// Process a key event. Returns true if the key was consumed.
 ///
-/// After calling this, use jaim_poll_commit() to check for committed text,
-/// and jaim_get_preedit() / jaim_is_converting() / jaim_*() for UI state.
+/// After calling this, use bonolith_poll_commit() to check for committed text,
+/// and bonolith_get_preedit() / bonolith_is_converting() / bonolith_*() for UI state.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jaim_handle_key(
-    ctx: *mut JaimContext,
+pub unsafe extern "C" fn bonolith_handle_key(
+    ctx: *mut BonolithContext,
     keyval: u32,
     state: u32,
 ) -> bool {
@@ -201,6 +202,30 @@ pub unsafe extern "C" fn jaim_handle_key(
     }
 
     let has_shift = state & SHIFT_MASK != 0;
+
+    // Tab while a preedit/conversion is active → commit current text and
+    // consume the key (return true). Focus does NOT move: this matches the
+    // standard Japanese IME convention (Mozc / Google IME / ATOK), where Tab
+    // during composition is an IME key, not a focus-navigation key. When
+    // nothing is composing we return false so Tab works normally. Both engines
+    // consume Tab here, so IBus and Fcitx5 stay consistent instead of diverging
+    // on framework preedit defaults.
+    if keyval == KEY_TAB {
+        if ctx.converting {
+            if let Some(text) = ctx.engine.commit_conversion() {
+                ctx.pending_commit = Some(text);
+            }
+            ctx.converting = false;
+            return true;
+        }
+        let preedit = ctx.engine.preedit();
+        if !preedit.is_empty() {
+            ctx.engine.commit(&preedit);
+            ctx.pending_commit = Some(preedit);
+            return true;
+        }
+        return false;
+    }
 
     // F6 → hiragana
     if keyval == KEY_F6 {
@@ -297,7 +322,7 @@ pub unsafe extern "C" fn jaim_handle_key(
 }
 
 /// Handle keys during conversion mode. Returns true if consumed.
-fn handle_conversion_key(ctx: &mut JaimContext, keyval: u32, has_shift: bool) -> bool {
+fn handle_conversion_key(ctx: &mut BonolithContext, keyval: u32, has_shift: bool) -> bool {
     match keyval {
         KEY_SPACE | KEY_DOWN => {
             ctx.engine.cycle_candidate(1);
@@ -358,9 +383,9 @@ fn handle_conversion_key(ctx: &mut JaimContext, keyval: u32, has_shift: bool) ->
 // ── State queries ────────────────────────────────────────────────────────────
 
 /// Get the current preedit string. Returns empty string if no preedit.
-/// The returned pointer is valid until the next call to any jaim_* function.
+/// The returned pointer is valid until the next call to any bonolith_* function.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jaim_get_preedit(ctx: *mut JaimContext) -> *const c_char {
+pub unsafe extern "C" fn bonolith_get_preedit(ctx: *mut BonolithContext) -> *const c_char {
     let ctx = unsafe { &mut *ctx };
     let preedit = ctx.engine.preedit();
     ctx.cache_preedit = CString::new(preedit).unwrap_or_default();
@@ -369,9 +394,9 @@ pub unsafe extern "C" fn jaim_get_preedit(ctx: *mut JaimContext) -> *const c_cha
 
 /// Poll for committed text. Returns null if nothing to commit.
 /// Clears the pending commit after returning.
-/// The returned pointer is valid until the next call to any jaim_* function.
+/// The returned pointer is valid until the next call to any bonolith_* function.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jaim_poll_commit(ctx: *mut JaimContext) -> *const c_char {
+pub unsafe extern "C" fn bonolith_poll_commit(ctx: *mut BonolithContext) -> *const c_char {
     let ctx = unsafe { &mut *ctx };
     match ctx.pending_commit.take() {
         Some(text) => {
@@ -384,22 +409,22 @@ pub unsafe extern "C" fn jaim_poll_commit(ctx: *mut JaimContext) -> *const c_cha
 
 /// Returns true if the engine is in conversion mode.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jaim_is_converting(ctx: *mut JaimContext) -> bool {
+pub unsafe extern "C" fn bonolith_is_converting(ctx: *mut BonolithContext) -> bool {
     let ctx = unsafe { &*ctx };
     ctx.converting
 }
 
 /// Returns true if there is preedit text.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jaim_has_preedit(ctx: *mut JaimContext) -> bool {
+pub unsafe extern "C" fn bonolith_has_preedit(ctx: *mut BonolithContext) -> bool {
     let ctx = unsafe { &*ctx };
     !ctx.engine.preedit().is_empty()
 }
 
 /// Get the composed text during conversion mode.
-/// The returned pointer is valid until the next call to any jaim_* function.
+/// The returned pointer is valid until the next call to any bonolith_* function.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jaim_composed_text(ctx: *mut JaimContext) -> *const c_char {
+pub unsafe extern "C" fn bonolith_composed_text(ctx: *mut BonolithContext) -> *const c_char {
     let ctx = unsafe { &mut *ctx };
     let text = ctx.engine.conversion_state()
         .map(|s| s.composed_text())
@@ -410,7 +435,7 @@ pub unsafe extern "C" fn jaim_composed_text(ctx: *mut JaimContext) -> *const c_c
 
 /// Get the number of segments in the current conversion.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jaim_segment_count(ctx: *mut JaimContext) -> i32 {
+pub unsafe extern "C" fn bonolith_segment_count(ctx: *mut BonolithContext) -> i32 {
     let ctx = unsafe { &*ctx };
     ctx.engine.conversion_state()
         .map(|s| s.segments.len() as i32)
@@ -419,7 +444,7 @@ pub unsafe extern "C" fn jaim_segment_count(ctx: *mut JaimContext) -> i32 {
 
 /// Get the currently focused segment index.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jaim_focus_index(ctx: *mut JaimContext) -> i32 {
+pub unsafe extern "C" fn bonolith_focus_index(ctx: *mut BonolithContext) -> i32 {
     let ctx = unsafe { &*ctx };
     ctx.engine.conversion_state()
         .map(|s| s.focus as i32)
@@ -428,7 +453,7 @@ pub unsafe extern "C" fn jaim_focus_index(ctx: *mut JaimContext) -> i32 {
 
 /// Get the character start position of a segment in the composed text.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jaim_segment_start_chars(ctx: *mut JaimContext, seg: i32) -> i32 {
+pub unsafe extern "C" fn bonolith_segment_start_chars(ctx: *mut BonolithContext, seg: i32) -> i32 {
     let ctx = unsafe { &*ctx };
     ctx.engine.conversion_state()
         .and_then(|s| {
@@ -440,7 +465,7 @@ pub unsafe extern "C" fn jaim_segment_start_chars(ctx: *mut JaimContext, seg: i3
 
 /// Get the character length of a segment in the composed text.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jaim_segment_char_len(ctx: *mut JaimContext, seg: i32) -> i32 {
+pub unsafe extern "C" fn bonolith_segment_char_len(ctx: *mut BonolithContext, seg: i32) -> i32 {
     let ctx = unsafe { &*ctx };
     ctx.engine.conversion_state()
         .and_then(|s| {
@@ -452,7 +477,7 @@ pub unsafe extern "C" fn jaim_segment_char_len(ctx: *mut JaimContext, seg: i32) 
 
 /// Get the number of candidates for the focused segment.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jaim_candidate_count(ctx: *mut JaimContext) -> i32 {
+pub unsafe extern "C" fn bonolith_candidate_count(ctx: *mut BonolithContext) -> i32 {
     let ctx = unsafe { &*ctx };
     ctx.engine.conversion_state()
         .map(|s| s.segments[s.focus].candidates.len() as i32)
@@ -460,9 +485,9 @@ pub unsafe extern "C" fn jaim_candidate_count(ctx: *mut JaimContext) -> i32 {
 }
 
 /// Get a candidate text by index (for the focused segment).
-/// The returned pointer is valid until the next call to any jaim_* function.
+/// The returned pointer is valid until the next call to any bonolith_* function.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jaim_candidate_text(ctx: *mut JaimContext, index: i32) -> *const c_char {
+pub unsafe extern "C" fn bonolith_candidate_text(ctx: *mut BonolithContext, index: i32) -> *const c_char {
     let ctx = unsafe { &mut *ctx };
     let text = ctx.engine.conversion_state()
         .and_then(|s| {
@@ -476,7 +501,7 @@ pub unsafe extern "C" fn jaim_candidate_text(ctx: *mut JaimContext, index: i32) 
 
 /// Get the selected candidate index for the focused segment.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jaim_selected_index(ctx: *mut JaimContext) -> i32 {
+pub unsafe extern "C" fn bonolith_selected_index(ctx: *mut BonolithContext) -> i32 {
     let ctx = unsafe { &*ctx };
     ctx.engine.conversion_state()
         .map(|s| s.segments[s.focus].selected as i32)
@@ -485,7 +510,7 @@ pub unsafe extern "C" fn jaim_selected_index(ctx: *mut JaimContext) -> i32 {
 
 /// Reset the engine state (called on focus change, deactivation, etc.)
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jaim_reset(ctx: *mut JaimContext) {
+pub unsafe extern "C" fn bonolith_reset(ctx: *mut BonolithContext) {
     let ctx = unsafe { &mut *ctx };
     ctx.engine.reset();
     ctx.engine.clear_conversion();
@@ -493,19 +518,41 @@ pub unsafe extern "C" fn jaim_reset(ctx: *mut JaimContext) {
     ctx.pending_commit = None;
 }
 
+/// Commit any in-progress composition (conversion candidate or raw preedit)
+/// into pending_commit, then clear composing state. Called on focus loss so
+/// typed text is preserved instead of discarded — matches standard JP IMEs.
+/// The committed text is delivered via the next bonolith_get_ui_state() /
+/// bonolith_poll_commit(). No-op when nothing is composing.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bonolith_commit_input(ctx: *mut BonolithContext) {
+    let ctx = unsafe { &mut *ctx };
+    if ctx.converting {
+        if let Some(text) = ctx.engine.commit_conversion() {
+            ctx.pending_commit = Some(text);
+        }
+        ctx.converting = false;
+    } else {
+        let preedit = ctx.engine.preedit();
+        if !preedit.is_empty() {
+            ctx.engine.commit(&preedit);
+            ctx.pending_commit = Some(preedit);
+        }
+    }
+}
+
 // ── Batch UI state query ────────────────────────────────────────────────────
 
 /// Get the complete UI state in a single FFI call.
 /// The returned struct's string pointers are valid until the next call to
-/// jaim_handle_key() or jaim_get_ui_state().
+/// bonolith_handle_key() or bonolith_get_ui_state().
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jaim_get_ui_state(ctx: *mut JaimContext, out: *mut JaimUiState) {
+pub unsafe extern "C" fn bonolith_get_ui_state(ctx: *mut BonolithContext, out: *mut BonolithUiState) {
     let ctx = unsafe { &mut *ctx };
     let out = unsafe { &mut *out };
 
     // Zero-init segments and candidates
     for i in 0..MAX_SEGMENTS {
-        out.segments[i] = JaimSegmentInfo { start_chars: 0, char_len: 0 };
+        out.segments[i] = BonolithSegmentInfo { start_chars: 0, char_len: 0 };
     }
     for i in 0..MAX_CANDIDATES {
         out.candidates[i] = ptr::null();
@@ -537,7 +584,7 @@ pub unsafe extern "C" fn jaim_get_ui_state(ctx: *mut JaimContext, out: *mut Jaim
 
             for i in 0..seg_count {
                 let (start, end) = ranges[i];
-                out.segments[i] = JaimSegmentInfo {
+                out.segments[i] = BonolithSegmentInfo {
                     start_chars: start as i32,
                     char_len: (end - start) as i32,
                 };
@@ -589,25 +636,25 @@ pub unsafe extern "C" fn jaim_get_ui_state(ctx: *mut JaimContext, out: *mut Jaim
 
 // ── Dictionary operations (global, not per-context) ─────────────────────────
 
-/// Entry info returned by jaim_dict_get_user_entries().
+/// Entry info returned by bonolith_dict_get_user_entries().
 #[repr(C)]
-pub struct JaimDictEntry {
+pub struct BonolithDictEntry {
     pub reading: *const c_char,
     pub surface: *const c_char,
 }
 
-/// Result of jaim_dict_get_user_entries().
-/// Caller must free with jaim_dict_free_entries().
+/// Result of bonolith_dict_get_user_entries().
+/// Caller must free with bonolith_dict_free_entries().
 #[repr(C)]
-pub struct JaimDictEntries {
-    pub entries: *mut JaimDictEntry,
+pub struct BonolithDictEntries {
+    pub entries: *mut BonolithDictEntry,
     pub count: i32,
 }
 
 /// Add a word to the user dictionary and save to disk.
 /// Returns true on success.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jaim_dict_add_entry(
+pub unsafe extern "C" fn bonolith_dict_add_entry(
     reading: *const c_char,
     surface: *const c_char,
 ) -> bool {
@@ -638,7 +685,7 @@ pub unsafe extern "C" fn jaim_dict_add_entry(
 
 /// Delete a user dictionary entry by index. Returns true on success.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jaim_dict_delete_entry(index: i32) -> bool {
+pub unsafe extern "C" fn bonolith_dict_delete_entry(index: i32) -> bool {
     let shared = SharedCore::global();
     let mut dict = shared.dictionary.write().unwrap();
     let mut entries = dict.user_entries().to_vec();
@@ -654,7 +701,7 @@ pub unsafe extern "C" fn jaim_dict_delete_entry(index: i32) -> bool {
 /// Update a user dictionary entry by index. Empty strings mean "no change".
 /// Returns true on success.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jaim_dict_update_entry(
+pub unsafe extern "C" fn bonolith_dict_update_entry(
     index: i32,
     new_reading: *const c_char,
     new_surface: *const c_char,
@@ -685,23 +732,23 @@ pub unsafe extern "C" fn jaim_dict_update_entry(
     dict.sync_user_entries_to_store().is_ok()
 }
 
-/// Get all user dictionary entries. Caller must free with jaim_dict_free_entries().
+/// Get all user dictionary entries. Caller must free with bonolith_dict_free_entries().
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jaim_dict_get_user_entries() -> JaimDictEntries {
+pub unsafe extern "C" fn bonolith_dict_get_user_entries() -> BonolithDictEntries {
     let shared = SharedCore::global();
     let dict = shared.dictionary.read().unwrap();
     let user = dict.user_entries();
 
     if user.is_empty() {
-        return JaimDictEntries {
+        return BonolithDictEntries {
             entries: ptr::null_mut(),
             count: 0,
         };
     }
 
     let count = user.len();
-    let layout = std::alloc::Layout::array::<JaimDictEntry>(count).unwrap();
-    let entries = unsafe { std::alloc::alloc(layout) as *mut JaimDictEntry };
+    let layout = std::alloc::Layout::array::<BonolithDictEntry>(count).unwrap();
+    let entries = unsafe { std::alloc::alloc(layout) as *mut BonolithDictEntry };
 
     for (i, e) in user.iter().enumerate() {
         let reading = CString::new(e.reading.as_str()).unwrap_or_default();
@@ -712,15 +759,15 @@ pub unsafe extern "C" fn jaim_dict_get_user_entries() -> JaimDictEntries {
         }
     }
 
-    JaimDictEntries {
+    BonolithDictEntries {
         entries,
         count: count as i32,
     }
 }
 
-/// Free entries returned by jaim_dict_get_user_entries().
+/// Free entries returned by bonolith_dict_get_user_entries().
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jaim_dict_free_entries(result: JaimDictEntries) {
+pub unsafe extern "C" fn bonolith_dict_free_entries(result: BonolithDictEntries) {
     if result.entries.is_null() {
         return;
     }
@@ -735,13 +782,13 @@ pub unsafe extern "C" fn jaim_dict_free_entries(result: JaimDictEntries) {
             }
         }
     }
-    let layout = std::alloc::Layout::array::<JaimDictEntry>(result.count as usize).unwrap();
+    let layout = std::alloc::Layout::array::<BonolithDictEntry>(result.count as usize).unwrap();
     unsafe { std::alloc::dealloc(result.entries as *mut u8, layout) };
 }
 
 /// Export dictionary to a file path. Returns true on success.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jaim_dict_export(path: *const c_char) -> bool {
+pub unsafe extern "C" fn bonolith_dict_export(path: *const c_char) -> bool {
     let path = match unsafe { std::ffi::CStr::from_ptr(path) }.to_str() {
         Ok(s) => std::path::PathBuf::from(s),
         Err(_) => return false,
@@ -753,7 +800,7 @@ pub unsafe extern "C" fn jaim_dict_export(path: *const c_char) -> bool {
 
 /// Import dictionary from a file path. Returns number of entries imported, or -1 on error.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jaim_dict_import(path: *const c_char) -> i32 {
+pub unsafe extern "C" fn bonolith_dict_import(path: *const c_char) -> i32 {
     let path = match unsafe { std::ffi::CStr::from_ptr(path) }.to_str() {
         Ok(s) => std::path::PathBuf::from(s),
         Err(_) => return -1,
@@ -772,7 +819,7 @@ pub unsafe extern "C" fn jaim_dict_import(path: *const c_char) -> i32 {
 /// Clear all user learning history (in-memory counts and persistent store).
 /// Returns the number of rows deleted, or -1 on error.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jaim_clear_learning() -> i32 {
+pub unsafe extern "C" fn bonolith_clear_learning() -> i32 {
     let shared = SharedCore::global();
     let mut user_scorer = shared.user_scorer.lock().unwrap();
     match user_scorer.clear_scores() {

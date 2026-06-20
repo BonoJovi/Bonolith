@@ -5,7 +5,7 @@
 /// and isolates the model in a separate process.
 ///
 /// The server should be started separately (e.g., via systemd):
-///   llama-server -m ~/.local/share/jaim/models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
+///   llama-server -m ~/.local/share/bonolith/models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
 ///     --host 127.0.0.1 --port 8080 --ctx-size 512
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -86,9 +86,9 @@ impl HttpLlamaScorer {
         })
     }
 
-    /// Connect to the default endpoint, checking JAIM_LLM_ENDPOINT env var.
+    /// Connect to the default endpoint, checking BONOLITH_LLM_ENDPOINT env var.
     pub fn from_default_endpoint() -> Option<Self> {
-        let endpoint = std::env::var("JAIM_LLM_ENDPOINT")
+        let endpoint = std::env::var("BONOLITH_LLM_ENDPOINT")
             .unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string());
         Self::new(&endpoint)
     }
@@ -97,7 +97,7 @@ impl HttpLlamaScorer {
     /// Generate a completion from context, then measure character overlap with candidate.
     fn score_by_generation(&self, context: &str, candidate: &str) -> f64 {
         // Fast-fail: once the server has been observed unreachable
-        // (e.g., user ran `jaim llm off` mid-session), skip the HTTP
+        // (e.g., user ran `bonolith llm off` mid-session), skip the HTTP
         // round-trip entirely and return the neutral score so we
         // don't pay the connect-timeout per keystroke.
         if self.warned.load(Ordering::Relaxed) {

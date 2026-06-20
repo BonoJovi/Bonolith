@@ -1,5 +1,5 @@
-/// JaIM configuration — user-configurable settings loaded from
-/// `~/.config/jaim/config.json`.
+/// Bonolith configuration — user-configurable settings loaded from
+/// `~/.config/bonolith/config.json`.
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -8,7 +8,7 @@ use super::keymap::*;
 
 /// User-facing config (serialized as JSON).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JaimConfig {
+pub struct BonolithConfig {
     #[serde(default = "default_toggle_keys")]
     pub toggle_keys: Vec<ToggleKeyBinding>,
 }
@@ -35,7 +35,7 @@ fn default_toggle_keys() -> Vec<ToggleKeyBinding> {
     }]
 }
 
-impl Default for JaimConfig {
+impl Default for BonolithConfig {
     fn default() -> Self {
         Self {
             toggle_keys: default_toggle_keys(),
@@ -43,7 +43,7 @@ impl Default for JaimConfig {
     }
 }
 
-impl JaimConfig {
+impl BonolithConfig {
     /// Resolve the config file path using XDG_CONFIG_HOME.
     fn config_path() -> PathBuf {
         let config_dir = std::env::var("XDG_CONFIG_HOME")
@@ -52,26 +52,26 @@ impl JaimConfig {
                 let home = std::env::var("HOME").unwrap_or_default();
                 PathBuf::from(home).join(".config")
             });
-        config_dir.join("jaim").join("config.json")
+        config_dir.join("bonolith").join("config.json")
     }
 
     /// Load config from disk. Returns default if file doesn't exist or fails to parse.
     pub fn load() -> Self {
         let path = Self::config_path();
         match std::fs::read_to_string(&path) {
-            Ok(contents) => match serde_json::from_str::<JaimConfig>(&contents) {
+            Ok(contents) => match serde_json::from_str::<BonolithConfig>(&contents) {
                 Ok(config) => {
-                    info!("JaIM: Loaded config from {}", path.display());
+                    info!("Bonolith: Loaded config from {}", path.display());
                     config
                 }
                 Err(e) => {
-                    warn!("JaIM: Failed to parse {}: {}", path.display(), e);
+                    warn!("Bonolith: Failed to parse {}: {}", path.display(), e);
                     Self::default()
                 }
             },
             Err(_) => {
                 info!(
-                    "JaIM: No config at {}, using defaults (Ctrl+Shift+Space)",
+                    "Bonolith: No config at {}, using defaults (Ctrl+Shift+Space)",
                     path.display()
                 );
                 Self::default()
@@ -91,7 +91,7 @@ impl JaimConfig {
                     .filter_map(|m| parse_modifier(m))
                     .fold(0u32, |acc, mask| acc | mask);
                 info!(
-                    "JaIM: Toggle key compiled: '{}' + {:?} → keyval=0x{:04X}, mask=0x{:04X}",
+                    "Bonolith: Toggle key compiled: '{}' + {:?} → keyval=0x{:04X}, mask=0x{:04X}",
                     binding.keyval, binding.modifiers, keyval, modifier_mask
                 );
                 Some(CompiledToggleKey {
@@ -127,7 +127,7 @@ fn parse_keyval(name: &str) -> Option<u32> {
         // Hex keysym for advanced users: "0xff2a"
         s if s.starts_with("0x") => u32::from_str_radix(&s[2..], 16).ok(),
         other => {
-            warn!("JaIM: Unknown key name '{}', ignoring", other);
+            warn!("Bonolith: Unknown key name '{}', ignoring", other);
             None
         }
     }
@@ -140,7 +140,7 @@ fn parse_modifier(name: &str) -> Option<u32> {
         "alt" | "mod1" => Some(IBUS_MOD1_MASK),
         "shift" => Some(IBUS_SHIFT_MASK),
         other => {
-            warn!("JaIM: Unknown modifier '{}', ignoring", other);
+            warn!("Bonolith: Unknown modifier '{}', ignoring", other);
             None
         }
     }

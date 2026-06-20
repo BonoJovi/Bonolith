@@ -479,12 +479,12 @@ impl Dictionary {
                 let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
                 PathBuf::from(home).join(".local/share")
             })
-            .join("jaim");
+            .join("bonolith");
         Ok(data_dir.join("user_dict.json"))
     }
 
     /// Construct a dictionary attached to the default SQLite store at
-    /// `~/.local/share/jaim/dict.sqlite`, with all user entries loaded
+    /// `~/.local/share/bonolith/dict.sqlite`, with all user entries loaded
     /// in memory. Runs legacy JSON migration on first call. Used by the
     /// CLI and dialog flows that previously built a fresh Dictionary
     /// with JSON-backed persistence.
@@ -1078,7 +1078,7 @@ mod tests {
 
     #[test]
     fn sync_and_load_via_store() {
-        let dir = std::env::temp_dir().join("jaim_test_dict_sync");
+        let dir = std::env::temp_dir().join("bonolith_test_dict_sync");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let store = Arc::new(DictStore::open(&dir.join("dict.sqlite")).unwrap());
@@ -1107,7 +1107,7 @@ mod tests {
 
     #[test]
     fn export_and_import() {
-        let dir = std::env::temp_dir().join("jaim_test_export_import");
+        let dir = std::env::temp_dir().join("bonolith_test_export_import");
         let path = dir.join("export.json");
 
         let mut dict = Dictionary::new();
@@ -1161,7 +1161,7 @@ mod tests {
 
     #[test]
     fn import_tolerates_trailing_comma() {
-        let dir = std::env::temp_dir().join("jaim_test_trailing_comma");
+        let dir = std::env::temp_dir().join("bonolith_test_trailing_comma");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("import.json");
@@ -1182,7 +1182,7 @@ mod tests {
 
     #[test]
     fn import_error_includes_path_and_hint() {
-        let dir = std::env::temp_dir().join("jaim_test_bad_json");
+        let dir = std::env::temp_dir().join("bonolith_test_bad_json");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("import.json");

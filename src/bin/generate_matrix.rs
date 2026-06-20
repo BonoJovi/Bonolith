@@ -1,9 +1,9 @@
-//! Generate JaIM CONNECTION_COST table from IPADIC matrix.def.
+//! Generate Bonolith CONNECTION_COST table from IPADIC matrix.def.
 //!
 //! Reads IPADIC left-id.def, right-id.def, and matrix.def from
 //! /usr/share/mecab/dic/ipadic, maps each IPADIC POS string to one of
-//! JaIM's 11 PartOfSpeech variants (same mapping as generate_dict.rs),
-//! aggregates costs per (left_jaim_pos, right_jaim_pos) using the arithmetic
+//! Bonolith's 11 PartOfSpeech variants (same mapping as generate_dict.rs),
+//! aggregates costs per (left_bonolith_pos, right_bonolith_pos) using the arithmetic
 //! mean, normalizes to [0, 8] (to match the engine boost ×10 scale), and
 //! emits a Rust source file.
 //!
@@ -45,7 +45,7 @@ fn pos_to_idx(name: &str) -> usize {
 ///
 /// IPADIC's 1316×1316 matrix has fine-grained particle/adjective subtypes
 /// (格助詞 vs 終助詞, 連体形 vs 終止形, …) whose costs span a wide range.
-/// Averaging them into JaIM's 11×11 buckets washes out cells that are
+/// Averaging them into Bonolith's 11×11 buckets washes out cells that are
 /// universally cheap in modern written Japanese, producing pathological
 /// asymmetries — most notably N→Part (1.667) vs Part→N (4.679), which
 /// makes the DP prefer wrong merges like は|いい → はい|い.
@@ -71,7 +71,7 @@ const OVERRIDES: &[(&str, &str, f64, &str)] = &[
     ("Adverb", "Verb",        2.500, "はやく|たべる — adverb modifies verb"),
     ("Adverb", "Adjective",   2.500, "とても|うつくしい — adverb modifies adjective"),
     // Noun → Suffix: IPADIC normalization gave 0.000 (universal compound-form
-    // magnet). The Suffix bucket is heterogeneous in JaIM's 11-class scheme
+    // magnet). The Suffix bucket is heterogeneous in Bonolith's 11-class scheme
     // (氏/様/的/化/etc.), so a universal 0.000 lets the DP take spurious
     // suffix splits like りょうかい|し(suf)|ました over りょうかい|しました.
     ("Noun", "Suffix",        2.500, "氏/様/的 chain is natural but not free; was 0.000 IPADIC artifact"),
@@ -118,7 +118,7 @@ fn read_eucjp(path: &Path) -> io::Result<String> {
     Ok(utf8.into_owned())
 }
 
-/// Parse left-id.def or right-id.def into a Vec<jaim_pos_idx> indexed by IPADIC id.
+/// Parse left-id.def or right-id.def into a Vec<bonolith_pos_idx> indexed by IPADIC id.
 /// Format per line: `<id> <pos_csv>` where pos_csv is e.g. `名詞,一般,*,*,*,*,*,*,*`
 fn parse_id_def(path: &Path) -> io::Result<Vec<usize>> {
     let text = read_eucjp(path)?;
@@ -138,8 +138,8 @@ fn parse_id_def(path: &Path) -> io::Result<Vec<usize>> {
         let parts: Vec<&str> = pos_csv.split(',').collect();
         let major = parts.first().copied().unwrap_or("");
         let sub = parts.get(1).copied().unwrap_or("");
-        let jaim_pos = map_pos(major, sub);
-        let idx = pos_to_idx(jaim_pos);
+        let bonolith_pos = map_pos(major, sub);
+        let idx = pos_to_idx(bonolith_pos);
         if by_id.len() <= id {
             by_id.resize(id + 1, other_idx);
         }

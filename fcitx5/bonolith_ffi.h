@@ -1,0 +1,120 @@
+/// Bonolith C FFI header — generated from src/ffi.rs
+/// Used by the Fcitx5 C++ addon to interface with the Rust engine.
+
+#ifndef BONOLITH_FFI_H
+#define BONOLITH_FFI_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/// Opaque handle to a Bonolith engine context.
+typedef struct BonolithContext BonolithContext;
+
+#define BONOLITH_MAX_SEGMENTS 32
+#define BONOLITH_MAX_CANDIDATES 64
+
+/// Segment info for batch UI state.
+typedef struct {
+    int32_t start_chars;
+    int32_t char_len;
+} BonolithSegmentInfo;
+
+/// Batch UI state returned by bonolith_get_ui_state().
+typedef struct {
+    const char *committed;
+    bool converting;
+    bool has_preedit;
+    const char *preedit;
+    int32_t segment_count;
+    int32_t focus_index;
+    BonolithSegmentInfo segments[BONOLITH_MAX_SEGMENTS];
+    int32_t candidate_count;
+    int32_t selected_index;
+    const char *candidates[BONOLITH_MAX_CANDIDATES];
+} BonolithUiState;
+
+// ── Lifecycle ────────────────────────────────────────────────────────────
+
+BonolithContext *bonolith_context_new(void);
+void bonolith_context_free(BonolithContext *ctx);
+
+// ── Key handling ─────────────────────────────────────────────────────────
+
+/// Process a key event. Returns true if the key was consumed.
+bool bonolith_handle_key(BonolithContext *ctx, uint32_t keyval, uint32_t state);
+
+// ── Batch state query ────────────────────────────────────────────────────
+
+/// Get the complete UI state in a single call.
+void bonolith_get_ui_state(BonolithContext *ctx, BonolithUiState *out);
+
+// ── Individual state queries (legacy) ────────────────────────────────────
+
+const char *bonolith_get_preedit(BonolithContext *ctx);
+const char *bonolith_poll_commit(BonolithContext *ctx);
+bool bonolith_is_converting(BonolithContext *ctx);
+bool bonolith_has_preedit(BonolithContext *ctx);
+const char *bonolith_composed_text(BonolithContext *ctx);
+int32_t bonolith_segment_count(BonolithContext *ctx);
+int32_t bonolith_focus_index(BonolithContext *ctx);
+int32_t bonolith_segment_start_chars(BonolithContext *ctx, int32_t seg);
+int32_t bonolith_segment_char_len(BonolithContext *ctx, int32_t seg);
+int32_t bonolith_candidate_count(BonolithContext *ctx);
+const char *bonolith_candidate_text(BonolithContext *ctx, int32_t index);
+int32_t bonolith_selected_index(BonolithContext *ctx);
+
+void bonolith_reset(BonolithContext *ctx);
+
+/// Commit any in-progress composition (conversion candidate or raw preedit),
+/// then clear composing state. Committed text is delivered via the next
+/// bonolith_get_ui_state()/bonolith_poll_commit(). No-op when nothing composes.
+void bonolith_commit_input(BonolithContext *ctx);
+
+// ── Dictionary operations (global, not per-context) ─────────────────────
+
+typedef struct {
+    const char *reading;
+    const char *surface;
+} BonolithDictEntry;
+
+typedef struct {
+    BonolithDictEntry *entries;
+    int32_t count;
+} BonolithDictEntries;
+
+/// Add a word to the user dictionary and save. Returns true on success.
+bool bonolith_dict_add_entry(const char *reading, const char *surface);
+
+/// Delete a user dictionary entry by index. Returns true on success.
+bool bonolith_dict_delete_entry(int32_t index);
+
+/// Update a user dictionary entry by index. Empty strings mean "no change".
+bool bonolith_dict_update_entry(int32_t index, const char *new_reading,
+                            const char *new_surface);
+
+/// Get all user dictionary entries. Caller must free with bonolith_dict_free_entries().
+BonolithDictEntries bonolith_dict_get_user_entries(void);
+
+/// Free entries returned by bonolith_dict_get_user_entries().
+void bonolith_dict_free_entries(BonolithDictEntries result);
+
+/// Export dictionary to a file path. Returns true on success.
+bool bonolith_dict_export(const char *path);
+
+/// Import dictionary from a file path. Returns count imported, or -1 on error.
+int32_t bonolith_dict_import(const char *path);
+
+// ── User learning history ───────────────────────────────────────────────
+
+/// Clear all user learning history. Returns number of rows deleted, or -1 on error.
+int32_t bonolith_clear_learning(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // BONOLITH_FFI_H

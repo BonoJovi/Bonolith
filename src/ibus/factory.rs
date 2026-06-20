@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zbus::{connection::Builder, interface, object_server::SignalEmitter, Connection};
 
-use super::config::JaimConfig;
-use super::engine_impl::JaimEngine;
+use super::config::BonolithConfig;
+use super::engine_impl::BonolithEngine;
 
 /// Shared "force the focused engine into 日本語ON" window.
 ///
@@ -17,7 +17,7 @@ use super::engine_impl::JaimEngine;
 /// before `deadline` should flip itself enabled. This is how the
 /// word-register dialog turns the IME on without injecting synthetic keys
 /// (xdotool is X11-only and absent on Wayland) — it calls
-/// `org.jaim.Control.ForceEnable` over the session bus, and the engine
+/// `org.bonolith.Control.ForceEnable` over the session bus, and the engine
 /// instances apply the request through IBus' own focus/key callbacks,
 /// which fire identically on X11 and Wayland.
 pub type ForceEnable = Arc<Mutex<Option<Instant>>>;
@@ -29,15 +29,15 @@ pub type ForceEnable = Arc<Mutex<Option<Instant>>>;
 const FORCE_WINDOW: Duration = Duration::from_secs(5);
 
 /// IBus Factory — creates engine instances on request from IBus daemon.
-pub struct JaimFactory {
-    config: JaimConfig,
+pub struct BonolithFactory {
+    config: BonolithConfig,
     force: ForceEnable,
 }
 
-impl JaimFactory {
+impl BonolithFactory {
     pub fn new(force: ForceEnable) -> Self {
         Self {
-            config: JaimConfig::load(),
+            config: BonolithConfig::load(),
             force,
         }
     }
@@ -45,38 +45,38 @@ impl JaimFactory {
 
 /// Session-bus control surface used by the word-register/-edit dialog.
 ///
-/// Exposed at `org.jaim.Control` / `/org/jaim/Control` so a plain
+/// Exposed at `org.bonolith.Control` / `/org/bonolith/Control` so a plain
 /// session-bus client (the GTK dialog) can reach it without knowing the
 /// IBus private-bus address.
-pub struct JaimControl {
+pub struct BonolithControl {
     force: ForceEnable,
 }
 
-impl JaimControl {
+impl BonolithControl {
     pub fn new(force: ForceEnable) -> Self {
         Self { force }
     }
 }
 
-#[interface(name = "org.jaim.Control")]
-impl JaimControl {
+#[interface(name = "org.bonolith.Control")]
+impl BonolithControl {
     /// Open a short force-on window: the next engine to focus or receive a
     /// key flips itself 日本語ON. Idempotent and order-independent — safe to
     /// call on every field focus-in.
     async fn force_enable(&self) {
         *self.force.lock().unwrap() = Some(Instant::now() + FORCE_WINDOW);
-        info!("JaIM Control: ForceEnable (+{:?})", FORCE_WINDOW);
+        info!("Bonolith Control: ForceEnable (+{:?})", FORCE_WINDOW);
     }
 
     /// Close the force-on window early (dialog is closing).
     async fn force_enable_clear(&self) {
         *self.force.lock().unwrap() = None;
-        info!("JaIM Control: ForceEnableClear");
+        info!("Bonolith Control: ForceEnableClear");
     }
 }
 
 #[interface(name = "org.freedesktop.IBus.Factory")]
-impl JaimFactory {
+impl BonolithFactory {
     /// Called by IBus daemon to create a new engine instance.
     async fn create_engine(
         &self,
@@ -84,10 +84,10 @@ impl JaimFactory {
         #[zbus(connection)] connection: &Connection,
         engine_name: &str,
     ) -> zbus::fdo::Result<zbus::zvariant::OwnedObjectPath> {
-        info!("JaIM Factory: CreateEngine({})", engine_name);
+        info!("Bonolith Factory: CreateEngine({})", engine_name);
 
         let path = format!("/org/freedesktop/IBus/Engine/{}", engine_name);
-        let engine = JaimEngine::new(&self.config, self.force.clone());
+        let engine = BonolithEngine::new(&self.config, self.force.clone());
 
         connection
             .object_server()
@@ -145,33 +145,33 @@ fn get_ibus_address() -> Option<String> {
 }
 
 /// Start the IBus service: register Factory on the IBus private bus, plus
-/// the `org.jaim.Control` surface on the session bus.
+/// the `org.bonolith.Control` surface on the session bus.
 ///
 /// Returns both connections; the caller must keep them alive for the
 /// process lifetime. The control connection is dropped (and its name
 /// released) only when the returned tuple is dropped.
 pub async fn start_ibus_service() -> zbus::Result<(Connection, Connection)> {
-    info!("JaIM: Starting IBus service...");
+    info!("Bonolith: Starting IBus service...");
 
     let force: ForceEnable = Arc::new(Mutex::new(None));
 
     let connection = if let Some(addr) = get_ibus_address() {
-        info!("JaIM: Connecting to IBus bus at {}", addr);
+        info!("Bonolith: Connecting to IBus bus at {}", addr);
         Builder::address(addr.as_str())?
-            .name("org.freedesktop.IBus.JaIM")?
+            .name("org.freedesktop.IBus.Bonolith")?
             .serve_at(
                 "/org/freedesktop/IBus/Factory",
-                JaimFactory::new(force.clone()),
+                BonolithFactory::new(force.clone()),
             )?
             .build()
             .await?
     } else {
-        info!("JaIM: IBus address not found, falling back to session bus");
+        info!("Bonolith: IBus address not found, falling back to session bus");
         Builder::session()?
-            .name("org.freedesktop.IBus.JaIM")?
+            .name("org.freedesktop.IBus.Bonolith")?
             .serve_at(
                 "/org/freedesktop/IBus/Factory",
-                JaimFactory::new(force.clone()),
+                BonolithFactory::new(force.clone()),
             )?
             .build()
             .await?
@@ -179,14 +179,14 @@ pub async fn start_ibus_service() -> zbus::Result<(Connection, Connection)> {
 
     // Control surface on the session bus, reachable by the GTK dialog.
     let control = Builder::session()?
-        .name("org.jaim.Control")?
-        .serve_at("/org/jaim/Control", JaimControl::new(force))?
+        .name("org.bonolith.Control")?
+        .serve_at("/org/bonolith/Control", BonolithControl::new(force))?
         .build()
         .await?;
 
-    info!("JaIM: IBus service registered successfully");
-    info!("JaIM: org.jaim.Control registered on session bus");
-    info!("JaIM: Waiting for IBus daemon requests...");
+    info!("Bonolith: IBus service registered successfully");
+    info!("Bonolith: org.bonolith.Control registered on session bus");
+    info!("Bonolith: Waiting for IBus daemon requests...");
 
     Ok((connection, control))
 }
