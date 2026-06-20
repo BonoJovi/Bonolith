@@ -103,6 +103,11 @@ bool jaim_dict_export(const char *path);
 /// Import dictionary from a file path. Returns count imported, or -1 on error.
 int32_t jaim_dict_import(const char *path);
 
+// ── User learning history ───────────────────────────────────────────────
+
+/// Clear all user learning history. Returns number of rows deleted, or -1 on error.
+int32_t jaim_clear_learning(void);
+
 #ifdef __cplusplus
 }
 #endif

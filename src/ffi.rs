@@ -768,3 +768,15 @@ pub unsafe extern "C" fn jaim_dict_import(path: *const c_char) -> i32 {
         Err(_) => -1,
     }
 }
+
+/// Clear all user learning history (in-memory counts and persistent store).
+/// Returns the number of rows deleted, or -1 on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jaim_clear_learning() -> i32 {
+    let shared = SharedCore::global();
+    let mut user_scorer = shared.user_scorer.lock().unwrap();
+    match user_scorer.clear_scores() {
+        Ok(n) => n as i32,
+        Err(_) => -1,
+    }
+}

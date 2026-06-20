@@ -399,6 +399,14 @@ impl DictStore {
         Ok(n)
     }
 
+    pub fn clear_user_scores(&self) -> io::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .execute("DELETE FROM user_scores", [])
+            .map_err(sqlite_to_io)?;
+        Ok(n)
+    }
+
     pub fn load_user_scores(&self) -> io::Result<HashMap<String, u32>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn

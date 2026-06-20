@@ -51,6 +51,17 @@ impl UserScorer {
         }
     }
 
+    /// Clear all learning history from memory and the persistent store.
+    /// Returns the number of rows deleted from the store.
+    pub fn clear_scores(&mut self) -> io::Result<usize> {
+        self.counts.clear();
+        if let Some(store) = &self.store {
+            store.clear_user_scores()
+        } else {
+            Ok(0)
+        }
+    }
+
     /// Score a (reading, surface) pair based on user history.
     /// Returns 0.0 if never selected. Uses absolute logarithmic scaling
     /// so that even a single selection provides meaningful signal.

@@ -60,6 +60,7 @@ private:
     static void runManageDict();
     static void runExportDict();
     static void runImportDict();
+    static void runClearLearning();
 
     fcitx::Instance *instance_;
     fcitx::FactoryFor<JaimState> factory_;
@@ -69,6 +70,7 @@ private:
     fcitx::SimpleAction actionManage_;
     fcitx::SimpleAction actionExport_;
     fcitx::SimpleAction actionImport_;
+    fcitx::SimpleAction actionClearLearning_;
     fcitx::Menu menu_;
     fcitx::SimpleAction menuAction_;
 };

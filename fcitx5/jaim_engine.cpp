@@ -149,6 +149,12 @@ JaimEngine::JaimEngine(fcitx::Instance *instance)
             std::thread([]() { JaimEngine::runImportDict(); }).detach();
         });
 
+    actionClearLearning_.setShortText("学習履歴をクリア");
+    actionClearLearning_.connect<fcitx::SimpleAction::Activated>(
+        [](fcitx::InputContext * /*ic*/) {
+            std::thread([]() { JaimEngine::runClearLearning(); }).detach();
+        });
+
     instance_->userInterfaceManager().registerAction("jaim-register",
                                                      &actionRegister_);
     instance_->userInterfaceManager().registerAction("jaim-manage",
@@ -157,11 +163,14 @@ JaimEngine::JaimEngine(fcitx::Instance *instance)
                                                      &actionExport_);
     instance_->userInterfaceManager().registerAction("jaim-import",
                                                      &actionImport_);
+    instance_->userInterfaceManager().registerAction("jaim-clear-learning",
+                                                     &actionClearLearning_);
 
     menu_.addAction(&actionRegister_);
     menu_.addAction(&actionManage_);
     menu_.addAction(&actionExport_);
     menu_.addAction(&actionImport_);
+    menu_.addAction(&actionClearLearning_);
 
     menuAction_.setShortText("JaIM");
     menuAction_.setMenu(&menu_);
@@ -383,6 +392,30 @@ void JaimEngine::runImportDict() {
                    "--text=" + std::to_string(count) + " 件インポートしました"});
     } else {
         runZenity({"--error", "--title=JaIM", "--text=インポートに失敗しました"});
+    }
+}
+
+void JaimEngine::runClearLearning() {
+    // zenity --question returns exit code 0 for OK, non-0 for cancel.
+    // runZenity() treats non-zero exit as failure (empty stdout), so use system() here.
+    std::string cmd = "zenity --question "
+                      "'--title=JaIM 学習履歴クリア' "
+                      "'--text=変換の学習履歴をすべて消去します。\n"
+                      "この操作は元に戻せません。よろしいですか？' "
+                      "'--ok-label=クリア' "
+                      "'--cancel-label=キャンセル'";
+    if (system(cmd.c_str()) != 0) {
+        return;
+    }
+
+    int n = jaim_clear_learning();
+    if (n >= 0) {
+        runZenity({"--info", "--title=JaIM",
+                   "--text=学習履歴を消去しました（" + std::to_string(n) +
+                       " 件）。\n次回起動時から反映されます。"});
+    } else {
+        runZenity({"--error", "--title=JaIM",
+                   "--text=学習履歴のクリアに失敗しました"});
     }
 }
 

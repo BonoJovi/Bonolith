@@ -448,6 +448,12 @@ impl JaimEngine {
                     Self::run_manage_dict();
                 });
             }
+            "jaim-clear-learning" => {
+                let shared = self.engine.lock().unwrap().shared_core();
+                std::thread::spawn(move || {
+                    Self::run_clear_learning(shared);
+                });
+            }
             _ => {}
         }
     }
@@ -856,7 +862,13 @@ impl JaimEngine {
             "ユーザー辞書の編集・削除",
         );
 
-        let prop_list = ibus_prop_list(vec![register_prop, manage_prop, export_prop, import_prop]);
+        let clear_prop = ibus_property(
+            "jaim-clear-learning", 0,
+            "学習履歴をクリア...", "",
+            "変換の学習履歴をすべて消去する",
+        );
+
+        let prop_list = ibus_prop_list(vec![register_prop, manage_prop, export_prop, import_prop, clear_prop]);
 
         Self::register_properties(emitter, prop_list).await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
@@ -1016,6 +1028,47 @@ impl JaimEngine {
                     .spawn();
             }
             _ => { /* user cancelled or zenity not available */ }
+        }
+    }
+
+    /// Clear all user learning history after zenity confirmation.
+    fn run_clear_learning(shared: std::sync::Arc<SharedCore>) {
+        let confirmed = std::process::Command::new("zenity")
+            .args([
+                "--question",
+                "--title=JaIM 学習履歴クリア",
+                "--text=変換の学習履歴をすべて消去します。\nこの操作は元に戻せません。よろしいですか？",
+                "--ok-label=クリア",
+                "--cancel-label=キャンセル",
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if !confirmed {
+            return;
+        }
+
+        let mut user_scorer = shared.user_scorer.lock().unwrap();
+        match user_scorer.clear_scores() {
+            Ok(n) => {
+                let _ = std::process::Command::new("zenity")
+                    .args([
+                        "--info",
+                        "--title=JaIM",
+                        &format!("--text=学習履歴を消去しました（{} 件）。\n次回起動時から反映されます。", n),
+                    ])
+                    .status();
+            }
+            Err(e) => {
+                let _ = std::process::Command::new("zenity")
+                    .args([
+                        "--error",
+                        "--title=JaIM",
+                        &format!("--text=エラー: {}", e),
+                    ])
+                    .status();
+            }
         }
     }
 

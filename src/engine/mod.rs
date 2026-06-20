@@ -598,6 +598,18 @@ impl ConversionEngine {
         Some(text)
     }
 
+    /// Clear all user learning history (scores) from memory and the database.
+    /// Returns the number of rows deleted, or an error string.
+    pub fn clear_learning_history(&self) -> Result<usize, String> {
+        let mut user_scorer = self.shared.user_scorer.lock().unwrap();
+        user_scorer.clear_scores().map_err(|e| e.to_string())
+    }
+
+    /// Return a reference to the shared core, for use in background threads.
+    pub fn shared_core(&self) -> Arc<SharedCore> {
+        self.shared.clone()
+    }
+
     /// Delete the last character from the preedit (backspace).
     /// Returns true if something was deleted.
     pub fn delete_last(&mut self) -> bool {
