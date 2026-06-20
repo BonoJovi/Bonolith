@@ -1,2 +1,8 @@
 /target
 /fcitx5/build
+
+# Local Claude Code settings
+/.claude/settings.local.json
+
+# Stray runtime database (created when running from the repo root)
+/data/jaim.db
