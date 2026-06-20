@@ -20,7 +20,7 @@
 //!   cargo test --test conversion_quality -- --nocapture
 
 use bonolith::core::dictionary::Dictionary;
-use bonolith::engine::{ConversionEngine, SharedCore};
+use bonolith::engine::{ConversionEngine, ConversionState, SharedCore};
 use std::fs;
 use std::time::{Duration, Instant};
 
@@ -477,6 +477,183 @@ fn evaluate_top1_accuracy_live() {
         eprintln!("misses:");
         for (id, want, got) in &card.misses {
             eprintln!("  {} want={:?} got={:?}", id, want, got);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Oracle-prefix ceiling (live, informational).
+//
+// Quantifies the upside of incremental re-ranking — re-evaluating the rest of
+// the sentence each time the user confirms a word. We drive the REAL engine
+// confirm-and-continue: at each expected bunsetsu we convert the *remaining*
+// reading with the LLM context built from prior confirmations, then commit a
+// confirmation surface so it becomes left context for the next round. The two
+// modes differ only in that surface:
+//   - oracle: the correct expected surface (a perfect user confirmation)
+//   - self:   the system's own leading output (today's single-pass behaviour)
+// The gap on downstream bunsetsu (j>=1, where left context exists) is the
+// ceiling of the feature. MockScorer ignores context, so this is live-only and
+// never gates — it informs whether the feature is worth building.
+// ---------------------------------------------------------------------------
+
+/// Surface produced for the first `target_chars` of reading, or None if a
+/// segment boundary straddles that offset (then we can't isolate the bunsetsu).
+fn leading_surface(state: &ConversionState, target_chars: usize) -> Option<String> {
+    let mut acc = 0usize;
+    let mut surf = String::new();
+    for seg in &state.segments {
+        acc += seg.reading.chars().count();
+        surf.push_str(&seg.candidates[seg.selected]);
+        if acc == target_chars {
+            return Some(surf);
+        }
+        if acc > target_chars {
+            return None;
+        }
+    }
+    None
+}
+
+/// Confirm-and-continue over one case. Returns, per bunsetsu, `Some(hit)` when
+/// the leading output is alignable (so measurable), else `None`.
+fn confirm_and_continue(case: &Case, oracle: bool) -> Vec<Option<bool>> {
+    let scorer = bonolith::core::llm::HttpLlamaScorer::from_default_endpoint()
+        .expect("llama-server checked reachable by caller");
+    let shared = SharedCore::new_eval(Box::new(scorer));
+    let mut engine = ConversionEngine::with_shared(shared);
+
+    let mut out = Vec::with_capacity(case.expected.len());
+    for j in 0..case.expected.len() {
+        let remaining: String = case.expected_readings[j..].concat();
+        engine.append_raw(&remaining);
+        if engine.start_conversion().is_none() {
+            engine.reset();
+            out.push(None);
+            continue;
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !engine.has_llm_rerank_result() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        engine.apply_llm_rerank();
+
+        let target = case.expected_readings[j].chars().count();
+        let got = engine
+            .conversion_state()
+            .and_then(|s| leading_surface(s, target));
+        out.push(got.as_ref().map(|g| g == &case.expected[j]));
+
+        // Confirm a surface so it becomes left context: the correct one in
+        // oracle mode, the system's own leading output otherwise (falling back
+        // to correct when unalignable, so context stays sane either way).
+        let confirm = if oracle {
+            case.expected[j].clone()
+        } else {
+            got.unwrap_or_else(|| case.expected[j].clone())
+        };
+        engine.clear_conversion();
+        engine.commit(&confirm);
+    }
+    out
+}
+
+#[derive(Default, Clone, Copy)]
+struct CeilStats {
+    aligned: u32,
+    oracle_hit: u32,
+    self_hit: u32,
+}
+
+#[test]
+#[ignore]
+fn measure_oracle_prefix_ceiling_live() {
+    if bonolith::core::llm::HttpLlamaScorer::from_default_endpoint().is_none() {
+        eprintln!("no llama-server reachable; skipping oracle-prefix ceiling");
+        return;
+    }
+    let cases = load_cases();
+
+    let mut overall = CeilStats::default();
+    let mut by_pos: std::collections::BTreeMap<String, CeilStats> = std::collections::BTreeMap::new();
+    let mut wins: Vec<String> = Vec::new();
+
+    eprintln!("\n=== Oracle-prefix ceiling (downstream bunsetsu, j>=1) ===");
+    for case in &cases {
+        if case.expected.len() < 2 {
+            continue; // no downstream position to measure
+        }
+        let oracle = confirm_and_continue(case, true);
+        let zelf = confirm_and_continue(case, false);
+
+        for j in 1..case.expected.len() {
+            // Segmentation of the remaining reading is context-independent, so
+            // alignment matches across modes; require both measurable.
+            if let (Some(oh), Some(sh)) = (oracle[j], zelf[j]) {
+                let b = by_pos.entry(case.pos_solvable.clone()).or_default();
+                overall.aligned += 1;
+                b.aligned += 1;
+                if oh {
+                    overall.oracle_hit += 1;
+                    b.oracle_hit += 1;
+                }
+                if sh {
+                    overall.self_hit += 1;
+                    b.self_hit += 1;
+                }
+                if oh && !sh {
+                    wins.push(format!(
+                        "{} bunsetsu[{}] {:?} fixed by correct left context",
+                        case.id, j, case.expected[j]
+                    ));
+                }
+            }
+        }
+    }
+
+    let pct = |n: u32, d: u32| if d == 0 { 0.0 } else { 100.0 * n as f64 / d as f64 };
+    eprintln!(
+        "\nDownstream aligned positions: {}",
+        overall.aligned
+    );
+    eprintln!(
+        "  self  (current single-pass): {}/{} ({:.1}%)",
+        overall.self_hit,
+        overall.aligned,
+        pct(overall.self_hit, overall.aligned),
+    );
+    eprintln!(
+        "  oracle (perfect left context): {}/{} ({:.1}%)   <- ceiling",
+        overall.oracle_hit,
+        overall.aligned,
+        pct(overall.oracle_hit, overall.aligned),
+    );
+    eprintln!(
+        "  ceiling gain: +{} positions (+{:.1} pts)",
+        overall.oracle_hit.saturating_sub(overall.self_hit),
+        pct(overall.oracle_hit, overall.aligned) - pct(overall.self_hit, overall.aligned),
+    );
+
+    eprintln!("\nBy pos_solvable (self -> oracle):");
+    for (k, s) in &by_pos {
+        eprintln!(
+            "  {:<8} {}/{} ({:.1}%) -> {}/{} ({:.1}%)",
+            k,
+            s.self_hit,
+            s.aligned,
+            pct(s.self_hit, s.aligned),
+            s.oracle_hit,
+            s.aligned,
+            pct(s.oracle_hit, s.aligned),
+        );
+    }
+
+    if wins.is_empty() {
+        eprintln!("\nNo downstream position flips on correct left context — feature looks inert.");
+    } else {
+        eprintln!("\nPositions fixed purely by correct left context ({}):", wins.len());
+        for w in &wins {
+            eprintln!("  {}", w);
         }
     }
 }
