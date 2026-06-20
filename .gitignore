@@ -6,3 +6,7 @@
 
 # Stray runtime database (created when running from the repo root)
 /data/jaim.db
+
+# Python bytecode cache from helper scripts
+scripts/__pycache__/
+*.pyc

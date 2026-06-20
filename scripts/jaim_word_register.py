@@ -27,51 +27,75 @@ import sys
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import GLib, Gtk  # noqa: E402
+from gi.repository import Gio, GLib, Gtk  # noqa: E402
 
 
-def _activate_ibus():
-    """Simulate JaIM's IME toggle hotkey (Ctrl+Shift+space) via xdotool.
+class _IBusActivator:
+    """Turn JaIM 日本語ON via its session-bus control surface.
 
-    IBus' DBus API (Bus.set_global_engine / InputContext.enable /
-    InputContext.set_engine) does not actually flip a focused IC into
-    日本語ON state when called from another process — empirically all
-    three are no-ops here. Instead, inject the key that the engine
-    itself maps to "toggle IME". Each GtkEntry gets a fresh IC that
-    starts in OFF, so a single toggle on focus-in always lands in ON.
+    We do NOT inject synthetic keys (the old xdotool approach): xdotool is
+    X11-only and absent on Wayland, so on Ubuntu 26.04/GNOME-Wayland the
+    keystroke never reached the engine and every field stayed OFF. Nor does
+    IBus' own DBus API flip a focused IC from another process.
+
+    Instead JaIM exposes `org.jaim.Control` on the session bus. `ForceEnable`
+    opens a short window; the engine adopts it through IBus' own focus/key
+    callbacks (which fire the same on X11 and Wayland), so each GtkEntry —
+    which gets a fresh input context — lands 日本語ON idempotently. We clear
+    the window when the dialog closes so other apps aren't forced ON.
     """
-    try:
-        subprocess.Popen(
-            ["xdotool", "key", "ctrl+shift+space"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception as exc:
-        print(f"ibus activate failed: {exc}", file=sys.stderr)
+
+    _NAME = "org.jaim.Control"
+    _PATH = "/org/jaim/Control"
+
+    def __init__(self):
+        self._bus = None
+
+    def _call(self, method):
+        try:
+            if self._bus is None:
+                self._bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            self._bus.call_sync(
+                self._NAME, self._PATH, self._NAME, method,
+                None, None, Gio.DBusCallFlags.NONE, 500, None,
+            )
+        except Exception as exc:
+            print(f"ibus {method} failed: {exc}", file=sys.stderr)
+
+    def activate(self):
+        self._call("ForceEnable")
+
+    def clear(self):
+        self._call("ForceEnableClear")
 
 
-def _activate_fcitx5():
+class _Fcitx5Activator:
     """Activate focused input context via fcitx5-remote CLI."""
-    try:
-        subprocess.Popen(
-            ["fcitx5-remote", "-o"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception as exc:
-        print(f"fcitx5 activate failed: {exc}", file=sys.stderr)
+
+    def activate(self):
+        try:
+            subprocess.Popen(
+                ["fcitx5-remote", "-o"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            print(f"fcitx5 activate failed: {exc}", file=sys.stderr)
+
+    def clear(self):
+        pass
 
 
 def make_activate(backend):
     if backend == "ibus":
-        return _activate_ibus
+        return _IBusActivator()
     if backend == "fcitx5":
-        return _activate_fcitx5
+        return _Fcitx5Activator()
     raise ValueError(f"unknown backend: {backend!r}")
 
 
 class WordDialog(Gtk.Dialog):
-    def __init__(self, activate, mode, init_reading, init_surface):
+    def __init__(self, activator, mode, init_reading, init_surface):
         title = "JaIM: 単語登録" if mode == "register" else "JaIM: 単語編集"
         super().__init__(title=title)
         self.set_default_size(420, 0)
@@ -82,7 +106,7 @@ class WordDialog(Gtk.Dialog):
         )
         self.set_default_response(Gtk.ResponseType.OK)
 
-        self.activate = activate
+        self.activator = activator
 
         box = self.get_content_area()
         box.set_spacing(8)
@@ -119,13 +143,17 @@ class WordDialog(Gtk.Dialog):
         self.show_all()
 
     def _on_focus_in(self, _widget, _event):
-        # Defer briefly so the GtkEntry's IM context has time to notify the
-        # host IME daemon of the focus change before we inject the toggle.
+        # Re-open the force-on window when focus enters this Entry. The first
+        # shot covers the common case; the second guards against a *late*
+        # focus-out of the previous Entry (observed on Ubuntu 26.04) racing in
+        # afterwards. ForceEnable is idempotent, so firing it repeatedly — and
+        # for every field — is harmless and keeps the window fresh.
         GLib.timeout_add(80, self._activate_once)
+        GLib.timeout_add(300, self._activate_once)
         return False  # propagate
 
     def _activate_once(self):
-        self.activate()
+        self.activator.activate()
         return False  # one-shot
 
 
@@ -137,10 +165,18 @@ def main(argv):
     parser.add_argument("--surface", default="")
     args = parser.parse_args(argv[1:])
 
-    activate = make_activate(args.backend)
+    activator = make_activate(args.backend)
 
-    dialog = WordDialog(activate, args.mode, args.reading, args.surface)
-    response = dialog.run()
+    dialog = WordDialog(activator, args.mode, args.reading, args.surface)
+    # Open the force-on window before the window maps so the engine's first
+    # focus_in (which may fire before any focus-in handler runs) already sees
+    # it and the first field lands 日本語ON without a keystroke.
+    activator.activate()
+    try:
+        response = dialog.run()
+    finally:
+        # Close the window so other apps aren't left forced ON.
+        activator.clear()
 
     if response != Gtk.ResponseType.OK:
         dialog.destroy()

@@ -13,6 +13,7 @@ use jaim::core::dictionary::{Dictionary, DictionaryEntry, PartOfSpeech};
 use jaim::engine::{ConversionEngine, ConversionState, SharedCore};
 
 use super::config::{CompiledToggleKey, JaimConfig};
+use super::factory::ForceEnable;
 use super::keymap::*;
 
 /// IBus Engine state
@@ -24,10 +25,13 @@ pub struct JaimEngine {
     converting: Mutex<bool>,
     /// Compiled toggle key bindings (immutable after creation)
     toggle_keys: Vec<CompiledToggleKey>,
+    /// Shared force-on window set by the word-register dialog (see
+    /// `factory::ForceEnable`).
+    force: ForceEnable,
 }
 
 impl JaimEngine {
-    pub fn new(config: &JaimConfig) -> Self {
+    pub fn new(config: &JaimConfig, force: ForceEnable) -> Self {
         let toggle_keys = config.compile_toggle_keys();
         info!(
             "JaIM: Engine created with {} toggle key binding(s)",
@@ -38,7 +42,26 @@ impl JaimEngine {
             enabled: Mutex::new(false),
             converting: Mutex::new(false),
             toggle_keys,
+            force,
         }
+    }
+
+    /// If the word-register dialog has opened a force-on window, flip this
+    /// engine 日本語ON. Idempotent; safe to call from focus/enable/key paths.
+    /// Returns true if it (or a prior call) left the engine enabled.
+    fn apply_force_enable(&self) -> bool {
+        let active = matches!(
+            *self.force.lock().unwrap(),
+            Some(deadline) if std::time::Instant::now() < deadline
+        );
+        if active {
+            let mut enabled = self.enabled.lock().unwrap();
+            if !*enabled {
+                *enabled = true;
+                info!("JaIM: force-enable window → enabled=true");
+            }
+        }
+        active
     }
 }
 
@@ -206,10 +229,36 @@ impl JaimEngine {
             return Ok(false);
         }
 
+        // If the word-register dialog opened a force-on window, adopt it now —
+        // before the `if !enabled` gate below — so the very first keystroke in
+        // the dialog is already Japanese, even when the focus_in callback fired
+        // before the dialog set the flag.
+        self.apply_force_enable();
+
         debug!(
             "JaIM: KeyEvent keyval=0x{:04X} keycode={} state=0x{:08X}",
             keyval, _keycode, state
         );
+
+        // Absolute IME on/off via the Japanese-keyboard 変換 / 無変換 keys.
+        // Unlike the toggle key, these set a *known* state regardless of the
+        // current one — handy on a physical JP keyboard. (The word-register
+        // dialog no longer relies on this; it uses the org.jaim.Control
+        // session-bus surface instead.) Skipped if the user explicitly bound
+        // these as toggle keys.
+        if !has_modifier(state) && !self.is_toggle_key(keyval, state) {
+            if keyval == IBUS_KEY_HENKAN_MODE {
+                *self.enabled.lock().unwrap() = true;
+                info!("JaIM: Henkan → enabled=true (absolute ON)");
+                return Ok(true);
+            }
+            if keyval == IBUS_KEY_MUHENKAN {
+                let _ = self.cancel_input(&emitter).await;
+                *self.enabled.lock().unwrap() = false;
+                info!("JaIM: Muhenkan → enabled=false (absolute OFF)");
+                return Ok(true);
+            }
+        }
 
         // Toggle key check — must come before modifier pass-through
         if self.is_toggle_key(keyval, state) {
@@ -418,6 +467,9 @@ impl JaimEngine {
         &self,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) {
+        // Adopt an open force-on window so the dialog's field shows 日本語ON the
+        // moment it gains focus (no keystroke needed).
+        self.apply_force_enable();
         info!("JaIM: FocusIn (enabled={})", *self.enabled.lock().unwrap());
         if let Err(e) = self.register_menu(&emitter).await {
             warn!("JaIM: Failed to register properties: {}", e);
@@ -479,6 +531,7 @@ impl JaimEngine {
 
     /// Enable the engine.
     async fn enable(&self) {
+        self.apply_force_enable();
         info!("JaIM: Enable (enabled={})", *self.enabled.lock().unwrap());
     }
 
@@ -973,8 +1026,10 @@ impl JaimEngine {
     /// re-activates IBus on every entry focus-in, so 単語 stays 日本語ON
     /// even after Tab. Output format: "<reading>|<surface>" on OK.
     fn run_word_register() {
+        // No GDK_BACKEND override: the dialog turns the IME on via the
+        // org.jaim.Control session-bus call (engine-side, backend-agnostic),
+        // so it runs as a native client and works on Wayland and X11 alike.
         let output = std::process::Command::new("/usr/bin/python3")
-            .env("GDK_BACKEND", "x11")  // Force XWayland so xdotool key works on Wayland sessions
             .args([
                 "/usr/share/jaim/scripts/jaim_word_register.py",
                 "ibus",
@@ -1183,7 +1238,6 @@ impl JaimEngine {
         let old_surface = entries[idx].surface.clone();
 
         let output = std::process::Command::new("/usr/bin/python3")
-            .env("GDK_BACKEND", "x11")
             .args([
                 "/usr/share/jaim/scripts/jaim_word_register.py",
                 "ibus",

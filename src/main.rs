@@ -234,8 +234,10 @@ async fn main() {
             info!("Starting JaIM engine...");
 
             match ibus::start_ibus_service().await {
-                Ok(connection) => {
+                Ok((connection, _control)) => {
                     info!("JaIM: IBus service started successfully");
+                    // `_control` (session-bus org.jaim.Control) is held for the
+                    // loop's lifetime so its bus name stays claimed.
                     loop {
                         connection.monitor_activity().await;
                     }

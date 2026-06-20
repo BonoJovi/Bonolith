@@ -4,21 +4,74 @@
 /// on demand from the IBus daemon.
 use log::info;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use zbus::{connection::Builder, interface, object_server::SignalEmitter, Connection};
 
 use super::config::JaimConfig;
 use super::engine_impl::JaimEngine;
 
+/// Shared "force the focused engine into 日本語ON" window.
+///
+/// `Some(deadline)` means: any engine that gains focus or receives a key
+/// before `deadline` should flip itself enabled. This is how the
+/// word-register dialog turns the IME on without injecting synthetic keys
+/// (xdotool is X11-only and absent on Wayland) — it calls
+/// `org.jaim.Control.ForceEnable` over the session bus, and the engine
+/// instances apply the request through IBus' own focus/key callbacks,
+/// which fire identically on X11 and Wayland.
+pub type ForceEnable = Arc<Mutex<Option<Instant>>>;
+
+/// Length of the force-on window opened by one `ForceEnable` call.
+/// The dialog refreshes it on every field focus-in, so this only needs to
+/// outlive the gap between focus events; it also bounds how long a crashed
+/// dialog could leave the flag set.
+const FORCE_WINDOW: Duration = Duration::from_secs(5);
+
 /// IBus Factory — creates engine instances on request from IBus daemon.
 pub struct JaimFactory {
     config: JaimConfig,
+    force: ForceEnable,
 }
 
 impl JaimFactory {
-    pub fn new() -> Self {
+    pub fn new(force: ForceEnable) -> Self {
         Self {
             config: JaimConfig::load(),
+            force,
         }
+    }
+}
+
+/// Session-bus control surface used by the word-register/-edit dialog.
+///
+/// Exposed at `org.jaim.Control` / `/org/jaim/Control` so a plain
+/// session-bus client (the GTK dialog) can reach it without knowing the
+/// IBus private-bus address.
+pub struct JaimControl {
+    force: ForceEnable,
+}
+
+impl JaimControl {
+    pub fn new(force: ForceEnable) -> Self {
+        Self { force }
+    }
+}
+
+#[interface(name = "org.jaim.Control")]
+impl JaimControl {
+    /// Open a short force-on window: the next engine to focus or receive a
+    /// key flips itself 日本語ON. Idempotent and order-independent — safe to
+    /// call on every field focus-in.
+    async fn force_enable(&self) {
+        *self.force.lock().unwrap() = Some(Instant::now() + FORCE_WINDOW);
+        info!("JaIM Control: ForceEnable (+{:?})", FORCE_WINDOW);
+    }
+
+    /// Close the force-on window early (dialog is closing).
+    async fn force_enable_clear(&self) {
+        *self.force.lock().unwrap() = None;
+        info!("JaIM Control: ForceEnableClear");
     }
 }
 
@@ -34,7 +87,7 @@ impl JaimFactory {
         info!("JaIM Factory: CreateEngine({})", engine_name);
 
         let path = format!("/org/freedesktop/IBus/Engine/{}", engine_name);
-        let engine = JaimEngine::new(&self.config);
+        let engine = JaimEngine::new(&self.config, self.force.clone());
 
         connection
             .object_server()
@@ -91,28 +144,49 @@ fn get_ibus_address() -> Option<String> {
     newest.map(|(_, addr)| addr)
 }
 
-/// Start the IBus service: register Factory on the IBus private bus.
-pub async fn start_ibus_service() -> zbus::Result<Connection> {
+/// Start the IBus service: register Factory on the IBus private bus, plus
+/// the `org.jaim.Control` surface on the session bus.
+///
+/// Returns both connections; the caller must keep them alive for the
+/// process lifetime. The control connection is dropped (and its name
+/// released) only when the returned tuple is dropped.
+pub async fn start_ibus_service() -> zbus::Result<(Connection, Connection)> {
     info!("JaIM: Starting IBus service...");
+
+    let force: ForceEnable = Arc::new(Mutex::new(None));
 
     let connection = if let Some(addr) = get_ibus_address() {
         info!("JaIM: Connecting to IBus bus at {}", addr);
         Builder::address(addr.as_str())?
             .name("org.freedesktop.IBus.JaIM")?
-            .serve_at("/org/freedesktop/IBus/Factory", JaimFactory::new())?
+            .serve_at(
+                "/org/freedesktop/IBus/Factory",
+                JaimFactory::new(force.clone()),
+            )?
             .build()
             .await?
     } else {
         info!("JaIM: IBus address not found, falling back to session bus");
         Builder::session()?
             .name("org.freedesktop.IBus.JaIM")?
-            .serve_at("/org/freedesktop/IBus/Factory", JaimFactory::new())?
+            .serve_at(
+                "/org/freedesktop/IBus/Factory",
+                JaimFactory::new(force.clone()),
+            )?
             .build()
             .await?
     };
 
+    // Control surface on the session bus, reachable by the GTK dialog.
+    let control = Builder::session()?
+        .name("org.jaim.Control")?
+        .serve_at("/org/jaim/Control", JaimControl::new(force))?
+        .build()
+        .await?;
+
     info!("JaIM: IBus service registered successfully");
+    info!("JaIM: org.jaim.Control registered on session bus");
     info!("JaIM: Waiting for IBus daemon requests...");
 
-    Ok(connection)
+    Ok((connection, control))
 }
