@@ -170,6 +170,17 @@ if [ "$NO_LLM" -eq 1 ]; then
     systemctl --user disable bonolith-llm-server.service >/dev/null 2>&1 || true
     echo "  (LLM disabled per --no-llm; turn it on later with \`bonolith llm on\`)"
 else
+    # Ensure the llama-server binary exists before enabling the unit. install.sh
+    # only ships the systemd unit; without the binary the engine silently falls
+    # back to the heuristic scorer (no real LLM). Fetch it on demand. Skipped
+    # entirely under --no-llm (this branch only runs when the LLM is enabled).
+    if [ ! -x "$HOME/.local/bin/llama-server" ]; then
+        echo "  llama-server not found — fetching prebuilt release..."
+        if ! "$SCRIPT_DIR/install-llama-server.sh"; then
+            echo "  Warning: llama-server install failed (offline?). The LLM service"
+            echo "  won't start until you run scripts/install-llama-server.sh."
+        fi
+    fi
     systemctl --user enable --now bonolith-llm-server.service >/dev/null 2>&1 || true
 fi
 
