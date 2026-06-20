@@ -126,6 +126,8 @@ const PRIORITY_OVERRIDES: &[(&str, &str, u32)] = &[
     ("かわ", "川", 3900), // was 1150, below 皮 3755
     ("かみ", "髪", 4000), // was 3300, below 加味 3609
     ("かみ", "神", 3800), // was 3065, below 加味 3609 (髪 > 神 kept)
+    ("りょうり", "料理", 4400), // was 3968, below 良吏 4296 (rare "good official")
+    ("かぎ", "鍵", 4200),       // was 4119, below 鈎 4124 (rare "hook/gaff")
     // Verbs: the everyday default buried below rare/literary kanji variants.
     // Same exclusion rule — context-dependent verbs (着る/切る, 図る/測る,
     // 上る/登る, 治す/直す, 帰る/変える) are left to the LLM.
@@ -1013,8 +1015,10 @@ mod tests {
             ("みち", "道"), // beats 未知
             ("うみ", "海"), // beats 生み/膿/産み
             ("め", "目"),   // beats 眼/海布
-            ("かわ", "川"), // beats 皮
-            ("かみ", "髪"), // beats 加味
+            ("かわ", "川"),   // beats 皮
+            ("かみ", "髪"),   // beats 加味
+            ("りょうり", "料理"), // beats 良吏
+            ("かぎ", "鍵"),   // beats 鈎
             // verbs
             ("みる", "見る"),     // beats 海松/水松
             ("いのる", "祈る"),   // beats 祷る
