@@ -5,7 +5,7 @@
 /// and isolates the model in a separate process.
 ///
 /// The server should be started separately (e.g., via systemd):
-///   llama-server -m ~/.local/share/bonolith/models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
+///   llama-server -m ~/.local/share/bonolith/models/qwen2.5-1.5b-instruct-q4_k_m.gguf \
 ///     --host 127.0.0.1 --port 8080 --ctx-size 512
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -298,7 +298,7 @@ mod tests {
                 if ok { "OK" } else { "MISS" }
             );
         }
-        // The 0.5B model isn't perfect, but it should clear a clear majority.
+        // The model isn't perfect, but it should clear a clear majority.
         assert!(correct >= 4, "only {correct}/5 homophone cases correct");
     }
 }

@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Japanese Input Method / Japanese a Input Method / Japanese AI Method**
+**An LLM-powered Japanese input method for Linux — IBus & Fcitx5**
 
 [![Version](https://img.shields.io/badge/Version-3.0.0-blue)](https://github.com/BonoJovi/Bonolith/releases)
 [![Rust](https://img.shields.io/badge/Rust-2024-orange.svg)](https://www.rust-lang.org/)
@@ -21,7 +21,7 @@
 - **辞書変換** — IPADIC ベースの 232,000+ エントリ辞書（Trie 検索 + DP 分節）
 - **活用形対応** — 動詞・形容詞の活用形を自動生成（食べた、走って、読んだ 等）
 - **記号入力** — 矢印（やじるし→）、括弧ペア（かっこ→「」）等の記号辞書
-- **LLM リランキング** — Qwen2.5-0.5B + ローカル HTTP サーバーによる文脈を考慮した候補順位付け（バックグラウンド実行）
+- **LLM リランキング** — Qwen2.5-1.5B + ローカル HTTP サーバーによる文脈を考慮した候補順位付け（バックグラウンド実行）
 - **文法スコアリング** — 文法ルールによる候補フィルタリング
 - **ユーザ学習** — 選択履歴を学習し、候補順位を最適化
 - **文節編集** — 文節の移動・伸縮・候補切替
@@ -49,7 +49,7 @@
 | **ローマ字変換器** | ASCII → ひらがな / カタカナのステートマシン |
 | **辞書エンジン** | Trie ベースのかな→漢字検索 + DP 分節（232K エントリ） |
 | **文法エンジン** | 構造検証とスコアリング（9 ルール） |
-| **LLM エンジン** | llama-server (HTTP) 経由の Qwen2.5-0.5B によるバックグラウンドリランキング |
+| **LLM エンジン** | llama-server (HTTP) 経由の Qwen2.5-1.5B によるバックグラウンドリランキング |
 | **ユーザスコアラ** | 選択履歴の対数スケール学習 |
 | **変換エンジン** | パイプライン統合と文節編集 |
 
@@ -103,7 +103,7 @@ Bonolith/
 - IPADIC 辞書（`sudo apt install mecab-ipadic`）
 - 辞書登録 / 編集ダイアログ（GTK3）: `sudo apt install python3-gi gir1.2-gtk-3.0 xdotool`
   - Wayland セッションでも `GDK_BACKEND=x11` で XWayland 経由で起動するため、xdotool が動作する Xorg / XWayland が必要
-- LLM 用（オプション）: llama-server + Qwen2.5-0.5B Q4 モデル（約 512MB）
+- LLM 用（オプション）: llama-server + Qwen2.5-1.5B Q4 モデル（約 1.1GB）
 
 ## ビルド
 
@@ -123,6 +123,10 @@ cargo build --release
 
 LLM リランキングを有効にするには、llama-server をセットアップします。
 LLM サーバーが起動していなくても Bonolith は正常に動作します（辞書＋文法＋ユーザ学習のみで変換）。
+
+> **かんたん導入**: 下記 1〜2 を自動化したスクリプトがあります。
+> `./scripts/install-llama-server.sh` で llama-server バイナリとモデル（Qwen2.5-1.5B）を取得します（`--no-model` でバイナリのみ）。
+> 手動でセットアップする場合は以下を参照してください。
 
 ### 1. llama-server のインストール
 
@@ -146,7 +150,7 @@ cp llama-*/lib*.so* ~/.local/lib/
 ```bash
 mkdir -p ~/.local/share/bonolith/models
 cd ~/.local/share/bonolith/models
-curl -LO https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
+curl -LO https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf
 ```
 
 ### 3. systemd サービスとして登録

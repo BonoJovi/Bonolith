@@ -1,6 +1,6 @@
 /// LLM-based contextual ranking and final validation
 ///
-/// Uses a local quantized model (Qwen2.5-0.5B Q4_K_M) for:
+/// Uses a local quantized model (Qwen2.5-1.5B Q4_K_M) for:
 /// 1. Disambiguating homophone candidates
 /// 2. Final check on dictionary-converted sentences
 /// 3. Context-aware reranking of candidates
