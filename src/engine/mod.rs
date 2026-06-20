@@ -773,6 +773,38 @@ impl ConversionEngine {
                     }
                 }
 
+                // Whole-sentence N-best rescoring (theme B): only worth a pass
+                // when there are at least two segments and at least one of them
+                // is ambiguous — otherwise the greedy result is already final.
+                let ambiguous = seg_info.iter().filter(|(_, c)| c.len() > 1).count();
+                if reranked_segments.len() >= 2 && ambiguous >= 1 {
+                    let segments: Vec<(String, Vec<String>)> = seg_info
+                        .iter()
+                        .map(|(r, _)| r.clone())
+                        .zip(reranked_segments.iter().cloned())
+                        .collect();
+                    let winners = Self::sentence_rescore(
+                        &committed_context,
+                        &segments,
+                        |ctx, surface| llm.score_with_context(ctx, surface),
+                    );
+                    // Promote each winning candidate to the front of its segment.
+                    for (seg, &w) in reranked_segments.iter_mut().zip(winners.iter()) {
+                        if w != 0 && w < seg.len() {
+                            let chosen = seg.remove(w);
+                            seg.insert(0, chosen);
+                        }
+                    }
+                    log::debug!(
+                        "sentence N-best: winners={:?} -> '{}'",
+                        winners,
+                        reranked_segments
+                            .iter()
+                            .filter_map(|s| s.first().cloned())
+                            .collect::<String>(),
+                    );
+                }
+
                 reranked_segments
             }));
 
@@ -843,6 +875,88 @@ impl ConversionEngine {
         } else {
             score()
         }
+    }
+
+    /// Whole-sentence N-best rescoring (theme B).
+    ///
+    /// The per-segment rerank is greedy left-to-right: it only ever sees the
+    /// LEFT context, so it cannot use a disambiguator that appears *after* an
+    /// ambiguous segment (e.g. はしを**わたる** → 渡る vs はしを**つかう** → 使う).
+    /// This pass enumerates a bounded set of full sentences from the top-K of
+    /// each segment, scores each whole sentence with the LLM as a single unit
+    /// (so both left and right context count), and returns the chosen candidate
+    /// index per segment.
+    ///
+    /// `segments`: (reading, ordered candidate surfaces) per segment, already
+    /// reranked so index 0 is the per-segment best. `score`: full-sentence
+    /// scorer `(context, surface) -> 0..1`. The all-zeros (greedy) hypothesis
+    /// is always included, so this can only move a result when a different
+    /// whole-sentence combination scores strictly higher.
+    fn sentence_rescore(
+        committed_context: &str,
+        segments: &[(String, Vec<String>)],
+        score: impl Fn(&str, &str) -> f64,
+    ) -> Vec<usize> {
+        // Vary the top-K of each segment; bare-kana segments are penalized the
+        // way rerank_llm_score neutralizes them per segment (the sentence LLM
+        // score over-rates kana continuations). Weights mirror the per-segment
+        // combine's LLM-leaning split, since a whole-sentence logprob is a
+        // stronger signal than the frequency prior.
+        const SENTENCE_TOP_K: usize = 2;
+        const MAX_SENTENCE_HYP: usize = 8;
+        const KANA_PENALTY: f64 = 0.25;
+        const PRIOR_WEIGHT: f64 = 0.3;
+        const LLM_WEIGHT: f64 = 0.7;
+
+        if segments.is_empty() {
+            return Vec::new();
+        }
+
+        // Enumerate hypotheses (candidate index per segment), capped.
+        let mut hyps: Vec<Vec<usize>> = vec![Vec::new()];
+        for (_reading, cands) in segments {
+            let k = cands.len().min(SENTENCE_TOP_K).max(1);
+            let mut next = Vec::new();
+            'expand: for h in &hyps {
+                for j in 0..k {
+                    let mut nh = h.clone();
+                    nh.push(j);
+                    next.push(nh);
+                    if next.len() >= MAX_SENTENCE_HYP {
+                        break 'expand;
+                    }
+                }
+            }
+            hyps = next;
+        }
+
+        hyps.iter()
+            .map(|idxs| {
+                let surface: String = idxs
+                    .iter()
+                    .zip(segments)
+                    .map(|(&j, (_r, c))| c[j].as_str())
+                    .collect();
+                let prior: f64 = idxs
+                    .iter()
+                    .zip(segments)
+                    .map(|(&j, (reading, c))| {
+                        let rank_base = 1.0 - (j as f64 / c.len().max(1) as f64) * 0.3;
+                        let kana_pen = if &c[j] == reading && c.len() > 1 {
+                            KANA_PENALTY
+                        } else {
+                            0.0
+                        };
+                        rank_base - kana_pen
+                    })
+                    .sum::<f64>()
+                    / idxs.len() as f64;
+                let llm = score(committed_context, &surface);
+                (idxs.clone(), prior * PRIOR_WEIGHT + llm * LLM_WEIGHT)
+            })
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(idxs, _)| idxs)
+            .unwrap_or_default()
     }
 
     /// Compute effective score combining dictionary frequency, user learning,
@@ -1497,6 +1611,47 @@ mod tests {
     /// must get the neutral LLM score so a model that over-rates bare kana can't
     /// promote it, while kanji forms keep the model's real score. Deliberate
     /// user learning is applied separately in the combine and stays unaffected.
+    /// Hermetic guard for sentence N-best (theme B): a right-side disambiguator
+    /// must be able to flip an earlier segment's choice, which greedy left-to-
+    /// right scoring cannot do. Uses a deterministic scorer that only rates the
+    /// full sentence "橋を渡る" highly.
+    #[test]
+    fn sentence_rescore_uses_right_context() {
+        let segments = vec![
+            ("はし".to_string(), vec!["箸".to_string(), "橋".to_string()]),
+            ("を".to_string(), vec!["を".to_string()]),
+            ("わたる".to_string(), vec!["渡る".to_string()]),
+        ];
+        // Only the intended whole sentence scores high; everything else is low.
+        let score = |_ctx: &str, surface: &str| {
+            if surface == "橋を渡る" { 0.95 } else { 0.10 }
+        };
+        let winners = ConversionEngine::sentence_rescore("", &segments, score);
+        // Segment 0 should flip from 箸 (index 0) to 橋 (index 1).
+        assert_eq!(winners[0], 1, "right-context should select 橋");
+        let sentence: String = winners
+            .iter()
+            .zip(&segments)
+            .map(|(&j, (_r, c))| c[j].clone())
+            .collect::<String>();
+        assert_eq!(sentence, "橋を渡る");
+    }
+
+    /// The greedy (all-zeros) hypothesis must win when no other whole sentence
+    /// scores higher — sentence_rescore never moves a result gratuitously.
+    #[test]
+    fn sentence_rescore_keeps_greedy_when_no_better() {
+        let segments = vec![
+            ("はし".to_string(), vec!["箸".to_string(), "橋".to_string()]),
+            ("を".to_string(), vec!["を".to_string()]),
+            ("つかう".to_string(), vec!["使う".to_string()]),
+        ];
+        let score = |_ctx: &str, _surface: &str| 0.5; // model has no opinion
+        let winners = ConversionEngine::sentence_rescore("", &segments, score);
+        // Prior favors index 0 everywhere; nothing should move.
+        assert_eq!(winners[0], 0);
+    }
+
     #[test]
     fn rerank_neutralizes_plain_kana_llm_score() {
         // A scorer that loves bare kana (the real failure mode).
@@ -1509,6 +1664,150 @@ mod tests {
         // Kanji form → the model's real score is used.
         let kanji = ConversionEngine::rerank_llm_score("はし", "橋", || kana_loving("橋"));
         assert_eq!(kanji, 0.9);
+    }
+
+    /// Sentence N-best experiment (theme B): does scoring *whole sentences*
+    /// with the LLM beat the current greedy left-to-right per-segment rerank?
+    ///
+    /// The greedy rerank only ever sees LEFT context, so it cannot use a
+    /// disambiguator that appears AFTER the ambiguous segment (はしをわたる →
+    /// 橋, はしをつかう → 箸 — both decided by the verb to the right of はし).
+    /// This probe segments each input, builds per-segment candidates like
+    /// build_segment_states, then compares:
+    ///   - greedy: production left-to-right combine (left context only)
+    ///   - nbest:  enumerate top-K^S full sentences (capped), score each whole
+    ///             sentence with one LLM call, pick the best.
+    ///
+    /// Ignored by default (needs a running llama-server):
+    ///   cargo test --lib engine -- --ignored --nocapture sentence_nbest
+    #[test]
+    #[ignore]
+    fn sentence_nbest_probe() {
+        use crate::core::llm::{HttpLlamaScorer, LlmScorer};
+
+        let scorer = match HttpLlamaScorer::from_default_endpoint() {
+            Some(s) => s,
+            None => {
+                eprintln!("no llama-server reachable; skipping");
+                return;
+            }
+        };
+        let dict = Dictionary::new();
+        let user = UserScorer::new();
+
+        // (kana input, expected surface) — disambiguator is to the RIGHT.
+        let cases = [
+            ("はしをわたる", "橋を渡る"),
+            ("はしをつかう", "箸を使う"),
+            ("あめがふる", "雨が降る"),
+            ("あめをなめる", "飴をなめる"),
+            ("かみをきる", "髪を切る"),
+            ("かみにいのる", "神に祈る"),
+        ];
+
+        // Build the per-segment candidate list exactly like build_segment_states.
+        let build_cands = |reading: &str, entries: &[&DictionaryEntry]| -> Vec<String> {
+            let mut sorted: Vec<&&DictionaryEntry> = entries.iter().collect();
+            sorted.sort_by(|a, b| {
+                let sa = ConversionEngine::effective_score_with(&user, reading, a);
+                let sb = ConversionEngine::effective_score_with(&user, reading, b);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut cands: Vec<String> = sorted.iter().map(|e| e.surface.clone()).collect();
+            if cands.is_empty() || !cands.contains(&reading.to_string()) {
+                let kana_score = user.score(reading, reading) * 2.0 + 0.1;
+                let pos = sorted
+                    .iter()
+                    .position(|e| {
+                        ConversionEngine::effective_score_with(&user, reading, e) < kana_score
+                    })
+                    .unwrap_or(cands.len());
+                cands.insert(pos, reading.to_string());
+            }
+            cands
+        };
+
+        println!("\n=== sentence N-best experiment ===");
+        let mut greedy_ok = 0;
+        let mut nbest_ok = 0;
+        let mut nbest_regressed = 0;
+        let probe_start = std::time::Instant::now();
+        for (kana, expected) in cases {
+            let segs = dict.segment(kana);
+            let seg_cands: Vec<Vec<String>> = segs
+                .iter()
+                .map(|s| {
+                    let refs: Vec<&DictionaryEntry> = s.candidates.iter().collect();
+                    build_cands(&s.reading, &refs)
+                })
+                .collect();
+
+            // --- greedy (production-style, left context only) ---
+            let mut preceding = String::new();
+            let mut greedy_pick: Vec<String> = Vec::new();
+            for (seg, cands) in segs.iter().zip(&seg_cands) {
+                if cands.len() > 1 && seg.reading.chars().count() >= 2 {
+                    let n = cands.len().min(5);
+                    let best = (0..n)
+                        .map(|i| {
+                            let surface = &cands[i];
+                            let llm = ConversionEngine::rerank_llm_score(
+                                &seg.reading,
+                                surface,
+                                || scorer.score(&preceding, surface),
+                            );
+                            let rank_base = 1.0 - (i as f64 / n as f64) * 0.3;
+                            (surface.clone(), rank_base * 0.4 + llm * 0.6)
+                        })
+                        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                        .map(|(s, _)| s)
+                        .unwrap();
+                    preceding.push_str(&best);
+                    greedy_pick.push(best);
+                } else {
+                    preceding.push_str(&cands[0]);
+                    greedy_pick.push(cands[0].clone());
+                }
+            }
+            let greedy: String = greedy_pick.concat();
+
+            // --- sentence N-best: the shipped production helper ---
+            let nbest_segs: Vec<(String, Vec<String>)> = segs
+                .iter()
+                .map(|s| s.reading.clone())
+                .zip(seg_cands.iter().cloned())
+                .collect();
+            let winners = ConversionEngine::sentence_rescore(
+                "",
+                &nbest_segs,
+                |ctx, surface| scorer.score(ctx, surface),
+            );
+            let nbest: String = winners
+                .iter()
+                .zip(&seg_cands)
+                .map(|(&j, c)| c[j].clone())
+                .collect();
+
+            let g = greedy == expected;
+            let n = nbest == expected;
+            greedy_ok += g as usize;
+            nbest_ok += n as usize;
+            if g && !n {
+                nbest_regressed += 1;
+            }
+            println!(
+                "  {kana} (want {expected}): greedy={greedy} [{}] | nbest={nbest} [{}]",
+                if g { "OK" } else { "MISS" },
+                if n { "OK" } else { "MISS" },
+            );
+        }
+        let elapsed = probe_start.elapsed();
+        println!(
+            "  ---\n  greedy {greedy_ok}/{n} | nbest {nbest_ok}/{n} | regressions {nbest_regressed} | {:.1}s total ({:.0}ms/case avg)",
+            elapsed.as_secs_f64(),
+            elapsed.as_millis() as f64 / cases.len() as f64,
+            n = cases.len(),
+        );
     }
 
     #[test]
