@@ -182,10 +182,22 @@ impl SharedCore {
                     }
                 }
 
+                // Unit tests must be hermetic: ConversionEngine::new() reaches
+                // this global core, and binding it to a live llama-server makes
+                // ranking-order tests depend on the server's model and the
+                // background rerank's timing (flaky under parallel load). Use
+                // the deterministic MockScorer in test builds; the #[ignore]
+                // integration tests construct their own HttpLlamaScorer.
+                let llm = if cfg!(test) {
+                    LlmEngine::with_scorer(Box::new(crate::core::llm::MockScorer))
+                } else {
+                    LlmEngine::new()
+                };
+
                 Arc::new(SharedCore {
                     dictionary: RwLock::new(dictionary),
                     grammar: GrammarEngine::new(),
-                    llm: Mutex::new(LlmEngine::new()),
+                    llm: Mutex::new(llm),
                     user_scorer: Mutex::new(user_scorer),
                     store,
                 })
@@ -1233,6 +1245,107 @@ pub struct ConversionCandidate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Learning-curve experiment: for each homophone case, how many user
+    /// selections N does it take before the final (dict + user + LLM) ranking
+    /// puts the correct surface on top?
+    ///
+    /// Ignored by default (needs a running llama-server). Run against either
+    /// model:
+    ///   cargo test --lib engine -- --ignored --nocapture learning_curve
+    ///   BONOLITH_LLM_ENDPOINT=http://127.0.0.1:8081 cargo test --lib engine \
+    ///       -- --ignored --nocapture learning_curve
+    ///
+    /// The combine mirrors production: candidates are ordered by
+    /// effective_score (freq + user*2 + surface_adj), then the top
+    /// LLM_RERANK_TOP_N are reranked by `rank_base*0.4 + llm*0.6`. The LLM
+    /// score is independent of N, so it's fetched once per surface and cached;
+    /// only the effective-score ordering (hence rank_base) moves as N grows.
+    #[test]
+    #[ignore]
+    fn learning_curve() {
+        use crate::core::llm::{HttpLlamaScorer, LlmScorer};
+
+        let scorer = match HttpLlamaScorer::from_default_endpoint() {
+            Some(s) => s,
+            None => {
+                eprintln!("no llama-server reachable; skipping");
+                return;
+            }
+        };
+        let dict = Dictionary::new();
+
+        // (preceding context, reading, correct surface)
+        let cases = [
+            ("ご飯を食べるための", "はし", "箸"),
+            ("川にかかった", "はし", "橋"),
+            ("工場の最新の", "きかい", "機械"),
+            ("またとない", "きかい", "機会"),
+            ("空から降ってくる", "あめ", "雨"),
+            ("甘くておいしい", "あめ", "飴"),
+            ("神社にお参りして", "かみ", "神"),
+            ("夏はとても", "あつい", "暑い"),
+            ("やかんのお湯が", "あつい", "熱い"),
+            ("時間どおり", "せいかく", "正確"),
+        ];
+
+        const MAX_N: u32 = 20;
+        let endpoint =
+            std::env::var("BONOLITH_LLM_ENDPOINT").unwrap_or_else(|_| "default(8080)".into());
+        println!("\n=== learning curve (endpoint={endpoint}) ===");
+
+        for (ctx, reading, correct) in cases {
+            let entries = dict.lookup(reading);
+            if !entries.iter().any(|e| e.surface == correct) {
+                println!("  {reading} -> {correct}: NOT IN DICT (skipped)");
+                continue;
+            }
+
+            // Cache the (N-independent) LLM score per surface once.
+            let llm: std::collections::HashMap<String, f64> = entries
+                .iter()
+                .map(|e| (e.surface.clone(), scorer.score(ctx, &e.surface)))
+                .collect();
+
+            // Winner of the production-style combine for a given learned count.
+            let winner_at = |n: u32| -> String {
+                let mut user = UserScorer::new();
+                for _ in 0..n {
+                    user.record(reading, correct);
+                }
+                let mut ranked: Vec<&&DictionaryEntry> = entries.iter().collect();
+                ranked.sort_by(|a, b| {
+                    let sa = ConversionEngine::effective_score_with(&user, reading, a);
+                    let sb = ConversionEngine::effective_score_with(&user, reading, b);
+                    sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let rerank_count = ranked.len().min(5);
+                ranked[..rerank_count]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| {
+                        let rank_base = 1.0 - (i as f64 / rerank_count as f64) * 0.3;
+                        let combined = rank_base * 0.4 + llm[&e.surface] * 0.6;
+                        (e.surface.clone(), combined)
+                    })
+                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(s, _)| s)
+                    .unwrap_or_default()
+            };
+
+            let flip = (0..=MAX_N).find(|&n| winner_at(n) == correct);
+            let n0 = winner_at(0);
+            match flip {
+                Some(0) => println!("  {reading} -> {correct}: ✓ correct at N=0 (no learning needed)"),
+                Some(n) => println!(
+                    "  {reading} -> {correct}: flips at N={n} (N=0 winner was {n0})"
+                ),
+                None => println!(
+                    "  {reading} -> {correct}: never wins within N={MAX_N} (stuck on {n0})"
+                ),
+            }
+        }
+    }
 
     #[test]
     fn process_key_buffering() {
