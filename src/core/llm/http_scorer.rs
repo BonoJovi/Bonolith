@@ -34,11 +34,44 @@ struct CompletionRequest {
     n_predict: u32,
     temperature: f64,
     cache_prompt: bool,
+    /// GBNF grammar. When set to a single-literal rule, it teacher-forces the
+    /// model to emit exactly that string so we can read the per-token logprob
+    /// of the candidate surface. Empty string = unconstrained (warm-up only).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    grammar: String,
+    /// Number of top token probabilities to return. Must be >= 1 for the
+    /// server to populate `completion_probabilities`.
+    n_probs: u32,
 }
 
 #[derive(Deserialize)]
 struct CompletionResponse {
-    content: String,
+    /// Per-emitted-token info. With a grammar forcing the candidate string,
+    /// each entry's `logprob` is the model's log P(token | context + prefix).
+    #[serde(default)]
+    completion_probabilities: Vec<TokenLogprob>,
+}
+
+#[derive(Deserialize)]
+struct TokenLogprob {
+    logprob: f64,
+}
+
+/// Escape a string into a GBNF double-quoted literal body.
+fn gbnf_string_literal(s: &str) -> String {
+    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("root ::= \"{}\"", escaped)
+}
+
+/// Map a mean per-token log-probability to the 0.3–0.9 scoring band used by
+/// the reranker. Typical contextual surfaces score around -5..-7; unlikely
+/// ones fall to -11 or worse. We keep the same band the previous heuristic
+/// used so the reranker's score-blend weights stay calibrated.
+fn logprob_to_score(avg_logprob: f64) -> f64 {
+    const LO: f64 = -12.0; // → 0.3
+    const HI: f64 = -4.0; // → 0.9
+    let t = ((avg_logprob - LO) / (HI - LO)).clamp(0.0, 1.0);
+    0.3 + t * 0.6
 }
 
 impl HttpLlamaScorer {
@@ -93,9 +126,14 @@ impl HttpLlamaScorer {
         Self::new(&endpoint)
     }
 
-    /// Score using generation-based approach:
-    /// Generate a completion from context, then measure character overlap with candidate.
-    fn score_by_generation(&self, context: &str, candidate: &str) -> f64 {
+    /// Score a candidate by its contextual log-probability.
+    ///
+    /// Sends the context as the prompt and a GBNF grammar that forces the model
+    /// to emit exactly `candidate`, then reads back the per-token logprobs the
+    /// server reports. Their mean is log P(candidate | context) per token — a
+    /// genuine semantic signal that can disambiguate homophones (箸/橋/端,
+    /// 機械/機会) the dictionary + connection-cost layer cannot.
+    fn score_by_logprob(&self, context: &str, candidate: &str) -> f64 {
         // Fast-fail: once the server has been observed unreachable
         // (e.g., user ran `bonolith llm off` mid-session), skip the HTTP
         // round-trip entirely and return the neutral score so we
@@ -103,15 +141,22 @@ impl HttpLlamaScorer {
         if self.warned.load(Ordering::Relaxed) {
             return 0.5;
         }
+        if candidate.is_empty() {
+            return 0.5;
+        }
 
         let url = format!("{}/completion", self.endpoint);
-        let n_predict = (candidate.chars().count() as u32 + 5).min(30);
+        // The grammar stops generation once the literal is complete; this is
+        // just an upper bound. Kanji can take >1 token each, so budget room.
+        let n_predict = (candidate.chars().count() as u32 * 3 + 4).min(48);
 
         let req = CompletionRequest {
             prompt: context.to_string(),
             n_predict,
             temperature: 0.0,
             cache_prompt: true,
+            grammar: gbnf_string_literal(candidate),
+            n_probs: 1,
         };
 
         let resp = match self.agent.post(&url).send_json(&req) {
@@ -134,35 +179,23 @@ impl HttpLlamaScorer {
             }
         };
 
-        let generated = &body.content;
-        if generated.is_empty() {
+        let probs = &body.completion_probabilities;
+        if probs.is_empty() {
+            // Server didn't return per-token probs (n_probs unsupported);
+            // fall back to neutral so we neither help nor hurt the ranking.
             return 0.5;
         }
 
-        // Score: how well does the candidate match the generated continuation?
-        let candidate_chars: Vec<char> = candidate.chars().collect();
-        let generated_chars: Vec<char> = generated.chars().collect();
+        let sum: f64 = probs.iter().map(|p| p.logprob).sum();
+        let avg = sum / probs.len() as f64;
+        let score = logprob_to_score(avg);
 
-        if candidate_chars.is_empty() {
-            return 0.5;
-        }
-
-        // Count matching characters from the start
-        let match_len = candidate_chars
-            .iter()
-            .zip(generated_chars.iter())
-            .take_while(|(a, b)| a == b)
-            .count();
-
-        let match_ratio = match_len as f64 / candidate_chars.len() as f64;
-
-        // Map to 0.3–0.9 range (never fully dominate or suppress)
-        let score = 0.3 + match_ratio * 0.6;
-
-        let gen_preview: String = generated.chars().take(20).collect();
         debug!(
-            "HttpLlamaScorer: candidate='{}' generated='{}' match={}/{} score={:.3}",
-            candidate, gen_preview, match_len, candidate_chars.len(), score,
+            "HttpLlamaScorer: candidate='{}' ntok={} avg_logprob={:.3} score={:.3}",
+            candidate,
+            probs.len(),
+            avg,
+            score,
         );
 
         score
@@ -171,7 +204,7 @@ impl HttpLlamaScorer {
 
 impl LlmScorer for HttpLlamaScorer {
     fn score(&self, context: &str, candidate: &str) -> f64 {
-        self.score_by_generation(context, candidate)
+        self.score_by_logprob(context, candidate)
     }
 
     fn warm_cache(&self, context: &str) {
@@ -185,11 +218,71 @@ impl LlmScorer for HttpLlamaScorer {
             n_predict: 0,
             temperature: 0.0,
             cache_prompt: true,
+            grammar: String::new(),
+            n_probs: 0,
         };
         if let Err(e) = self.agent.post(&url).send_json(&req) {
             if !self.warned.swap(true, Ordering::Relaxed) {
                 warn!("HttpLlamaScorer: warm_cache failed: {}", e);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gbnf_literal_wraps_and_escapes() {
+        assert_eq!(gbnf_string_literal("箸"), "root ::= \"箸\"");
+        // Backslashes and quotes must be escaped so the grammar stays valid.
+        assert_eq!(gbnf_string_literal("a\"b\\c"), "root ::= \"a\\\"b\\\\c\"");
+    }
+
+    #[test]
+    fn logprob_score_is_monotonic_and_banded() {
+        // Higher (less negative) log-prob → higher score.
+        assert!(logprob_to_score(-4.0) > logprob_to_score(-8.0));
+        assert!(logprob_to_score(-8.0) > logprob_to_score(-12.0));
+        // Clamped to the 0.3–0.9 band at the extremes.
+        assert!((logprob_to_score(0.0) - 0.9).abs() < 1e-9);
+        assert!((logprob_to_score(-100.0) - 0.3).abs() < 1e-9);
+    }
+
+    /// Live homophone discrimination against a running llama-server.
+    /// Ignored by default (needs the server); run with:
+    ///   cargo test --lib http_scorer -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_homophone_discrimination() {
+        let scorer = match HttpLlamaScorer::from_default_endpoint() {
+            Some(s) => s,
+            None => {
+                eprintln!("no llama-server reachable; skipping");
+                return;
+            }
+        };
+        // (context, correct surface, competing surface)
+        let cases = [
+            ("ご飯を食べるための", "箸", "橋"),
+            ("川にかかった", "橋", "箸"),
+            ("工場の", "機械", "機会"),
+            ("またとない", "機会", "機械"),
+            ("労働組合と会社が", "交渉", "高尚"),
+        ];
+        let mut correct = 0;
+        for (ctx, good, bad) in cases {
+            let sg = scorer.score(ctx, good);
+            let sb = scorer.score(ctx, bad);
+            let ok = sg > sb;
+            correct += ok as usize;
+            println!(
+                "ctx={ctx:?} {good}={sg:.3} {bad}={sb:.3} -> {}",
+                if ok { "OK" } else { "MISS" }
+            );
+        }
+        // The 0.5B model isn't perfect, but it should clear a clear majority.
+        assert!(correct >= 4, "only {correct}/5 homophone cases correct");
     }
 }
