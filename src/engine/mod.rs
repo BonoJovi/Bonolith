@@ -205,26 +205,31 @@ impl SharedCore {
             .clone()
     }
 
-    /// Build a fresh, isolated core for hermetic evaluation harnesses.
+    /// Build a fresh, isolated core for evaluation harnesses, wired to a
+    /// specific LLM scorer.
     ///
-    /// Unlike [`global`], this does not touch the process-wide singleton, the
-    /// user's SQLite store, or any live llama-server: it pairs the embedded
-    /// dictionary/grammar with an empty [`UserScorer`] (no learned history) and
-    /// the deterministic [`MockScorer`]. This makes conversion-quality results
-    /// reproducible across machines and CI, while still exercising the real
-    /// production pipeline (`start_conversion` → `trigger_llm_rerank` →
-    /// `apply_llm_rerank`). The `#[ignore]` live-quality tests construct their
-    /// own core wired to an HttpLlamaScorer instead.
-    pub fn new_hermetic() -> Arc<SharedCore> {
+    /// Unlike [`global`], this does not touch the process-wide singleton or the
+    /// user's SQLite store: it pairs the embedded dictionary/grammar with an
+    /// empty [`UserScorer`] (no learned history), while still exercising the
+    /// real production pipeline (`start_conversion` → `trigger_llm_rerank` →
+    /// `apply_llm_rerank`). The scorer is the only moving part, so the hermetic
+    /// and live conversion-quality layers differ only in what they pass here.
+    pub fn new_eval(scorer: Box<dyn crate::core::llm::LlmScorer>) -> Arc<SharedCore> {
         Arc::new(SharedCore {
             dictionary: RwLock::new(Dictionary::new()),
             grammar: GrammarEngine::new(),
-            llm: Mutex::new(LlmEngine::with_scorer(Box::new(
-                crate::core::llm::MockScorer,
-            ))),
+            llm: Mutex::new(LlmEngine::with_scorer(scorer)),
             user_scorer: Mutex::new(UserScorer::new()),
             store: None,
         })
+    }
+
+    /// Hermetic evaluation core: [`new_eval`] wired to the deterministic
+    /// [`MockScorer`]. No llama-server, reproducible across machines and CI.
+    /// The `#[ignore]` live-quality tests call [`new_eval`] with an
+    /// `HttpLlamaScorer` instead.
+    pub fn new_hermetic() -> Arc<SharedCore> {
+        Self::new_eval(Box::new(crate::core::llm::MockScorer))
     }
 }
 

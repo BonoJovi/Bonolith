@@ -299,28 +299,45 @@ impl Top1Stats {
     }
 }
 
-#[test]
-fn evaluate_top1_accuracy() {
-    let cases = load_cases();
-    let shared = SharedCore::new_hermetic();
+fn pct(num: u32, den: u32) -> f64 {
+    if den == 0 {
+        0.0
+    } else {
+        100.0 * num as f64 / den as f64
+    }
+}
 
-    let pct = |num: u32, den: u32| -> f64 {
-        if den == 0 {
-            0.0
-        } else {
-            100.0 * num as f64 / den as f64
-        }
+/// Aggregated scorecard for one suite run.
+struct Scorecard {
+    overall: Top1Stats,
+    by_pos: std::collections::BTreeMap<String, Top1Stats>,
+    by_cat: std::collections::BTreeMap<String, Top1Stats>,
+    /// `(id, want, got)` for every case that missed top-1 exact.
+    misses: Vec<(String, String, String)>,
+}
+
+impl Scorecard {
+    fn bucket(&self, by_pos: &str) -> Top1Stats {
+        self.by_pos.get(by_pos).copied().unwrap_or_default()
+    }
+}
+
+/// Drive the full conversion pipeline over every case against `shared`,
+/// printing a per-case line and bucketed scorecard. The only difference
+/// between the hermetic and live layers is the scorer wired into `shared`.
+fn run_top1_suite(shared: &std::sync::Arc<SharedCore>, label: &str) -> Scorecard {
+    let cases = load_cases();
+    let mut card = Scorecard {
+        overall: Top1Stats::default(),
+        by_pos: std::collections::BTreeMap::new(),
+        by_cat: std::collections::BTreeMap::new(),
+        misses: Vec::new(),
     };
 
-    let mut overall = Top1Stats::default();
-    let mut by_pos: std::collections::BTreeMap<String, Top1Stats> = std::collections::BTreeMap::new();
-    let mut by_cat: std::collections::BTreeMap<String, Top1Stats> = std::collections::BTreeMap::new();
-    let mut yes_failures: Vec<String> = Vec::new();
-
-    eprintln!("\n=== Top-1 conversion accuracy (hermetic: MockScorer, no learning) ===");
+    eprintln!("\n=== Top-1 conversion accuracy ({label}) ===");
     for case in &cases {
         let want: String = case.expected.concat();
-        let got = convert_top1(&shared, &case.input_hiragana);
+        let got = convert_top1(shared, &case.input_hiragana);
         let exact = got == want;
 
         // Phrase recall: expected surfaces present (in order) as the output is
@@ -335,18 +352,18 @@ fn evaluate_top1_accuracy() {
         }
         let phrase_total = case.expected.len() as u32;
 
-        overall.record(exact, phrase_hit, phrase_total);
-        by_pos
+        card.overall.record(exact, phrase_hit, phrase_total);
+        card.by_pos
             .entry(case.pos_solvable.clone())
             .or_default()
             .record(exact, phrase_hit, phrase_total);
-        by_cat
+        card.by_cat
             .entry(case.category.clone())
             .or_default()
             .record(exact, phrase_hit, phrase_total);
-
-        if !exact && case.pos_solvable == "yes" {
-            yes_failures.push(format!("{} {:?} -> got {:?}", case.id, want, got));
+        if !exact {
+            card.misses
+                .push((case.id.clone(), want.clone(), got.clone()));
         }
 
         let tag = if exact { "OK  " } else { "MISS" };
@@ -359,15 +376,15 @@ fn evaluate_top1_accuracy() {
     eprintln!("\n=== Summary ===");
     eprintln!(
         "Top-1 exact:    {}/{} ({:.1}%)   [full-sentence surface == expected]",
-        overall.exact,
-        overall.total,
-        pct(overall.exact, overall.total),
+        card.overall.exact,
+        card.overall.total,
+        pct(card.overall.exact, card.overall.total),
     );
     eprintln!(
         "Phrase recall:  {}/{} ({:.1}%)   [expected phrases present in order]",
-        overall.phrase_hit,
-        overall.phrase_total,
-        pct(overall.phrase_hit, overall.phrase_total),
+        card.overall.phrase_hit,
+        card.overall.phrase_total,
+        pct(card.overall.phrase_hit, card.overall.phrase_total),
     );
 
     let print_bucket = |title: &str, m: &std::collections::BTreeMap<String, Top1Stats>| {
@@ -386,14 +403,23 @@ fn evaluate_top1_accuracy() {
             );
         }
     };
-    print_bucket("pos_solvable", &by_pos);
-    print_bucket("category", &by_cat);
+    print_bucket("pos_solvable", &card.by_pos);
+    print_bucket("category", &card.by_cat);
+
+    card
+}
+
+/// Hermetic layer (CI gate): the deterministic MockScorer measures
+/// dictionary + POS quality with no llama-server and no learned history.
+#[test]
+fn evaluate_top1_accuracy() {
+    let shared = SharedCore::new_hermetic();
+    let card = run_top1_suite(&shared, "hermetic: MockScorer, no learning");
 
     // Gate: the `yes` bucket is the POS/dictionary-solvable set — it must not
-    // regress. `partial`/`no` lean on the real LLM and are tracked in the live
-    // layer, so they are informational here. Threshold is calibrated to the
-    // current hermetic baseline; tighten it as dictionary/POS quality improves.
-    let yes = by_pos.get("yes").copied().unwrap_or_default();
+    // regress. `partial`/`no` lean on the real LLM and are measured in the live
+    // layer, so they are informational here.
+    let yes = card.bucket("yes");
     // Baseline 2026-06-21: yes=7/13 (53.8%). Floor just below it, so any
     // single-case regression in the solvable bucket (→ 6/13 = 46.2%) trips CI.
     // Raise as dictionary/POS quality improves.
@@ -403,16 +429,54 @@ fn evaluate_top1_accuracy() {
         "\nGate: pos_solvable=yes top-1 = {:.1}% (floor {:.1}%)",
         yes_pct, YES_GATE_PCT,
     );
-    if !yes_failures.is_empty() {
-        eprintln!("yes-bucket misses:");
-        for f in &yes_failures {
-            eprintln!("  {}", f);
-        }
-    }
     assert!(
         yes_pct >= YES_GATE_PCT,
         "pos_solvable=yes top-1 accuracy {:.1}% fell below floor {:.1}%",
         yes_pct,
         YES_GATE_PCT,
     );
+}
+
+/// Live layer (informational, needs a running llama-server): the real
+/// HttpLlamaScorer measures semantic disambiguation — the `partial`/`no`
+/// buckets (はし/きしゃ/公開 …) that MockScorer cannot solve. Not a CI gate:
+/// the score depends on the served model, so it reports rather than asserts.
+///
+/// Run with a server up:
+///   cargo test --test conversion_quality -- --ignored --nocapture live
+#[test]
+#[ignore]
+fn evaluate_top1_accuracy_live() {
+    use bonolith::core::llm::HttpLlamaScorer;
+
+    let scorer = match HttpLlamaScorer::from_default_endpoint() {
+        Some(s) => s,
+        None => {
+            eprintln!("no llama-server reachable; skipping live conversion-quality suite");
+            return;
+        }
+    };
+    let shared = SharedCore::new_eval(Box::new(scorer));
+    let card = run_top1_suite(&shared, "live: HttpLlamaScorer");
+
+    // The live layer earns its keep on the semantic buckets the hermetic layer
+    // must skip. Surface those numbers explicitly so a model/endpoint change is
+    // easy to spot, then list every miss for inspection.
+    let partial = card.bucket("partial");
+    let no = card.bucket("no");
+    eprintln!(
+        "\nSemantic buckets (LLM-dependent): partial {}/{} ({:.1}%)  no {}/{} ({:.1}%)",
+        partial.exact,
+        partial.total,
+        pct(partial.exact, partial.total),
+        no.exact,
+        no.total,
+        pct(no.exact, no.total),
+    );
+    if !card.misses.is_empty() {
+        eprintln!("misses:");
+        for (id, want, got) in &card.misses {
+            eprintln!("  {} want={:?} got={:?}", id, want, got);
+        }
+    }
 }
