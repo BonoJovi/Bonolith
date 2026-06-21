@@ -92,6 +92,22 @@ echo "=============="
 # children, but they can outlive a daemon TERM and keep running
 # the previous binary).
 echo "[1/4] Stopping services..."
+# Snapshot the GNOME input-source list *before* we touch IBus. On GNOME,
+# restarting ibus-daemon while bonolith is momentarily absent from the engine
+# registry makes gnome-shell prune it from org.gnome.desktop.input-sources —
+# so even an IBus->IBus in-place upgrade silently drops Bonolith from the
+# input sources. We rebuild the registry cache before the restart (step 2) to
+# avoid the race, and restore this snapshot afterwards (step 4) as a belt-and-
+# suspenders safety net.
+PREV_SOURCES=""
+HAD_BONOLITH=0
+if command -v gsettings >/dev/null 2>&1; then
+    PREV_SOURCES="$(gsettings get org.gnome.desktop.input-sources sources 2>/dev/null || true)"
+    case "$PREV_SOURCES" in
+        *"'bonolith'"*) HAD_BONOLITH=1 ;;
+    esac
+fi
+
 systemctl --user stop bonolith-llm-server.service >/dev/null 2>&1 || true
 sudo pkill -TERM -x ibus-daemon >/dev/null 2>&1 || true
 pkill -TERM -f /usr/bin/ibus-engine-bonolith >/dev/null 2>&1 || true
@@ -152,6 +168,13 @@ sudo install -D -m 644 fcitx5/bonolith-addon.conf      /usr/share/fcitx5/addon/b
 sudo install -D -m 644 fcitx5/bonolith-im.conf         /usr/share/fcitx5/inputmethod/bonolith.conf
 sudo install -D -m 755 scripts/bonolith_word_register.py /usr/share/bonolith/scripts/bonolith_word_register.py
 
+# 2b. Rebuild the IBus registry cache now that the new component is in place,
+# so the daemon serves bonolith the instant it restarts instead of racing a
+# rebuild while gnome-shell queries engines (and prunes the "unknown" source).
+# Standalone tool; needs no running daemon. Writes the user cache under
+# ~/.cache/ibus/, so run it unprivileged (not via sudo).
+ibus write-cache >/dev/null 2>&1 || true
+
 # 3. User-level systemd unit. The unit's ExecStartPre handles the
 # llama.cpp ggml-backend symlink dance.
 echo "[3/4] Installing user systemd unit..."
@@ -192,6 +215,22 @@ setsid -f ibus-daemon -drx </dev/null >/dev/null 2>&1 || true
 
 if [ -f "$HOME/.config/fcitx5/profile" ]; then
     setsid -f fcitx5 -d </dev/null >/dev/null 2>&1 || true
+fi
+
+# Safety net for the GNOME input-source prune: if Bonolith was a configured
+# input source before the upgrade but got dropped during the IBus restart,
+# put the saved list back. Give gnome-shell a moment to reconcile after the
+# daemon comes up, then restore only when bonolith actually went missing.
+if [ "$HAD_BONOLITH" -eq 1 ] && command -v gsettings >/dev/null 2>&1; then
+    sleep 2
+    NOW_SOURCES="$(gsettings get org.gnome.desktop.input-sources sources 2>/dev/null || true)"
+    case "$NOW_SOURCES" in
+        *"'bonolith'"*) : ;; # survived the restart — nothing to do
+        *)
+            echo "  Restoring Bonolith input source (GNOME pruned it on restart)..."
+            gsettings set org.gnome.desktop.input-sources sources "$PREV_SOURCES" 2>/dev/null || true
+            ;;
+    esac
 fi
 
 # Daemons we just spawned (or the systemctl/dbus calls above) can
