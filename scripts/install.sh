@@ -108,6 +108,18 @@ if command -v gsettings >/dev/null 2>&1; then
     esac
 fi
 
+# Record which IM framework was actually running *before* we stop anything,
+# so step 4 brings back only what the user was using. Restarting fcitx5
+# merely because a stale ~/.config/fcitx5/profile exists is wrong: an IBus
+# user who tried Fcitx5 once still has that file, and starting fcitx5
+# alongside the restarted ibus-daemon leaves two frameworks contending for
+# the session (fcitx5 typically wins, hijacking input from an IBus user).
+# Gate the restarts on live process state instead.
+IBUS_WAS_RUNNING=0
+FCITX5_WAS_RUNNING=0
+pgrep -x ibus-daemon >/dev/null 2>&1 && IBUS_WAS_RUNNING=1
+pgrep -x fcitx5      >/dev/null 2>&1 && FCITX5_WAS_RUNNING=1
+
 systemctl --user stop bonolith-llm-server.service >/dev/null 2>&1 || true
 sudo pkill -TERM -x ibus-daemon >/dev/null 2>&1 || true
 pkill -TERM -f /usr/bin/ibus-engine-bonolith >/dev/null 2>&1 || true
@@ -207,13 +219,22 @@ else
     systemctl --user enable --now bonolith-llm-server.service >/dev/null 2>&1 || true
 fi
 
-# Detach from the script's controlling TTY so the daemons don't
-# inherit the terminal. setsid -f starts a new session with no
-# controlling TTY; redirecting all three fds keeps the daemon from
-# touching the parent terminal's termios state.
-setsid -f ibus-daemon -drx </dev/null >/dev/null 2>&1 || true
+# Bring back only the framework(s) that were running before the install
+# (captured in step 1). This avoids starting Fcitx5 on top of an IBus-only
+# session, which would let Fcitx5 hijack input from an IBus user. If neither
+# was running (e.g. a fresh first install before any IM is up), default to
+# starting ibus-daemon, since IBus is Bonolith's default framework and the
+# GNOME input-source restore below relies on it.
+#
+# Detach from the script's controlling TTY so the daemons don't inherit the
+# terminal. setsid -f starts a new session with no controlling TTY;
+# redirecting all three fds keeps the daemon from touching the parent
+# terminal's termios state.
+if [ "$IBUS_WAS_RUNNING" -eq 1 ] || { [ "$FCITX5_WAS_RUNNING" -eq 0 ] && [ "$IBUS_WAS_RUNNING" -eq 0 ]; }; then
+    setsid -f ibus-daemon -drx </dev/null >/dev/null 2>&1 || true
+fi
 
-if [ -f "$HOME/.config/fcitx5/profile" ]; then
+if [ "$FCITX5_WAS_RUNNING" -eq 1 ]; then
     setsid -f fcitx5 -d </dev/null >/dev/null 2>&1 || true
 fi
 
