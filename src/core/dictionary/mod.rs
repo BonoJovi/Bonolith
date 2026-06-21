@@ -480,6 +480,65 @@ impl Dictionary {
         segs
     }
 
+    /// Build candidate entries for a reading the user has forced into a single
+    /// segment via a manual boundary resize.
+    ///
+    /// A flat [`lookup`](Self::lookup) returns nothing for a multi-token reading
+    /// such as a particle glued onto a verb ("がふる"), so the segment would
+    /// otherwise collapse to bare kana and could never rerank to the intended
+    /// word. In that case we sub-segment the reading (reusing the DP segmenter +
+    /// affix merge) and return the Cartesian product of each piece's top
+    /// candidates, mirroring [`merge_affix_compounds`](Self::merge_affix_compounds)
+    /// — so the forced segment still surfaces real words (が降る).
+    pub fn candidates_for_unit(&self, reading: &str) -> Vec<DictionaryEntry> {
+        // Real word or known compound — use the dictionary entries directly.
+        let direct: Vec<DictionaryEntry> = self.lookup(reading).into_iter().cloned().collect();
+        if !direct.is_empty() {
+            return direct;
+        }
+
+        // Decompose the multi-token reading and recombine its pieces.
+        let subs = self.segment(reading);
+        if subs.len() < 2 {
+            return direct; // can't decompose further; caller falls back to kana
+        }
+
+        const PER_SEG: usize = 3;
+        const MAX_TOTAL: usize = 12;
+        // Iteratively expand the Cartesian product, keeping the highest-frequency
+        // combinations so the candidate list stays bounded.
+        let mut combos: Vec<(String, u32)> = vec![(String::new(), u32::MAX)];
+        for sub in &subs {
+            let tops: Vec<&DictionaryEntry> = sub.candidates.iter().take(PER_SEG).collect();
+            let mut next: Vec<(String, u32)> = Vec::new();
+            if tops.is_empty() {
+                // No dictionary entry for this piece — carry its kana through.
+                for (acc, freq) in &combos {
+                    next.push((format!("{}{}", acc, sub.reading), *freq));
+                }
+            } else {
+                for (acc, freq) in &combos {
+                    for t in &tops {
+                        next.push((format!("{}{}", acc, t.surface), (*freq).min(t.frequency)));
+                    }
+                }
+            }
+            next.sort_by_key(|(_, freq)| std::cmp::Reverse(*freq));
+            next.truncate(MAX_TOTAL);
+            combos = next;
+        }
+
+        combos
+            .into_iter()
+            .map(|(surface, frequency)| DictionaryEntry {
+                reading: reading.to_string(),
+                surface,
+                pos: PartOfSpeech::Other,
+                frequency,
+            })
+            .collect()
+    }
+
     /// Return a slice of user-added entries.
     pub fn user_entries(&self) -> &[DictionaryEntry] {
         &self.entries[self.user_start..]

@@ -1199,7 +1199,10 @@ impl ConversionEngine {
             None => return,
         };
         let dict = self.shared.dictionary.read().unwrap();
-        let mut entries = dict.lookup(&reading);
+        // Use candidates_for_unit (not a flat lookup) so a manually resized
+        // boundary that glues a particle onto an adjacent word still yields real
+        // word candidates instead of collapsing to bare kana.
+        let mut entries = dict.candidates_for_unit(&reading);
         let user_scorer = self.shared.user_scorer.lock().unwrap();
         entries.sort_by(|a, b| {
             let score_a = Self::effective_score_with(&user_scorer, &reading, a);
@@ -1325,6 +1328,52 @@ pub struct ConversionCandidate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression (hermetic): resizing a segment boundary so a particle is
+    /// glued onto an adjacent word must still surface that word's kanji
+    /// candidate. `relookup_segment` did a flat `dict.lookup` on the
+    /// multi-token reading (e.g. "がふる"), which has no dictionary entry, so
+    /// the segment collapsed to a kana-only candidate and could never rerank
+    /// to the intended word (降る) — unlike the auto path, which rebuilds
+    /// bunsetsu candidates via DP + Cartesian merge. Drives the real engine
+    /// through the resize → relookup path.
+    #[test]
+    fn resize_keeps_word_candidate_when_particle_glued() {
+        fn has_kanji(s: &str) -> bool {
+            s.chars().any(|c| {
+                ('\u{4E00}'..='\u{9FFF}').contains(&c) || ('\u{3400}'..='\u{4DBF}').contains(&c)
+            })
+        }
+
+        let mut engine = ConversionEngine::with_shared(SharedCore::new_hermetic());
+        for ch in "amegafuru".chars() {
+            engine.process_key(ch);
+        }
+        engine.start_conversion();
+        // Default bunsetsu: seg0="あめが", seg1="ふる". Shrink seg0 so its last
+        // char (the particle が) is pushed onto the following verb, leaving the
+        // tail segment with the multi-token reading "がふる".
+        engine.resize_segment(-1);
+        let tail = engine
+            .conversion_state()
+            .unwrap()
+            .segments
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            tail.reading, "がふる",
+            "precondition: particle should be glued onto the trailing verb",
+        );
+        // The particle-glued segment must still offer at least one candidate
+        // carrying the verb's kanji (e.g. が降る) — not just the bare kana.
+        assert!(
+            tail.candidates.iter().any(|c| has_kanji(c)),
+            "particle-glued segment '{}' offered no word candidate: {:?}",
+            tail.reading,
+            tail.candidates,
+        );
+    }
 
     /// Learning regression (hermetic): recording user selections must be able
     /// to promote a non-default but valid surface to top-1 through the *full*
