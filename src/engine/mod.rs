@@ -433,13 +433,24 @@ impl ConversionEngine {
             }
         }
 
-        // Re-lookup candidates for affected segments
+        // Re-lookup candidates for the affected segments. On a shrink, the
+        // following segment passively received the pushed char and may now span
+        // a particle + word (e.g. "がふる"); split it back into separate bunsetsu
+        // so each piece stays independently selectable instead of collapsing
+        // into one inseparable chunk. On an extend the focused segment grew by a
+        // deliberate merge, so it is kept whole.
         self.relookup_segment(focus);
         if focus + 1 < self.conversion.as_ref().unwrap().segments.len() {
-            self.relookup_segment(focus + 1);
+            if delta < 0 {
+                self.relookup_or_split_segment(focus + 1);
+            } else {
+                self.relookup_segment(focus + 1);
+            }
         }
 
-        // Mark resized segments as user-selected
+        // Mark the resized segments as user-selected so they survive reranking.
+        // A split may have replaced segment `focus + 1` with several bunsetsu;
+        // those are already flagged inside relookup_or_split_segment.
         if let Some(state) = self.conversion.as_mut() {
             state.segments[focus].user_selected = true;
             if focus + 1 < state.segments.len() {
@@ -1228,6 +1239,43 @@ impl ConversionEngine {
         }
     }
 
+    /// Re-lookup the segment at `idx`, splitting it into separate bunsetsu when
+    /// a resize has glued a particle onto an adjacent word so its reading now
+    /// spans more than one bunsetsu (e.g. "がふる" = が + 降る). Splitting keeps
+    /// each piece independently selectable instead of fusing them into one
+    /// inseparable chunk. Falls back to a plain in-place relookup when the
+    /// reading is a single bunsetsu (incl. genuine Noun+Particle units like
+    /// "はしを", which the segmenter keeps merged).
+    fn relookup_or_split_segment(&mut self, idx: usize) {
+        let reading = match self.conversion.as_ref() {
+            Some(state) => state.segments[idx].reading.clone(),
+            None => return,
+        };
+        let subs = {
+            let dict = self.shared.dictionary.read().unwrap();
+            dict.segment(&reading)
+        };
+        if subs.len() < 2 {
+            self.relookup_segment(idx);
+            return;
+        }
+        let base_start = match self.conversion.as_ref() {
+            Some(state) => state.segments[idx].start,
+            None => return,
+        };
+        // Build a SegmentState per sub-bunsetsu (mirrors the auto path), shift
+        // each to the glued segment's absolute kana offset, and flag them as
+        // user-edited so the new boundaries survive reranking.
+        let mut new_states = self.build_segment_states(&subs);
+        for st in &mut new_states {
+            st.start += base_start;
+            st.user_selected = true;
+        }
+        if let Some(state) = self.conversion.as_mut() {
+            state.segments.splice(idx..=idx, new_states);
+        }
+    }
+
     /// Build candidate sentences from segmented words.
     /// For each segment, pick the top candidates and combine.
     fn build_candidates(&self, segments: &[Segment]) -> Vec<String> {
@@ -1330,15 +1378,16 @@ mod tests {
     use super::*;
 
     /// Regression (hermetic): resizing a segment boundary so a particle is
-    /// glued onto an adjacent word must still surface that word's kanji
-    /// candidate. `relookup_segment` did a flat `dict.lookup` on the
-    /// multi-token reading (e.g. "がふる"), which has no dictionary entry, so
-    /// the segment collapsed to a kana-only candidate and could never rerank
-    /// to the intended word (降る) — unlike the auto path, which rebuilds
-    /// bunsetsu candidates via DP + Cartesian merge. Drives the real engine
-    /// through the resize → relookup path.
+    /// pushed onto an adjacent word must split the pair back into separate
+    /// bunsetsu, each independently selectable — not fuse them into one
+    /// inseparable chunk. Earlier, `relookup_segment` did a flat `dict.lookup`
+    /// on the multi-token reading (e.g. "がふる"), which collapsed to bare kana
+    /// (fixed in bf15e50 by composing a "が降る" candidate); but that left the
+    /// particle glued onto the verb as a single segment. Now the receiving
+    /// segment is re-segmented into bunsetsu (あめ | が | 降る). Drives the real
+    /// engine through the resize → relookup → split path.
     #[test]
-    fn resize_keeps_word_candidate_when_particle_glued() {
+    fn resize_splits_particle_off_adjacent_word() {
         fn has_kanji(s: &str) -> bool {
             s.chars().any(|c| {
                 ('\u{4E00}'..='\u{9FFF}').contains(&c) || ('\u{3400}'..='\u{4DBF}').contains(&c)
@@ -1351,27 +1400,31 @@ mod tests {
         }
         engine.start_conversion();
         // Default bunsetsu: seg0="あめが", seg1="ふる". Shrink seg0 so its last
-        // char (the particle が) is pushed onto the following verb, leaving the
-        // tail segment with the multi-token reading "がふる".
+        // char (the particle が) is pushed onto the following verb. The glued
+        // reading "がふる" must be split into が | ふる, not kept as one chunk.
         engine.resize_segment(-1);
-        let tail = engine
-            .conversion_state()
-            .unwrap()
-            .segments
-            .last()
-            .unwrap()
-            .clone();
-        assert_eq!(
-            tail.reading, "がふる",
-            "precondition: particle should be glued onto the trailing verb",
-        );
-        // The particle-glued segment must still offer at least one candidate
-        // carrying the verb's kanji (e.g. が降る) — not just the bare kana.
+        let segs = engine.conversion_state().unwrap().segments.clone();
+
+        // No segment should carry the fused multi-token reading.
         assert!(
-            tail.candidates.iter().any(|c| has_kanji(c)),
-            "particle-glued segment '{}' offered no word candidate: {:?}",
-            tail.reading,
-            tail.candidates,
+            segs.iter().all(|s| s.reading != "がふる"),
+            "particle stayed glued onto the verb as one chunk: {:?}",
+            segs.iter().map(|s| &s.reading).collect::<Vec<_>>(),
+        );
+        let readings: Vec<&str> = segs.iter().map(|s| s.reading.as_str()).collect();
+        assert_eq!(
+            readings,
+            vec!["あめ", "が", "ふる"],
+            "resize should split into independent bunsetsu",
+        );
+        // The verb bunsetsu still offers its kanji candidate (降る), and the
+        // particle is its own selectable segment.
+        let verb = segs.last().unwrap();
+        assert!(
+            verb.candidates.iter().any(|c| has_kanji(c)),
+            "verb segment '{}' offered no word candidate: {:?}",
+            verb.reading,
+            verb.candidates,
         );
     }
 
