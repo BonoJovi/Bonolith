@@ -128,6 +128,8 @@ const PRIORITY_OVERRIDES: &[(&str, &str, u32)] = &[
     ("かみ", "神", 3800), // was 3065, below 加味 3609 (髪 > 神 kept)
     ("りょうり", "料理", 4400), // was 3968, below 良吏 4296 (rare "good official")
     ("かぎ", "鍵", 4200),       // was 4119, below 鈎 4124 (rare "hook/gaff")
+    ("ひと", "人", 4100), // was 2882, below 匪徒/費途 3982 (rare "bandit"/"expense")
+    ("こと", "事", 4700), // was 1188, buried under 古都 4603/糊塗/殊/琴 (ancient capital etc.)
     // 書き (連用/compound tail: 下書き, 落書き) is far more common as input than
     // 餓鬼; IPADIC buried it (Suffix 3635 < 餓鬼 4353), so がき defaulted to 餓鬼
     // and, worse, its Noun POS suppressed the Noun+Suffix compound merge.
@@ -1087,6 +1089,8 @@ mod tests {
             ("かみ", "髪"),   // beats 加味
             ("りょうり", "料理"), // beats 良吏
             ("かぎ", "鍵"),   // beats 鈎
+            ("ひと", "人"),   // beats 匪徒/費途
+            ("こと", "事"),   // beats 古都/糊塗/殊/琴
             // verbs
             ("みる", "見る"),     // beats 海松/水松
             ("いのる", "祈る"),   // beats 祷る
