@@ -3,7 +3,7 @@
 /// Implements org.freedesktop.IBus.Engine via zbus #[interface].
 /// Bridges IBus key events to Bonolith's ConversionEngine and sends
 /// preedit/commit/candidates back via D-Bus signals.
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use log::{debug, info, warn};
 use zbus::object_server::SignalEmitter;
@@ -18,11 +18,14 @@ use super::keymap::*;
 
 /// IBus Engine state
 pub struct BonolithEngine {
-    engine: Mutex<ConversionEngine>,
+    /// Arc so a detached background task (LLM rerank refresh) can hold a clone
+    /// and mutate the conversion state after the key handler has returned.
+    engine: Arc<Mutex<ConversionEngine>>,
     /// Whether the engine is active (enabled by IBus)
     enabled: Mutex<bool>,
-    /// Whether we are in conversion mode (showing candidates)
-    converting: Mutex<bool>,
+    /// Whether we are in conversion mode (showing candidates). Arc for the same
+    /// reason as `engine`: the rerank-refresh task checks it before emitting.
+    converting: Arc<Mutex<bool>>,
     /// Compiled toggle key bindings (immutable after creation)
     toggle_keys: Vec<CompiledToggleKey>,
     /// Shared force-on window set by the word-register dialog (see
@@ -38,9 +41,9 @@ impl BonolithEngine {
             toggle_keys.len()
         );
         Self {
-            engine: Mutex::new(ConversionEngine::new()),
+            engine: Arc::new(Mutex::new(ConversionEngine::new())),
             enabled: Mutex::new(false),
-            converting: Mutex::new(false),
+            converting: Arc::new(Mutex::new(false)),
             toggle_keys,
             force,
         }
@@ -680,6 +683,8 @@ impl BonolithEngine {
 
         self.show_conversion_state(emitter, &state).await?;
         *self.converting.lock().unwrap() = true;
+        // Surface LLM context reranking once the background pass finishes.
+        self.spawn_rerank_refresh(emitter);
 
         Ok(true)
     }
@@ -728,6 +733,10 @@ impl BonolithEngine {
                 if let Some(conv) = conv {
                     self.show_conversion_state(emitter, &conv).await?;
                 }
+                // A resize re-triggers the background rerank; refresh when ready.
+                if has_shift {
+                    self.spawn_rerank_refresh(emitter);
+                }
                 Ok(true)
             }
             // Left → move focus to previous segment (or Shift+Left → shrink segment)
@@ -742,6 +751,10 @@ impl BonolithEngine {
                 };
                 if let Some(conv) = conv {
                     self.show_conversion_state(emitter, &conv).await?;
+                }
+                // A resize re-triggers the background rerank; refresh when ready.
+                if has_shift {
+                    self.spawn_rerank_refresh(emitter);
                 }
                 Ok(true)
             }
@@ -777,6 +790,16 @@ impl BonolithEngine {
         emitter: &SignalEmitter<'_>,
         state: &ConversionState,
     ) -> zbus::fdo::Result<()> {
+        Self::emit_conversion_state(emitter, state).await
+    }
+
+    /// Emit the preedit + lookup-table signals for `state`. Standalone (no
+    /// `&self`) so the background rerank-refresh task can call it with an owned
+    /// signal emitter after the key handler has returned.
+    async fn emit_conversion_state(
+        emitter: &SignalEmitter<'_>,
+        state: &ConversionState,
+    ) -> zbus::fdo::Result<()> {
         let text = state.composed_text();
         let ranges = state.segment_char_ranges();
         let focus = state.focus;
@@ -802,6 +825,52 @@ impl BonolithEngine {
         ).await.map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
         Ok(())
+    }
+
+    /// Spawn a detached task that waits for the background LLM rerank to finish,
+    /// applies it, and re-emits the conversion display — so context reranking
+    /// surfaces without the user pressing another key. Cheap no-op if no result
+    /// ever arrives. Called after a conversion is (re)built (start / resize).
+    fn spawn_rerank_refresh(&self, emitter: &SignalEmitter<'_>) {
+        let engine = Arc::clone(&self.engine);
+        let converting = Arc::clone(&self.converting);
+        let emitter = emitter.to_owned();
+
+        tokio::spawn(async move {
+            // Poll for the background result with a bounded budget. The rerank
+            // runs on a llama-server round-trip per segment, so allow ~2s.
+            const POLL_INTERVAL_MS: u64 = 60;
+            const MAX_POLLS: u32 = 34; // ~2.0s total
+            for _ in 0..MAX_POLLS {
+                if engine.lock().unwrap().has_llm_rerank_result() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+            }
+
+            // Apply and snapshot the refreshed state under one lock. Skip if the
+            // user already left conversion mode (committed / cancelled).
+            let refreshed = {
+                if !*converting.lock().unwrap() {
+                    return;
+                }
+                let mut engine = engine.lock().unwrap();
+                if !engine.apply_llm_rerank() {
+                    return;
+                }
+                engine.conversion_state().cloned()
+            };
+
+            if let Some(state) = refreshed {
+                // Re-check converting after the await-free section; harmless race
+                // at worst repaints a still-valid panel.
+                if *converting.lock().unwrap() {
+                    if let Err(e) = Self::emit_conversion_state(&emitter, &state).await {
+                        debug!("Bonolith: rerank refresh emit failed: {e}");
+                    }
+                }
+            }
+        });
     }
 
     /// Convert the focused segment to katakana (F7/F8 during conversion mode).

@@ -58,6 +58,14 @@ const char *bonolith_get_preedit(BonolithContext *ctx);
 const char *bonolith_poll_commit(BonolithContext *ctx);
 bool bonolith_is_converting(BonolithContext *ctx);
 bool bonolith_has_preedit(BonolithContext *ctx);
+
+/// True while a background LLM rerank pass is outstanding (triggered by the last
+/// conversion start or resize but not yet applied). Poll target gate.
+bool bonolith_rerank_pending(BonolithContext *ctx);
+
+/// Apply the background LLM rerank result if ready. Returns true if candidates
+/// changed (caller should refresh UI). Non-blocking; false when not ready yet.
+bool bonolith_poll_apply_rerank(BonolithContext *ctx);
 const char *bonolith_composed_text(BonolithContext *ctx);
 int32_t bonolith_segment_count(BonolithContext *ctx);
 int32_t bonolith_focus_index(BonolithContext *ctx);

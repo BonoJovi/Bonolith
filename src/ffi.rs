@@ -414,6 +414,24 @@ pub unsafe extern "C" fn bonolith_is_converting(ctx: *mut BonolithContext) -> bo
     ctx.converting
 }
 
+/// Returns true while a background LLM rerank pass is outstanding (triggered by
+/// the last conversion start or resize but not yet applied). The frontend uses
+/// this to decide whether to poll `bonolith_poll_apply_rerank`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bonolith_rerank_pending(ctx: *mut BonolithContext) -> bool {
+    let ctx = unsafe { &*ctx };
+    ctx.engine.rerank_inflight()
+}
+
+/// Apply the background LLM rerank result if it is ready. Returns true if the
+/// conversion candidates changed (the caller should refresh its UI). Non-
+/// blocking: returns false when no result is ready yet.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bonolith_poll_apply_rerank(ctx: *mut BonolithContext) -> bool {
+    let ctx = unsafe { &mut *ctx };
+    ctx.engine.apply_llm_rerank()
+}
+
 /// Returns true if there is preedit text.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_has_preedit(ctx: *mut BonolithContext) -> bool {

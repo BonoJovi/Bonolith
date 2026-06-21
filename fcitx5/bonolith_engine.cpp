@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <ctime>
 #include <thread>
 
 #include <fcitx-utils/utf8.h>
@@ -37,6 +38,12 @@ void BonolithState::keyEvent(fcitx::KeyEvent &event) {
     }
     // Always update UI after key events to keep preedit display in sync
     updateUI();
+
+    // If this key (conversion start / boundary resize) kicked off a background
+    // LLM rerank, poll for its result and refresh the panel when it lands.
+    if (bonolith_rerank_pending(ctx_)) {
+        scheduleRerankRefresh();
+    }
 }
 
 void BonolithState::reset() {
@@ -124,6 +131,35 @@ void BonolithState::updateUI() {
 
     ic_->updatePreedit();
     ic_->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
+}
+
+void BonolithState::scheduleRerankRefresh() {
+    // Poll cadence/budget for the background rerank. The pass is a llama-server
+    // round-trip per segment, so allow ~2s before giving up.
+    constexpr uint64_t kPollUs = 60000; // 60ms
+    constexpr int kMaxTicks = 34;       // ~2.0s total
+
+    rerankTicks_ = 0;
+    auto *instance = engine_->instance();
+    rerankTimer_ = instance->eventLoop().addTimeEvent(
+        CLOCK_MONOTONIC, fcitx::now(CLOCK_MONOTONIC) + kPollUs, 0,
+        [this](fcitx::EventSourceTime *time, uint64_t) {
+            // Stop (don't re-arm) once the user has left conversion mode.
+            if (!ctx_ || !bonolith_is_converting(ctx_)) {
+                return true;
+            }
+            // Result landed: apply, repaint, and stop.
+            if (bonolith_poll_apply_rerank(ctx_)) {
+                updateUI();
+                return true;
+            }
+            // Still pending: re-arm until the budget is spent.
+            if (++rerankTicks_ < kMaxTicks) {
+                time->setNextInterval(kPollUs);
+                time->setOneShot();
+            }
+            return true;
+        });
 }
 
 // ── BonolithEngine (addon) ──────────────────────────────────────────────────

@@ -3,6 +3,7 @@
 #ifndef BONOLITH_ENGINE_H
 #define BONOLITH_ENGINE_H
 
+#include <fcitx-utils/event.h>
 #include <fcitx/action.h>
 #include <fcitx/addonfactory.h>
 #include <fcitx/addonmanager.h>
@@ -31,10 +32,18 @@ public:
 
 private:
     void updateUI();
+    /// Arm a self-rescheduling timer that polls for the background LLM rerank
+    /// result, applies it, and refreshes the panel — so context reranking
+    /// surfaces without the user pressing another key.
+    void scheduleRerankRefresh();
 
     BonolithEngine *engine_;
     fcitx::InputContext *ic_;
     BonolithContext *ctx_;
+    /// Outstanding rerank-refresh poll timer (null when idle).
+    std::unique_ptr<fcitx::EventSourceTime> rerankTimer_;
+    /// Poll ticks elapsed for the current rerank-refresh cycle.
+    int rerankTicks_ = 0;
 };
 
 /// Fcitx5 input method engine addon.
@@ -54,6 +63,7 @@ public:
     std::vector<fcitx::InputMethodEntry> listInputMethods() override;
 
     auto &factory() { return factory_; }
+    fcitx::Instance *instance() { return instance_; }
 
 private:
     // Dictionary management via zenity dialogs (run in background threads)

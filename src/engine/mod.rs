@@ -9,6 +9,7 @@
 ///       → LLM rerank → candidate list → user selects → commit
 
 use std::io::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 
@@ -243,6 +244,9 @@ pub struct ConversionEngine {
     conversion: Option<ConversionState>,
     /// Background LLM reranking result (populated asynchronously)
     llm_rerank_result: Arc<Mutex<Option<LlmRerankResult>>>,
+    /// True from when a background rerank is triggered until its result is
+    /// applied. Frontends poll this to know whether to wait for a refresh.
+    rerank_inflight: Arc<AtomicBool>,
 }
 
 impl ConversionEngine {
@@ -262,6 +266,7 @@ impl ConversionEngine {
             shared,
             conversion: None,
             llm_rerank_result: Arc::new(Mutex::new(None)),
+            rerank_inflight: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -448,15 +453,13 @@ impl ConversionEngine {
             }
         }
 
-        // Mark the resized segments as user-selected so they survive reranking.
-        // A split may have replaced segment `focus + 1` with several bunsetsu;
-        // those are already flagged inside relookup_or_split_segment.
-        if let Some(state) = self.conversion.as_mut() {
-            state.segments[focus].user_selected = true;
-            if focus + 1 < state.segments.len() {
-                state.segments[focus + 1].user_selected = true;
-            }
-        }
+        // A manual boundary change is *not* a surface choice: `user_selected`
+        // is reserved for segments where the user explicitly picked a candidate
+        // (cycle / kana / hiragana), which `apply_llm_rerank` must not override.
+        // Leaving the resized bunsetsu rerank-eligible lets the LLM order their
+        // candidates by context. Re-run the background rerank so it scores the
+        // new bunsetsu instead of the stale pre-resize segmentation.
+        self.trigger_llm_rerank();
 
         self.conversion.as_ref()
     }
@@ -754,8 +757,9 @@ impl ConversionEngine {
         let shared = self.shared.clone();
         let result_slot = self.llm_rerank_result.clone();
 
-        // Clear previous result
+        // Clear previous result and mark a pass in flight (cleared when applied).
         *result_slot.lock().unwrap() = None;
+        self.rerank_inflight.store(true, Ordering::Relaxed);
 
         thread::spawn(move || {
             // Catch any panics to prevent crashing the IBus process
@@ -845,9 +849,13 @@ impl ConversionEngine {
         };
 
         let reranked = match reranked {
+            // No result yet — leave `rerank_inflight` set so the frontend keeps
+            // polling for the pass that is still running.
             Some(r) => r,
             None => return false,
         };
+        // We consumed the background result; the pass is no longer in flight.
+        self.rerank_inflight.store(false, Ordering::Relaxed);
 
         let state = match self.conversion.as_mut() {
             Some(s) => s,
@@ -875,6 +883,13 @@ impl ConversionEngine {
     /// Check if LLM reranking results are ready (non-blocking).
     pub fn has_llm_rerank_result(&self) -> bool {
         self.llm_rerank_result.lock().unwrap().is_some()
+    }
+
+    /// True while a background rerank pass is outstanding (triggered but its
+    /// result not yet applied). Frontends poll this to decide whether to keep
+    /// waiting for a display refresh.
+    pub fn rerank_inflight(&self) -> bool {
+        self.rerank_inflight.load(Ordering::Relaxed)
     }
 
     /// LLM score to use for a candidate during reranking.
@@ -1263,13 +1278,13 @@ impl ConversionEngine {
             Some(state) => state.segments[idx].start,
             None => return,
         };
-        // Build a SegmentState per sub-bunsetsu (mirrors the auto path), shift
-        // each to the glued segment's absolute kana offset, and flag them as
-        // user-edited so the new boundaries survive reranking.
+        // Build a SegmentState per sub-bunsetsu (mirrors the auto path) and
+        // shift each to the glued segment's absolute kana offset. Leave
+        // user_selected = false (build_segment_states default) so the freshly
+        // split bunsetsu remain eligible for LLM context reranking.
         let mut new_states = self.build_segment_states(&subs);
         for st in &mut new_states {
             st.start += base_start;
-            st.user_selected = true;
         }
         if let Some(state) = self.conversion.as_mut() {
             state.segments.splice(idx..=idx, new_states);
@@ -1425,6 +1440,40 @@ mod tests {
             "verb segment '{}' offered no word candidate: {:?}",
             verb.reading,
             verb.candidates,
+        );
+    }
+
+    /// Regression (hermetic): a manual resize must re-trigger the background LLM
+    /// rerank and must NOT lock the touched bunsetsu as `user_selected` — a
+    /// boundary change is not a surface choice, so the LLM may still reorder
+    /// their candidates by context. (Previously resize set user_selected=true,
+    /// which `apply_llm_rerank` skips, so context reranking never reached a
+    /// resized segment.)
+    #[test]
+    fn resize_retriggers_rerank_and_leaves_segments_rerankable() {
+        use std::time::{Duration, Instant};
+
+        let mut engine = ConversionEngine::with_shared(SharedCore::new_hermetic());
+        for ch in "amegafuru".chars() {
+            engine.process_key(ch);
+        }
+        engine.start_conversion();
+        assert!(engine.rerank_inflight(), "start_conversion should trigger a rerank");
+
+        // Drain the initial pass so we can observe the resize re-trigger cleanly.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !engine.has_llm_rerank_result() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        engine.apply_llm_rerank();
+        assert!(!engine.rerank_inflight(), "applying the result clears the inflight flag");
+
+        engine.resize_segment(-1);
+        assert!(engine.rerank_inflight(), "resize should re-trigger the rerank");
+        let segs = &engine.conversion_state().unwrap().segments;
+        assert!(
+            segs.iter().all(|s| !s.user_selected),
+            "resized/split bunsetsu must stay rerank-eligible (user_selected=false)",
         );
     }
 
