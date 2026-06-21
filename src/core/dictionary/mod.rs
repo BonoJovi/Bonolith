@@ -128,6 +128,10 @@ const PRIORITY_OVERRIDES: &[(&str, &str, u32)] = &[
     ("かみ", "神", 3800), // was 3065, below 加味 3609 (髪 > 神 kept)
     ("りょうり", "料理", 4400), // was 3968, below 良吏 4296 (rare "good official")
     ("かぎ", "鍵", 4200),       // was 4119, below 鈎 4124 (rare "hook/gaff")
+    // 書き (連用/compound tail: 下書き, 落書き) is far more common as input than
+    // 餓鬼; IPADIC buried it (Suffix 3635 < 餓鬼 4353), so がき defaulted to 餓鬼
+    // and, worse, its Noun POS suppressed the Noun+Suffix compound merge.
+    ("がき", "書き", 4400), // was 3635, below 餓鬼 4353
     // Verbs: the everyday default buried below rare/literary kanji variants.
     // Same exclusion rule — context-dependent verbs (着る/切る, 図る/測る,
     // 上る/登る, 治す/直す, 帰る/変える) are left to the LLM.
@@ -686,14 +690,19 @@ impl Dictionary {
             ("まるかっこ", &["（）", "（", "）"]),
             ("ゆうびん", &["〒"]),
         ];
+        // Low base frequency (like emoji): a symbol shortcut must stay reachable
+        // when its reading has no real word (やじるし, かっこ), but must never
+        // outrank a common homophone word. At 8000 these clobbered everyday
+        // words — e.g. した→↓ beat 舌/下/した, うえ→↑ beat 上, から→〜 beat から.
+        const SYMBOL_BASE_FREQ: u32 = 500;
         for &(reading, surfaces) in symbols {
             for (i, &surface) in surfaces.iter().enumerate() {
                 self.add_entry(DictionaryEntry {
                     reading: reading.to_string(),
                     surface: surface.to_string(),
                     pos: PartOfSpeech::Other,
-                    // First candidate gets highest frequency
-                    frequency: 8000 - (i as u32) * 100,
+                    // First candidate keeps the highest frequency within the group.
+                    frequency: SYMBOL_BASE_FREQ.saturating_sub(i as u32 * 10),
                 });
             }
         }
@@ -1132,6 +1141,52 @@ mod tests {
         let dict = Dictionary::new();
         let results = dict.lookup("zzz");
         assert!(results.is_empty());
+    }
+
+    /// Regression: a symbol shortcut must not outrank a common homophone word.
+    /// At base freq 8000, した→↓ beat 舌/下/した; lowering it (like emoji) keeps
+    /// the arrow reachable without clobbering the word.
+    #[test]
+    fn symbol_shortcut_ranks_below_common_word() {
+        let dict = Dictionary::new();
+        let shita = dict.lookup("した");
+        let arrow = shita.iter().find(|e| e.surface == "↓").map_or(0, |e| e.frequency);
+        let top_word = shita
+            .iter()
+            .filter(|e| !matches!(e.surface.as_str(), "↓" | "⇓"))
+            .map(|e| e.frequency)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            top_word > arrow,
+            "↓ ({arrow}) must rank below the top した word ({top_word})",
+        );
+    }
+
+    /// Regression: 書き (compound tail: 下書き/落書き) is far commoner as input
+    /// than 餓鬼; the override lifts it above 餓鬼 so がき defaults to 書き and the
+    /// Noun+Suffix compound merge fires.
+    #[test]
+    fn gaki_kaki_outranks_gaki_demon_and_merges() {
+        let dict = Dictionary::new();
+        let gaki = dict.lookup("がき");
+        let kaki = gaki.iter().find(|e| e.surface == "書き").map_or(0, |e| e.frequency);
+        let demon = gaki.iter().find(|e| e.surface == "餓鬼").map_or(0, |e| e.frequency);
+        assert!(kaki > demon, "書き ({kaki}) must outrank 餓鬼 ({demon})");
+
+        // The compound suffix must merge into one bunsetsu, not split off 餓鬼.
+        for (input, want) in [("したがき", "下書き"), ("らくがき", "落書き")] {
+            let segs = dict.segment(input);
+            assert_eq!(segs.len(), 1, "{input} should be one bunsetsu, got {:?}",
+                       segs.iter().map(|s| &s.reading).collect::<Vec<_>>());
+            let top = segs[0]
+                .candidates
+                .iter()
+                .max_by_key(|e| e.frequency)
+                .map(|e| e.surface.as_str())
+                .unwrap_or("");
+            assert_eq!(top, want, "{input} top candidate should be {want}");
+        }
     }
 
     #[test]
