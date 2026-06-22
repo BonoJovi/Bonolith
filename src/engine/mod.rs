@@ -235,7 +235,11 @@ impl SharedCore {
 }
 
 /// Result of background LLM reranking: reranked candidate lists per segment.
-type LlmRerankResult = Vec<Vec<String>>;
+/// One reranked segment: the reading it was computed for, paired with its
+/// reordered candidate list. The reading lets `apply_llm_rerank` reject a
+/// result whose segmentation no longer matches the live conversion (a pass
+/// that started before a resize / boundary change moved the bunsetsu).
+type LlmRerankResult = Vec<(String, Vec<String>)>;
 
 pub struct ConversionEngine {
     romaji: RomajiConverter,
@@ -778,7 +782,7 @@ impl ConversionEngine {
                 // has deliberately reinforced a reading, while a single
                 // selection only nudges near-ties.
                 const USER_LEARNING_WEIGHT: f64 = 0.5;
-                let mut reranked_segments: Vec<Vec<String>> = Vec::new();
+                let mut reranked_segments: Vec<(String, Vec<String>)> = Vec::new();
 
                 for (reading, candidates) in &seg_info {
                     if candidates.len() > 1 && reading.chars().count() >= 2 {
@@ -817,11 +821,13 @@ impl ConversionEngine {
                         );
 
                         preceding_text.push_str(&reranked[0]);
-                        reranked_segments.push(reranked);
+                        reranked_segments.push((reading.clone(), reranked));
                     } else {
                         preceding_text.push_str(&candidates[0].0);
-                        reranked_segments
-                            .push(candidates.iter().map(|(s, _)| s.clone()).collect());
+                        reranked_segments.push((
+                            reading.clone(),
+                            candidates.iter().map(|(s, _)| s.clone()).collect(),
+                        ));
                     }
                 }
 
@@ -854,16 +860,38 @@ impl ConversionEngine {
             Some(r) => r,
             None => return false,
         };
-        // We consumed the background result; the pass is no longer in flight.
-        self.rerank_inflight.store(false, Ordering::Relaxed);
 
         let state = match self.conversion.as_mut() {
             Some(s) => s,
-            None => return false,
+            None => {
+                // No active conversion to apply to; the pass is moot.
+                self.rerank_inflight.store(false, Ordering::Relaxed);
+                return false;
+            }
         };
 
+        // Reject a stale result whose segmentation no longer matches the live
+        // conversion. Background passes from before a resize / commit can finish
+        // late and be grabbed by a still-polling refresh task; applying their
+        // candidate lists positionally onto a changed bunsetsu layout corrupts
+        // the display (dropped or duplicated segments). Require a segment-for-
+        // segment reading match; on mismatch, drop it and leave the pass marked
+        // in flight so the frontend keeps waiting for the matching result.
+        let aligned = reranked.len() == state.segments.len()
+            && reranked
+                .iter()
+                .zip(state.segments.iter())
+                .all(|((reading, _), seg)| *reading == seg.reading);
+        if !aligned {
+            log::debug!("Discarding stale LLM rerank result (segmentation changed)");
+            return false;
+        }
+
+        // We consumed a matching background result; the pass is no longer in flight.
+        self.rerank_inflight.store(false, Ordering::Relaxed);
+
         let mut updated = false;
-        for (seg, new_candidates) in state.segments.iter_mut().zip(reranked.into_iter()) {
+        for (seg, (_, new_candidates)) in state.segments.iter_mut().zip(reranked.into_iter()) {
             // Don't override if user already manually selected a candidate
             if seg.user_selected {
                 continue;
@@ -1474,6 +1502,69 @@ mod tests {
         assert!(
             segs.iter().all(|s| !s.user_selected),
             "resized/split bunsetsu must stay rerank-eligible (user_selected=false)",
+        );
+    }
+
+    /// Regression: a background rerank from a superseded segmentation (e.g. one
+    /// triggered before a resize / left-commit changed the bunsetsu boundaries)
+    /// can finish late and be grabbed by a still-polling refresh task. Applying
+    /// its candidate lists positionally onto the *current* layout corrupted the
+    /// display (dropped / duplicated segments — 再現性→再性, …のですがですが).
+    /// `apply_llm_rerank` must reject any result whose readings don't line up
+    /// segment-for-segment, leave the conversion untouched, and keep the pass
+    /// marked in flight so the matching result is still awaited.
+    #[test]
+    fn apply_rerank_rejects_stale_segmentation() {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        let mut engine = ConversionEngine::with_shared(SharedCore::new_hermetic());
+        for ch in "amegafuru".chars() {
+            engine.process_key(ch);
+        }
+        engine.start_conversion();
+
+        // Drain the initial pass so the slot is empty and state is settled.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !engine.has_llm_rerank_result() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        engine.apply_llm_rerank();
+
+        let before: Vec<Vec<String>> = engine
+            .conversion_state()
+            .unwrap()
+            .segments
+            .iter()
+            .map(|s| s.candidates.clone())
+            .collect();
+
+        // Inject a stale result whose readings don't match the live layout.
+        *engine.llm_rerank_result.lock().unwrap() = Some(vec![(
+            "ZZ-bogus-reading".to_string(),
+            vec!["☃".to_string(), "☔".to_string()],
+        )]);
+        engine.rerank_inflight.store(true, Ordering::Relaxed);
+
+        assert!(
+            !engine.apply_llm_rerank(),
+            "a result from a different segmentation must not be applied",
+        );
+        assert!(
+            engine.rerank_inflight(),
+            "a discarded stale result leaves the pass in flight for the matching one",
+        );
+
+        let after: Vec<Vec<String>> = engine
+            .conversion_state()
+            .unwrap()
+            .segments
+            .iter()
+            .map(|s| s.candidates.clone())
+            .collect();
+        assert_eq!(
+            before, after,
+            "candidates must be untouched by a stale rerank result",
         );
     }
 
