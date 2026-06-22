@@ -778,6 +778,11 @@ impl Dictionary {
             // single verbal complexes.
             ("たべたい", "食べたい"),
             ("みたかった", "見たかった"),
+            // Explanatory ending 準体助詞の+コピュラです. IPADIC's Particle→Auxiliary
+            // bigram (の→です) costs 6.287, while ので(Particle 8664)→す(Noun) is only
+            // 3.500, so のです mis-segmented as ので+す(→素). A single Auxiliary entry
+            // wins outright; Verb/Adj→Aux connection (1.789/3.837) keeps 〜のです natural.
+            ("のです", "のです"),
         ];
         for &(reading, surface) in formulaic {
             self.add_entry(DictionaryEntry {
@@ -866,6 +871,7 @@ impl Dictionary {
         let general_supplement: &[(&str, &str, u32)] = &[
             // Common nouns / expressions
             ("かのうせい",   "可能性",       8500), // extremely common; IPADIC omits hiragana surface
+            ("さいげんせい", "再現性",       7500), // IPADIC lacks the compound; 再+厳正 narrowly beat 再現+性
             ("ざんりょう",   "残量",         7500),
             ("きに",         "気に",         7500),
             ("きょうどう",   "協働",         7500), // collaborative; IPADIC has 協同/共同 but not 協働
