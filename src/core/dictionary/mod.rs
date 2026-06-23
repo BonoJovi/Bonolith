@@ -149,6 +149,7 @@ const PRIORITY_OVERRIDES: &[(&str, &str, u32)] = &[
     // lift the plain する above the 摺る/擦る group.
     ("する", "スる", 800),  // was 6520, slangy katakana stylization
     ("する", "する", 2800), // was 1306, below 摺る/擦る 2632
+    ("ところ", "所", 4200), // was 1685, below 野老 3755 (rare plant/surname) / 処 2978
     // 書き (連用/compound tail: 下書き, 落書き) is far more common as input than
     // 餓鬼; IPADIC buried it (Suffix 3635 < 餓鬼 4353), so がき defaulted to 餓鬼
     // and, worse, its Noun POS suppressed the Noun+Suffix compound merge.
@@ -1300,6 +1301,21 @@ mod tests {
         let kyou_seg = segments.iter().find(|s| s.reading == "きょうは").unwrap();
         let surfaces: Vec<&str> = kyou_seg.candidates.iter().map(|e| e.surface.as_str()).collect();
         assert!(surfaces.contains(&"今日は"), "expected 今日は in {:?}", surfaces);
+    }
+
+    /// Regression: ところ must offer 所 (everyday "place") as its top dictionary
+    /// candidate, not the rare 野老 (3755, a plant / uncommon surname) that buried
+    /// 所 (1685). PRIORITY_OVERRIDES lifts 所 to 4200.
+    #[test]
+    fn tokoro_defaults_to_tokoro_place() {
+        let dict = Dictionary::new();
+        let cands = &dict.segment("ところ")[0].candidates;
+        assert_eq!(
+            cands.first().map(|e| e.surface.as_str()),
+            Some("所"),
+            "got {:?}",
+            cands.iter().map(|e| e.surface.as_str()).take(3).collect::<Vec<_>>(),
+        );
     }
 
     /// Regression: つぎは must default to 次+は, not the archaic single word 継歯
