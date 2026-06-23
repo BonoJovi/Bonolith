@@ -306,6 +306,13 @@ impl Dictionary {
             let is_bos = i == 0;
             let remaining = &input[byte_offsets[i]..];
             let prefixes = self.trie.common_prefix_search(remaining);
+            // Longest dictionary word starting here. A learning boost on a
+            // segment shorter than this would let a frequently-typed short word
+            // (e.g. けん→件) fragment a longer compound it is a prefix of
+            // (けんさく→検索 becoming 件＋柵). Suppress the boost in that case so
+            // user learning can reorder candidates but never break a longer
+            // dictionary word apart.
+            let max_prefix_len = prefixes.iter().map(|(l, _)| *l).max().unwrap_or(0);
 
             for prev_p in 0..PC {
                 let prev_cost = best_cost[i][prev_p];
@@ -331,7 +338,11 @@ impl Dictionary {
                         .iter()
                         .map(|&idx| &self.entries[idx])
                         .collect();
-                    let boost = boost_fn(&reading, &entries);
+                    let boost = if *len < max_prefix_len {
+                        0.0
+                    } else {
+                        boost_fn(&reading, &entries)
+                    };
 
                     for cur_p in 0..PC {
                         let best_freq = best_freq_by_pos[cur_p];
@@ -1250,6 +1261,40 @@ mod tests {
         }
     }
 
+    /// Regression: a heavily-learned short word (けん→件) must not fragment a
+    /// longer compound it is a prefix of. Before the fix, the learning boost on
+    /// けん let the DP split けんさく(検索) into 件＋柵, so "けんさくになります"
+    /// rendered as 件柵になります even though "けんさく" alone stayed 検索.
+    #[test]
+    fn learned_prefix_does_not_fragment_longer_compound() {
+        let dict = Dictionary::new();
+        // Mimic production user learning: けん→件 selected several times. The
+        // boost mirrors the engine closure (×10, single-char segments skipped).
+        let boost = |reading: &str, entries: &[&DictionaryEntry]| -> f64 {
+            if reading.chars().count() <= 1 {
+                return 0.0;
+            }
+            let learned = reading == "けん"
+                && entries.iter().any(|e| e.surface == "件");
+            // ln(1+4)/ln(1+20) ≈ 0.53 — four selections of けん→件.
+            if learned { 0.53 * 10.0 } else { 0.0 }
+        };
+        for input in ["けんさく", "けんさくになります"] {
+            let segs = dict.segment_with_boost(input, &boost);
+            let top = segs[0]
+                .candidates
+                .first()
+                .map(|e| e.surface.as_str())
+                .unwrap_or("");
+            assert!(
+                top.starts_with("検索"),
+                "{input}: first bunsetsu should stay 検索, got {:?} ({})",
+                segs.iter().map(|s| &s.reading).collect::<Vec<_>>(),
+                top,
+            );
+        }
+    }
+
     #[test]
     fn lookup_multiple_candidates() {
         let dict = Dictionary::new();
@@ -1640,3 +1685,4 @@ mod tests {
         assert_eq!(failures, 0, "{failures} supplement entries missing from candidates");
     }
 }
+
