@@ -130,6 +130,19 @@ const PRIORITY_OVERRIDES: &[(&str, &str, u32)] = &[
     ("かぎ", "鍵", 4200),       // was 4119, below 鈎 4124 (rare "hook/gaff")
     ("ひと", "人", 4100), // was 2882, below 匪徒/費途 3982 (rare "bandit"/"expense")
     ("こと", "事", 4700), // was 1188, buried under 古都 4603/糊塗/殊/琴 (ancient capital etc.)
+    ("じしょ", "辞書", 4700), // was 4465, below 字書 4594 (rare/archaic "character dictionary")
+    // つぎは: two stacked homophone problems. The 3-char Noun 継歯/継端 (4378, an
+    // archaic dental-prosthesis term) wins as one word over つぎ+は, and even when
+    // split, 継ぎ (3957) outranks 次 (3508). Raise 次 above 継ぎ AND demote the rare
+    // 継歯/継端 so 「つぎは」→ 次(Noun)+は(Particle) (next/next time).
+    ("つぎ", "次", 4400),    // was 3508, below 継ぎ 3957
+    ("つぎは", "継歯", 1500), // was 4378, archaic; was beating the 次+は split as one word
+    ("つぎは", "継端", 1500), // was 4378, archaic; same
+    ("とうこう", "投稿", 4600), // was 4436, below 登校 4442 / 陶工 4440 (SNS投稿 is the everyday default)
+    // おねがい was 3459, so おねがいします mis-segmented as 尾根(おね 4435)+害します
+    // (がいします Verb 5772, a 5-char length bonus). Raising お願い fixes the whole
+    // family (お願いします / お願いする / お願いいたします).
+    ("おねがい", "お願い", 5800), // was 3459, below 尾根 4435 once します pulls in 害します
     // 書き (連用/compound tail: 下書き, 落書き) is far more common as input than
     // 餓鬼; IPADIC buried it (Suffix 3635 < 餓鬼 4353), so がき defaulted to 餓鬼
     // and, worse, its Noun POS suppressed the Noun+Suffix compound merge.
@@ -793,6 +806,28 @@ impl Dictionary {
             });
         }
 
+        // Passive / honorific auxiliary される and its conjugations. IPADIC carries
+        // these only as freq-2 hiragana surfaces, so サ変名詞+される (登録される,
+        // 削除される, 表示される…) loses badly: とうろくされて mis-segmented as
+        // 当路(4378)+腐れて(くされて Verb 5694). A high-frequency Auxiliary entry wins;
+        // Noun→Aux connection (3.469) keeps the サ変名詞 boundary natural.
+        let sareru_aux: &[(&str, &str)] = &[
+            ("される", "される"),
+            ("されて", "されて"),
+            ("された", "された"),
+            ("されない", "されない"),
+            ("されます", "されます"),
+            ("されました", "されました"),
+        ];
+        for &(reading, surface) in sareru_aux {
+            self.add_entry(DictionaryEntry {
+                reading: reading.to_string(),
+                surface: surface.to_string(),
+                pos: PartOfSpeech::Auxiliary,
+                frequency: 8500,
+            });
+        }
+
         // Compound particles (格助詞連結) absent from IPADIC as single entries.
         // High frequency keeps them competitive against adjacent single-particle splits.
         let compound_particles: &[(&str, &str)] = &[
@@ -926,6 +961,14 @@ impl Dictionary {
             // Noun-stem + さ derivations
             ("たかさ", "高さ", 8000),
             ("ふとさ", "太さ", 7500),
+            // Common nouns absent from / mis-ranked in IPADIC, surfaced from user
+            // dictionaries (registered because the default conversion was wrong).
+            ("きどく",       "既読",   8000), // IPADIC top is 奇特(4371); 既読 absent
+            ("おまたせ",     "お待たせ", 7500), // お待たせ(しました); absent
+            ("けつりゅう",   "血流",   7000), // absent
+            ("ぼうまんかん", "膨満感", 7000), // absent
+            ("けんこうこつ", "肩甲骨", 7000), // IPADIC has only old-form 肩胛骨(胛) 4378
+            ("ふかぼり",     "深掘り", 7000), // absent (business jargon 深掘りする)
         ];
         for &(reading, surface, freq) in general_supplement {
             self.add_entry(DictionaryEntry {
@@ -1097,6 +1140,7 @@ mod tests {
             ("かぎ", "鍵"),   // beats 鈎
             ("ひと", "人"),   // beats 匪徒/費途
             ("こと", "事"),   // beats 古都/糊塗/殊/琴
+            ("じしょ", "辞書"), // beats 字書/自署/地所
             // verbs
             ("みる", "見る"),     // beats 海松/水松
             ("いのる", "祈る"),   // beats 祷る
@@ -1250,6 +1294,36 @@ mod tests {
         let kyou_seg = segments.iter().find(|s| s.reading == "きょうは").unwrap();
         let surfaces: Vec<&str> = kyou_seg.candidates.iter().map(|e| e.surface.as_str()).collect();
         assert!(surfaces.contains(&"今日は"), "expected 今日は in {:?}", surfaces);
+    }
+
+    /// Regression: つぎは must default to 次+は, not the archaic single word 継歯
+    /// (4378) nor 継ぎ (3957, which outranked 次 3508). Noun+Particle merge makes
+    /// つぎは one bunsetsu whose Cartesian candidates are frequency-ordered; the
+    /// PRIORITY_OVERRIDES (次→4400, 継歯/継端→1500) must put 次は first.
+    #[test]
+    fn segmentation_tsugiha_defaults_to_next() {
+        let dict = Dictionary::new();
+        let segs = dict.segment("つぎは");
+        assert_eq!(segs.len(), 1, "つぎは should be one bunsetsu, got {:?}",
+            segs.iter().map(|s| s.reading.as_str()).collect::<Vec<_>>());
+        let top = segs[0].candidates.first().map(|e| e.surface.as_str());
+        assert_eq!(top, Some("次は"), "top candidate should be 次は, got {:?}",
+            segs[0].candidates.iter().map(|e| e.surface.as_str()).take(5).collect::<Vec<_>>());
+    }
+
+    /// Regression: おねがいします must segment as お願い+します, not 尾根(おね 4435)+
+    /// 害します (がいします Verb 5772, whose 5-char length bonus beat お願い 3459 once
+    /// します was pulled in). PRIORITY_OVERRIDES raises お願い to 5800.
+    #[test]
+    fn segmentation_onegaishimasu() {
+        let dict = Dictionary::new();
+        let segs = dict.segment("おねがいします");
+        let readings: Vec<&str> = segs.iter().map(|s| s.reading.as_str()).collect();
+        assert_eq!(readings, vec!["おねがい", "します"], "got {:?}", readings);
+        assert_eq!(
+            segs[0].candidates.first().map(|e| e.surface.as_str()),
+            Some("お願い"),
+        );
     }
 
     #[test]
