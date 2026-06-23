@@ -143,6 +143,12 @@ const PRIORITY_OVERRIDES: &[(&str, &str, u32)] = &[
     // (がいします Verb 5772, a 5-char length bonus). Raising お願い fixes the whole
     // family (お願いします / お願いする / お願いいたします).
     ("おねがい", "お願い", 5800), // was 3459, below 尾根 4435 once します pulls in 害します
+    // する: the everyday verb should default to hiragana, not the slangy カタカナ
+    // スる. スる (ス + hiragana る) is mixed-kana, so it dodges the all-katakana
+    // demotion in surface_adjustment and its IPADIC freq 6520 wins. Demote スる and
+    // lift the plain する above the 摺る/擦る group.
+    ("する", "スる", 800),  // was 6520, slangy katakana stylization
+    ("する", "する", 2800), // was 1306, below 摺る/擦る 2632
     // 書き (連用/compound tail: 下書き, 落書き) is far more common as input than
     // 餓鬼; IPADIC buried it (Suffix 3635 < 餓鬼 4353), so がき defaulted to 餓鬼
     // and, worse, its Noun POS suppressed the Noun+Suffix compound merge.

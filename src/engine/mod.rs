@@ -1471,6 +1471,28 @@ mod tests {
         );
     }
 
+    /// Regression (hermetic): the bare verb する must default to hiragana, not the
+    /// slangy katakana スる. スる (ス + hiragana る) is mixed-kana so it dodged the
+    /// all-katakana demotion in surface_adjustment; PRIORITY_OVERRIDES demotes スる
+    /// and lifts する so build_segment_states ranks する first.
+    #[test]
+    fn suru_defaults_to_hiragana_not_katakana() {
+        let mut engine = ConversionEngine::with_shared(SharedCore::new_hermetic());
+        for ch in "suru".chars() {
+            engine.process_key(ch);
+        }
+        engine.start_conversion();
+        let seg = &engine.conversion_state().unwrap().segments[0];
+        assert_eq!(seg.reading, "する");
+        assert_eq!(
+            seg.candidates.first().map(String::as_str),
+            Some("する"),
+            "する should default to hiragana, got {:?}",
+            seg.candidates.iter().take(4).collect::<Vec<_>>(),
+        );
+        assert_ne!(seg.candidates.first().map(String::as_str), Some("スる"));
+    }
+
     /// Regression (hermetic): a manual resize must re-trigger the background LLM
     /// rerank and must NOT lock the touched bunsetsu as `user_selected` — a
     /// boundary change is not a surface choice, so the LLM may still reorder
