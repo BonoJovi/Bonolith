@@ -1,0 +1,69 @@
+name: Release
+
+# Build the IBus engine binary and publish a GitHub Release whenever a
+# version tag (vX.Y.Z) is pushed. The built-in dictionary is compiled
+# into the binary, so the published artifact is a self-contained IBus
+# engine — no IPADIC, no dictionary generation, no Rust toolchain needed
+# on the user's machine. The Fcitx5 addon is intentionally not shipped
+# here: it links against the user's installed Fcitx5 and must be built
+# from source (see README).
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --bin bonolith
+
+      - name: Package artifact
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          STAGE="bonolith-${VERSION}-x86_64-linux"
+          mkdir -p "$STAGE"
+          cp target/release/bonolith "$STAGE/"
+          cp data/bonolith.xml "$STAGE/"
+          cp README.md LICENSE "$STAGE/"
+          tar czf "${STAGE}.tar.gz" "$STAGE"
+          sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            ## Bonolith ${{ github.ref_name }}
+
+            **IBus users — no build required.** The attached
+            `bonolith-*-x86_64-linux.tar.gz` contains a prebuilt engine
+            binary with the dictionary compiled in:
+
+            ```bash
+            tar xzf bonolith-*-x86_64-linux.tar.gz
+            cd bonolith-*-x86_64-linux
+            sudo cp bonolith /usr/bin/ibus-engine-bonolith
+            sudo cp bonolith.xml /usr/share/ibus/component/bonolith.xml
+            ibus-daemon -drx
+            ```
+
+            **Fcitx5 users** still build the addon from source — see the
+            README. **LLM reranking** is optional; set it up per the
+            README if you want it.
+
+            ---
+          files: |
+            bonolith-*-x86_64-linux.tar.gz
+            bonolith-*-x86_64-linux.tar.gz.sha256
