@@ -3,7 +3,7 @@
   <name>org.freedesktop.IBus.Bonolith</name>
   <description>Bonolith - Japanese AI-powered Input Method</description>
   <exec>/usr/bin/ibus-engine-bonolith</exec>
-  <version>3.0.0</version>
+  <version>3.0.1</version>
   <author>Yoshihiro NAKAHARA</author>
   <license>MIT</license>
   <homepage>https://github.com/BonoJovi/Bonolith</homepage>

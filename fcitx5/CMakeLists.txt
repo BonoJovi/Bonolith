@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(fcitx5-bonolith VERSION 3.0.0)
+project(fcitx5-bonolith VERSION 3.0.1)
 
 set(CMAKE_CXX_STANDARD 17)
 

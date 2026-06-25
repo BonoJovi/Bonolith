@@ -4,7 +4,7 @@
 
 **An LLM-powered Japanese input method for Linux — IBus & Fcitx5**
 
-[![Version](https://img.shields.io/badge/Version-3.0.0-blue)](https://github.com/BonoJovi/Bonolith/releases)
+[![Version](https://img.shields.io/badge/Version-3.0.1-blue)](https://github.com/BonoJovi/Bonolith/releases)
 [![Rust](https://img.shields.io/badge/Rust-2024-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/bonojovi)
@@ -100,22 +100,16 @@ Bonolith/
 
 - [Rust](https://rustup.rs/)（最新 stable）
 - Linux + IBus または Fcitx5
-- IPADIC 辞書（`sudo apt install mecab-ipadic`）
 - 辞書登録 / 編集ダイアログ（GTK3）: `sudo apt install python3-gi gir1.2-gtk-3.0 xdotool`
   - Wayland セッションでも `GDK_BACKEND=x11` で XWayland 経由で起動するため、xdotool が動作する Xorg / XWayland が必要
 - LLM 用（オプション）: llama-server + Qwen2.5-1.5B Q4 モデル（約 1.1GB）
 
+> **辞書はリポジトリに同梱済み**です。組み込み辞書 (`builtin_dict.rs`) は生成済みのものがチェックインされているため、ビルドに IPADIC のインストールは不要です（辞書を自前で再生成する場合のみ必要 → [辞書の再生成](#辞書の再生成メンテナ向け任意)）。
+
 ## ビルド
 
 ```bash
-# 辞書生成（IPADIC から組み込み辞書を生成）
-cargo run --bin generate-dict
-
-# 品詞接続コスト表を再生成（IPADIC matrix.def から 11×11 集約、任意）
-# 実行しない場合はチェックイン済みのハンドチューニング版が使われる
-cargo run --bin generate-matrix --release > src/core/dictionary/connection_cost.rs
-
-# リリースビルド
+# リリースビルド — 組み込み辞書は同梱済みなので、これだけで完了
 cargo build --release
 ```
 
@@ -261,6 +255,20 @@ Fcitx5 設定 → 入力メソッド → 「+」 → Bonolith を検索 → 追�
 ### 再起動後に入力ソースが消える（Ubuntu / GNOME の仕様）
 
 IME フレームワークを Fcitx5 にしたまま、その自動起動を OFF にして Ubuntu を再起動すると、GNOME のデフォルトである IBus が起動し、入力ソース一覧から Bonolith が消えて再登録が必要になることがあります。これは GNOME の入力ソース管理（`org.gnome.desktop.input-sources`）が「現在アクティブな IME フレームワーク」前提で動くためで、Bonolith 側のバグではありません。`im-config` で選んだフレームワークと実際に自動起動するフレームワークを一致させておけば回避できます。
+
+## 辞書の再生成（メンテナ向け・任意）
+
+組み込み辞書 (`builtin_dict.rs`) と品詞接続コスト表 (`connection_cost.rs`) は生成済みのものがリポジトリに同梱されているため、**通常のビルドでは再生成は不要**です。辞書ソースを更新したい場合のみ実行します。
+
+再生成には IPADIC の **CSV ソース**が必要です。apt の `mecab-ipadic` パッケージはコンパイル済み辞書（`/var/lib/mecab/...`）のため**別物**で、CSV は含まれません。[IPADIC のソース配布](https://github.com/taku910/mecab)（`mecab-ipadic-2.7.0-*.tar.gz`）から CSV を取得し、`src/bin/generate_dict.rs` の `IPADIC_DIR`（既定 `/usr/share/mecab/dic/ipadic`）に配置してください。
+
+```bash
+# 組み込み辞書を再生成（IPADIC CSV → builtin_dict.rs）
+cargo run --bin generate-dict
+
+# 品詞接続コスト表を再生成（IPADIC matrix.def から 11×11 集約）
+cargo run --bin generate-matrix --release > src/core/dictionary/connection_cost.rs
+```
 
 ## テスト
 
