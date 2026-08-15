@@ -27,10 +27,14 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        # dtolnay/rust-toolchain uses branch names (`stable`) rather than
+        # semver tags. Pinned to the current `stable` HEAD commit; bump
+        # manually when adopting a newer Rust — Dependabot does not track
+        # SHA pins that originate from branch refs.
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @ 2026-08-05
 
       - name: Verify tag matches Cargo.toml and bonolith.xml
         run: |
@@ -66,7 +70,7 @@ jobs:
           sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           generate_release_notes: true
           body: |

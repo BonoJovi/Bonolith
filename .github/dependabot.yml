@@ -1,0 +1,20 @@
+# Keep third-party GitHub Actions used in workflows up to date. The
+# release workflow pins each `uses:` to a full commit SHA (with a
+# trailing semver comment) so a retagged upstream cannot silently ship
+# new code under the same `@v2` tag; Dependabot uses the semver comment
+# to open a PR whenever a newer release is published, updating both the
+# SHA and the comment atomically.
+#
+# The `dtolnay/rust-toolchain@<sha> # stable @ <date>` pin does NOT
+# participate — Dependabot does not track SHAs originating from branch
+# refs. Bump that one manually when adopting a newer Rust toolchain.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    groups:
+      actions:
+        patterns:
+          - "*"
