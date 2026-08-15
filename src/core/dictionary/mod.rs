@@ -302,6 +302,15 @@ impl Dictionary {
         let bos_slot = PartOfSpeech::Other.idx();
         best_cost[0][bos_slot] = 0.0;
 
+        // Per-prefix data that depends on (i, len) only — hoisted out of
+        // the prev_p loop so boost_fn and the accompanying allocations
+        // run once per prefix instead of PC times.
+        struct PrefixInfo {
+            len: usize,
+            best_freq_by_pos: [u32; PC],
+            boost: f64,
+        }
+
         for i in 0..n {
             let is_bos = i == 0;
             let remaining = &input[byte_offsets[i]..];
@@ -314,14 +323,9 @@ impl Dictionary {
             // dictionary word apart.
             let max_prefix_len = prefixes.iter().map(|(l, _)| *l).max().unwrap_or(0);
 
-            for prev_p in 0..PC {
-                let prev_cost = best_cost[i][prev_p];
-                if prev_cost >= INF {
-                    continue;
-                }
-                let prev_pos = if is_bos { None } else { Some(POS_BY_IDX[prev_p]) };
-
-                for (len, indices) in &prefixes {
+            let prefix_infos: Vec<PrefixInfo> = prefixes
+                .iter()
+                .map(|(len, indices)| {
                     // Group candidates by POS; take the max-frequency entry per POS
                     // so each POS transition is scored on its strongest candidate.
                     let mut best_freq_by_pos = [0u32; PC];
@@ -333,29 +337,41 @@ impl Dictionary {
                         }
                     }
 
-                    let reading: String = chars[i..i + len].iter().collect();
-                    let entries: Vec<&DictionaryEntry> = indices
-                        .iter()
-                        .map(|&idx| &self.entries[idx])
-                        .collect();
                     let boost = if *len < max_prefix_len {
                         0.0
                     } else {
+                        let reading: String = chars[i..i + len].iter().collect();
+                        let entries: Vec<&DictionaryEntry> = indices
+                            .iter()
+                            .map(|&idx| &self.entries[idx])
+                            .collect();
                         boost_fn(&reading, &entries)
                     };
 
+                    PrefixInfo { len: *len, best_freq_by_pos, boost }
+                })
+                .collect();
+
+            for prev_p in 0..PC {
+                let prev_cost = best_cost[i][prev_p];
+                if prev_cost >= INF {
+                    continue;
+                }
+                let prev_pos = if is_bos { None } else { Some(POS_BY_IDX[prev_p]) };
+
+                for info in &prefix_infos {
                     for cur_p in 0..PC {
-                        let best_freq = best_freq_by_pos[cur_p];
+                        let best_freq = info.best_freq_by_pos[cur_p];
                         if best_freq == 0 {
                             continue;
                         }
                         let cur_pos = POS_BY_IDX[cur_p];
                         let conn = connection_cost(prev_pos, cur_pos);
-                        let cost = segment_cost(*len, best_freq) + conn - boost;
+                        let cost = segment_cost(info.len, best_freq) + conn - info.boost;
                         let total = prev_cost + cost;
-                        if total < best_cost[i + len][cur_p] {
-                            best_cost[i + len][cur_p] = total;
-                            back[i + len][cur_p] = Some((i, prev_p));
+                        if total < best_cost[i + info.len][cur_p] {
+                            best_cost[i + info.len][cur_p] = total;
+                            back[i + info.len][cur_p] = Some((i, prev_p));
                         }
                     }
                 }
