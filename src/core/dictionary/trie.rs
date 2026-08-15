@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 pub struct TrieNode {
     children: HashMap<char, TrieNode>,
-    /// Entry indices into Dictionary.entries, sorted by frequency (descending)
+    /// Entry indices into Dictionary.entries, in insertion order. Callers that
+    /// want frequency ordering (e.g. Dictionary::lookup) sort at read time.
     pub entry_indices: Vec<usize>,
 }
 
@@ -26,8 +27,9 @@ impl Trie {
         }
     }
 
-    /// Insert an entry index at the given reading, maintaining frequency-sorted order.
-    pub fn insert(&mut self, reading: &str, entry_idx: usize, frequency: u32) {
+    /// Insert an entry index at the given reading. Insertion order is preserved
+    /// on the node; callers that need frequency ordering sort at read time.
+    pub fn insert(&mut self, reading: &str, entry_idx: usize) {
         let mut node = &mut self.root;
         for ch in reading.chars() {
             node = node.children.entry(ch).or_insert_with(TrieNode::new);
@@ -37,7 +39,6 @@ impl Trie {
             return;
         }
         node.entry_indices.push(entry_idx);
-        let _ = frequency; // frequency ordering maintained by insertion order
     }
 
     /// Exact lookup: return entry indices for the exact reading.
@@ -115,9 +116,9 @@ mod tests {
     #[test]
     fn insert_and_exact_lookup() {
         let mut trie = Trie::new();
-        trie.insert("きょう", 0, 9500);
-        trie.insert("きょう", 1, 7000);
-        trie.insert("きた", 2, 8000);
+        trie.insert("きょう", 0);
+        trie.insert("きょう", 1);
+        trie.insert("きた", 2);
 
         assert_eq!(trie.exact_lookup("きょう"), &[0, 1]);
         assert_eq!(trie.exact_lookup("きた"), &[2]);
@@ -132,9 +133,9 @@ mod tests {
     #[test]
     fn common_prefix_search_basic() {
         let mut trie = Trie::new();
-        trie.insert("き", 0, 5000);
-        trie.insert("きょう", 1, 9500);
-        trie.insert("きょうと", 2, 8000);
+        trie.insert("き", 0);
+        trie.insert("きょう", 1);
+        trie.insert("きょうと", 2);
 
         let results = trie.common_prefix_search("きょうは");
         // Should find: き (len=1), きょう (len=3), but NOT きょうと (input too short at は)
@@ -146,10 +147,10 @@ mod tests {
     #[test]
     fn prefix_lookup_basic() {
         let mut trie = Trie::new();
-        trie.insert("きょう", 0, 9500);
-        trie.insert("きょうと", 1, 8000);
-        trie.insert("きょうだい", 2, 7500);
-        trie.insert("きた", 3, 8000);
+        trie.insert("きょう", 0);
+        trie.insert("きょうと", 1);
+        trie.insert("きょうだい", 2);
+        trie.insert("きた", 3);
 
         let mut results = trie.prefix_lookup("きょう");
         results.sort();
@@ -166,13 +167,13 @@ mod tests {
         // predicate, which returns an unspecified index and could let the
         // same entry_idx be pushed twice when it sits mid-vector.
         let mut trie = Trie::new();
-        trie.insert("あ", 10, 100);
-        trie.insert("あ", 20, 100);
-        trie.insert("あ", 30, 100);
-        trie.insert("あ", 40, 100);
-        trie.insert("あ", 50, 100);
+        trie.insert("あ", 10);
+        trie.insert("あ", 20);
+        trie.insert("あ", 30);
+        trie.insert("あ", 40);
+        trie.insert("あ", 50);
         // Re-insert a middle idx — must not duplicate.
-        trie.insert("あ", 30, 100);
+        trie.insert("あ", 30);
         assert_eq!(trie.exact_lookup("あ"), &[10, 20, 30, 40, 50]);
     }
 

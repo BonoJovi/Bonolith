@@ -227,9 +227,8 @@ impl Dictionary {
     pub fn add_entry(&mut self, entry: DictionaryEntry) {
         let idx = self.entries.len();
         let reading = entry.reading.clone();
-        let frequency = entry.frequency;
         self.entries.push(entry);
-        self.trie.insert(&reading, idx, frequency);
+        self.trie.insert(&reading, idx);
     }
 
     /// Exact lookup: return all candidates for a reading, sorted by frequency (descending).
