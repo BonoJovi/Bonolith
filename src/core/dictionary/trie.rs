@@ -32,20 +32,10 @@ impl Trie {
         for ch in reading.chars() {
             node = node.children.entry(ch).or_insert_with(TrieNode::new);
         }
-        // Insert maintaining descending frequency order
-        let pos = node
-            .entry_indices
-            .partition_point(|&idx| idx != entry_idx);
         // Avoid duplicates
-        if pos < node.entry_indices.len() && node.entry_indices[pos] == entry_idx {
+        if node.entry_indices.iter().any(|&idx| idx == entry_idx) {
             return;
         }
-        // We store indices and sort by frequency via a callback isn't possible here,
-        // so we just push and let Dictionary handle ordering.
-        // Actually, we insert in sorted position using the frequency.
-        // We need a helper: store (frequency, idx) temporarily? No -- keep it simple.
-        // The builtin_dict is already sorted by frequency within each reading group,
-        // so insertion order preserves frequency ordering.
         node.entry_indices.push(entry_idx);
         let _ = frequency; // frequency ordering maintained by insertion order
     }
@@ -168,6 +158,22 @@ mod tests {
         let mut results2 = trie.prefix_lookup("き");
         results2.sort();
         assert_eq!(results2, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn insert_deduplicates_repeat_entry_idx() {
+        // Regression: previously used partition_point with a non-monotonic
+        // predicate, which returns an unspecified index and could let the
+        // same entry_idx be pushed twice when it sits mid-vector.
+        let mut trie = Trie::new();
+        trie.insert("あ", 10, 100);
+        trie.insert("あ", 20, 100);
+        trie.insert("あ", 30, 100);
+        trie.insert("あ", 40, 100);
+        trie.insert("あ", 50, 100);
+        // Re-insert a middle idx — must not duplicate.
+        trie.insert("あ", 30, 100);
+        assert_eq!(trie.exact_lookup("あ"), &[10, 20, 30, 40, 50]);
     }
 
     #[test]
