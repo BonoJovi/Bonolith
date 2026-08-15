@@ -18,7 +18,10 @@ permissions:
 
 jobs:
   build-release:
-    runs-on: ubuntu-latest
+    # Pinned to the oldest supported runner so the binary links against
+    # an older glibc and remains loadable on Ubuntu 22.04 / Debian 12
+    # users. Bumping this raises the minimum glibc floor for all users.
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout
         uses: actions/checkout@v5
