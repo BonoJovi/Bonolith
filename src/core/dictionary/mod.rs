@@ -340,12 +340,12 @@ impl Dictionary {
                     let boost = if *len < max_prefix_len {
                         0.0
                     } else {
-                        let reading: String = chars[i..i + len].iter().collect();
+                        let reading = &input[byte_offsets[i]..byte_offsets[i + *len]];
                         let entries: Vec<&DictionaryEntry> = indices
                             .iter()
                             .map(|&idx| &self.entries[idx])
                             .collect();
-                        boost_fn(&reading, &entries)
+                        boost_fn(reading, &entries)
                     };
 
                     PrefixInfo { len: *len, best_freq_by_pos, boost }
