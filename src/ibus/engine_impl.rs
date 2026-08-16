@@ -216,17 +216,14 @@ impl BonolithEngine {
         _keycode: u32,
         state: u32,
     ) -> zbus::fdo::Result<bool> {
-        // Consume releases for function keys (F6–F10) when IME is active,
-        // to prevent GTK apps from opening menus on F10 release.
+        // Consume all key releases while IME is active. Leaking a release for
+        // a key whose press we consumed (Space, arrows, Enter, F6–F10) lets
+        // some XIM/IBus clients reconstruct a phantom press+release pair from
+        // the orphan release. Text-carrying apps derive input from press
+        // events, so consuming releases is safe.
         if is_release(state) {
             let enabled = *self.enabled.lock().unwrap();
-            if enabled
-                && (keyval == IBUS_KEY_F6
-                    || keyval == IBUS_KEY_F7
-                    || keyval == IBUS_KEY_F8
-                    || keyval == IBUS_KEY_F9
-                    || keyval == IBUS_KEY_F10)
-            {
+            if enabled {
                 return Ok(true);
             }
             return Ok(false);
@@ -318,6 +315,8 @@ impl BonolithEngine {
                     .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
                 Self::hide_lookup_table(&emitter).await
                     .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                Self::hide_auxiliary_text(&emitter).await
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
                 *self.converting.lock().unwrap() = false;
                 return Ok(true);
             }
@@ -386,6 +385,8 @@ impl BonolithEngine {
                 Self::hide_preedit_text(&emitter).await
                     .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
                 Self::hide_lookup_table(&emitter).await
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                Self::hide_auxiliary_text(&emitter).await
                     .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
                 *self.converting.lock().unwrap() = false;
             }
@@ -509,6 +510,11 @@ impl BonolithEngine {
         // moment it gains focus (no keystroke needed).
         self.apply_force_enable();
         info!("Bonolith: FocusIn (enabled={})", *self.enabled.lock().unwrap());
+        // Reset the client's IM state on focus so the XIM proxy doesn't carry
+        // a stale buffer from the previous window (Mozc parity).
+        let _ = Self::hide_preedit_text(&emitter).await;
+        let _ = Self::hide_lookup_table(&emitter).await;
+        let _ = Self::hide_auxiliary_text(&emitter).await;
         if let Err(e) = self.register_menu(&emitter).await {
             warn!("Bonolith: Failed to register properties: {}", e);
         }
@@ -549,13 +555,36 @@ impl BonolithEngine {
     }
 
     /// Called when the engine loses focus.
-    async fn focus_out(&self) {
-        info!("Bonolith: FocusOut");
-        // We send preedit with IBUS_ENGINE_PREEDIT_COMMIT (mode=1), so IBus
-        // itself commits any visible composition on focus loss — clicking away
-        // (e.g. onto a modal) preserves typed text, like Mozc/Google IME.
-        // Emitting CommitText here too would double-commit; instead we just
-        // clear our internal buffer so stale preedit can't reappear next focus.
+    async fn focus_out(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) {
+        // With mode=0 (PREEDIT_CLEAR) IBus drops the preedit on focus loss, so
+        // we must commit manually to preserve the "click-away keeps typed text"
+        // contract (Mozc/Google IME parity).
+        let commit_str = {
+            let mut engine = self.engine.lock().unwrap();
+            let converting = *self.converting.lock().unwrap();
+            let preedit = engine.preedit().to_string();
+            if converting {
+                engine.commit_conversion().unwrap_or_default()
+            } else if !preedit.is_empty() {
+                engine.commit(&preedit);
+                preedit
+            } else {
+                String::new()
+            }
+        };
+
+        if !commit_str.is_empty() {
+            if let Err(e) = Self::commit_text(&emitter, ibus_text(&commit_str)).await {
+                warn!("Bonolith: focus_out commit_text failed: {e}");
+            }
+        }
+        // Hide any stale UI, clear internal state.
+        let _ = Self::hide_preedit_text(&emitter).await;
+        let _ = Self::hide_lookup_table(&emitter).await;
+        let _ = Self::hide_auxiliary_text(&emitter).await;
         {
             let mut engine = self.engine.lock().unwrap();
             engine.reset();
@@ -575,9 +604,16 @@ impl BonolithEngine {
     }
 
     /// Enable the engine.
-    async fn enable(&self) {
+    async fn enable(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) {
         self.apply_force_enable();
         info!("Bonolith: Enable (enabled={})", *self.enabled.lock().unwrap());
+        // Reset the client's IM state on enable (Mozc parity).
+        let _ = Self::hide_preedit_text(&emitter).await;
+        let _ = Self::hide_lookup_table(&emitter).await;
+        let _ = Self::hide_auxiliary_text(&emitter).await;
     }
 
     /// Disable the engine.
@@ -629,6 +665,20 @@ impl BonolithEngine {
     /// Hide the lookup table.
     #[zbus(signal)]
     async fn hide_lookup_table(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
+
+    /// Update the auxiliary text (romaji buffer / status area).
+    /// Emitted alongside preedit/lookup updates for parity with Mozc so the
+    /// XIM proxy's internal buffer never accumulates stale content.
+    #[zbus(signal)]
+    async fn update_auxiliary_text(
+        emitter: &SignalEmitter<'_>,
+        text: zvariant::Value<'_>,
+        visible: bool,
+    ) -> zbus::Result<()>;
+
+    /// Hide the auxiliary text.
+    #[zbus(signal)]
+    async fn hide_auxiliary_text(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
 
     /// Register the property list (menu items).
     #[zbus(signal)]
@@ -771,6 +821,8 @@ impl BonolithEngine {
                         .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
                     Self::hide_lookup_table(emitter).await
                         .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                    Self::hide_auxiliary_text(emitter).await
+                        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
                     *self.converting.lock().unwrap() = false;
                 }
                 Ok(true)
@@ -804,16 +856,16 @@ impl BonolithEngine {
         let ranges = state.segment_char_ranges();
         let focus = state.focus;
 
-        // Preedit with segment highlighting
+        // Preedit with segment highlighting.
+        // mode=0 (PREEDIT_CLEAR): drop preedit when hidden; focus_out commits
+        // manually so the click-away-keeps-text contract still holds.
         let cursor = text.chars().count() as u32;
-        // mode=1 (IBUS_ENGINE_PREEDIT_COMMIT): commit-on-focus-loss, so clicking
-        // away mid-conversion keeps the composed text instead of dropping it.
         Self::update_preedit_text(
             emitter,
             ibus_text_with_segments(&text, &ranges, focus),
             cursor,
             true,
-            1,
+            0,
         ).await.map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
         // Lookup table for the focused segment's candidates
@@ -822,6 +874,14 @@ impl BonolithEngine {
             emitter,
             ibus_lookup_table(&seg.candidates, seg.selected),
             true,
+        ).await.map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+        // Keep auxiliary text explicitly empty so the XIM proxy doesn't
+        // accumulate stale content (Mozc parity).
+        Self::update_auxiliary_text(
+            emitter,
+            ibus_text(""),
+            false,
         ).await.map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
         Ok(())
@@ -941,6 +1001,10 @@ impl BonolithEngine {
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Self::hide_preedit_text(emitter).await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        Self::hide_lookup_table(emitter).await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        Self::hide_auxiliary_text(emitter).await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
         Ok(true)
     }
@@ -958,6 +1022,8 @@ impl BonolithEngine {
         Self::hide_preedit_text(emitter).await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Self::hide_lookup_table(emitter).await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        Self::hide_auxiliary_text(emitter).await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Ok(true)
     }
@@ -979,6 +1045,8 @@ impl BonolithEngine {
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Self::hide_lookup_table(emitter).await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        Self::hide_auxiliary_text(emitter).await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Ok(())
     }
 
@@ -996,11 +1064,22 @@ impl BonolithEngine {
         } else {
             ibus_text(text)
         };
-        // mode=1 (IBUS_ENGINE_PREEDIT_COMMIT): on focus loss IBus commits this
-        // preedit instead of discarding it, so clicking away (e.g. onto a modal)
-        // preserves typed text. See focus_out — we no longer commit manually.
-        Self::update_preedit_text(emitter, preedit_text, cursor, visible, 1).await
+        // mode=0 (PREEDIT_CLEAR): drop preedit when hidden; focus_out commits
+        // manually to preserve the click-away-keeps-text contract.
+        Self::update_preedit_text(emitter, preedit_text, cursor, visible, 0).await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        // Keep lookup and auxiliary explicitly cleared during romaji buildup
+        // so no stale state accumulates in the client (Mozc parity).
+        Self::update_lookup_table(
+            emitter,
+            ibus_lookup_table(&[], 0),
+            false,
+        ).await.map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        Self::update_auxiliary_text(
+            emitter,
+            ibus_text(""),
+            false,
+        ).await.map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Ok(())
     }
 
@@ -1419,6 +1498,10 @@ impl BonolithEngine {
 
         if new_preedit.is_empty() {
             Self::hide_preedit_text(emitter).await
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            Self::hide_lookup_table(emitter).await
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            Self::hide_auxiliary_text(emitter).await
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         } else {
             self.send_preedit(emitter, &new_preedit).await?;

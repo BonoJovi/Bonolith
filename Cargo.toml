@@ -13,7 +13,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # D-Bus for IBus integration
-zbus = "5"
+zbus = { version = "5", features = ["tokio"] }
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 # Serialization
