@@ -350,27 +350,42 @@ pub fn hiragana_to_romaji(s: &str) -> String {
     result
 }
 
+/// ASCII → full-width Japanese equivalent for a single character.
+///
+/// Shared by every front-end that inserts a punctuation/digit character
+/// into the preedit while Bonolith is active (Fcitx5 via `bonolith_handle_key`,
+/// IBus via `process_key_event`, F9 kana→romaji form). Previously duplicated
+/// three times — the IBus and FFI copies also missed `'`, `-`, and ` ` that
+/// the F9 form already handled.
+///
+/// Digits and letters map to their U+FF01-block equivalents; the punctuation
+/// table below matches the Mozc/ATOK conventions users expect. Returns
+/// `None` for characters we deliberately leave unchanged.
+pub fn to_fullwidth_char(c: char) -> Option<char> {
+    Some(match c {
+        'a'..='z' => char::from_u32(c as u32 - 'a' as u32 + 'ａ' as u32)?,
+        'A'..='Z' => char::from_u32(c as u32 - 'A' as u32 + 'Ａ' as u32)?,
+        '0'..='9' => char::from_u32(c as u32 - '0' as u32 + '０' as u32)?,
+        '!' => '！', '?' => '？', '.' => '。', ',' => '、',
+        '(' => '（', ')' => '）', '[' => '［', ']' => '］',
+        '{' => '｛', '}' => '｝', '+' => '＋', '=' => '＝',
+        '*' => '＊', '/' => '／', '\\' => '＼', '&' => '＆',
+        '@' => '＠', '#' => '＃', '$' => '＄', '%' => '％',
+        '^' => '＾', '|' => '｜', '~' => '～', '<' => '＜',
+        '>' => '＞', ':' => '：', ';' => '；', '_' => '＿',
+        '"' => '＂', '\'' => '＇', '`' => '｀', '-' => 'ー',
+        ' ' => '\u{3000}', // full-width space
+        _ => return None,
+    })
+}
+
 /// Convert a hiragana string to full-width ASCII romaji.
 /// First converts to half-width romaji, then maps each ASCII char to its full-width equivalent.
 pub fn hiragana_to_fullwidth_romaji(s: &str) -> String {
     let romaji = hiragana_to_romaji(s);
     romaji
         .chars()
-        .map(|c| match c {
-            'a'..='z' => char::from_u32(c as u32 - 'a' as u32 + 'ａ' as u32).unwrap_or(c),
-            'A'..='Z' => char::from_u32(c as u32 - 'A' as u32 + 'Ａ' as u32).unwrap_or(c),
-            '0'..='9' => char::from_u32(c as u32 - '0' as u32 + '０' as u32).unwrap_or(c),
-            '!' => '！', '?' => '？', '.' => '。', ',' => '、',
-            '(' => '（', ')' => '）', '[' => '［', ']' => '］',
-            '{' => '｛', '}' => '｝', '+' => '＋', '=' => '＝',
-            '*' => '＊', '/' => '／', '\\' => '＼', '&' => '＆',
-            '@' => '＠', '#' => '＃', '$' => '＄', '%' => '％',
-            '^' => '＾', '|' => '｜', '~' => '～', '<' => '＜',
-            '>' => '＞', ':' => '：', ';' => '；', '_' => '＿',
-            '"' => '＂', '\'' => '＇', '`' => '｀', '-' => 'ー',
-            ' ' => '\u{3000}', // full-width space
-            _ => c,
-        })
+        .map(|c| to_fullwidth_char(c).unwrap_or(c))
         .collect()
 }
 
@@ -679,6 +694,24 @@ mod tests {
         assert_eq!(hiragana_to_romaji("。"), ".");
         assert_eq!(hiragana_to_romaji("、"), ",");
         assert_eq!(hiragana_to_romaji("！"), "!");
+    }
+
+    #[test]
+    fn to_fullwidth_char_covers_shared_table() {
+        // Punctuation & digits that every front-end used to duplicate.
+        assert_eq!(to_fullwidth_char(','), Some('、'));
+        assert_eq!(to_fullwidth_char('.'), Some('。'));
+        assert_eq!(to_fullwidth_char('!'), Some('！'));
+        assert_eq!(to_fullwidth_char('7'), Some('７'));
+        // Letters and hyphen/apostrophe DO map (F9 form uses them);
+        // the front-end wrappers filter these out so process_key still
+        // owns romaji-input characters.
+        assert_eq!(to_fullwidth_char('a'), Some('ａ'));
+        assert_eq!(to_fullwidth_char('-'), Some('ー'));
+        assert_eq!(to_fullwidth_char('\''), Some('＇'));
+        assert_eq!(to_fullwidth_char(' '), Some('\u{3000}'));
+        // Non-ASCII passthrough remains None.
+        assert_eq!(to_fullwidth_char('あ'), None);
     }
 
     #[test]

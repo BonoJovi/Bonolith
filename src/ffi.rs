@@ -128,51 +128,19 @@ pub struct BonolithContext {
     cache_candidates: Vec<CString>,
 }
 
-/// Full-width punctuation mapping.
-fn to_fullwidth(ch: char) -> Option<&'static str> {
-    match ch {
-        ',' => Some("、"),
-        '.' => Some("。"),
-        '!' => Some("！"),
-        '?' => Some("？"),
-        '(' => Some("（"),
-        ')' => Some("）"),
-        '[' => Some("［"),
-        ']' => Some("］"),
-        '{' => Some("｛"),
-        '}' => Some("｝"),
-        '+' => Some("＋"),
-        '=' => Some("＝"),
-        '*' => Some("＊"),
-        '/' => Some("／"),
-        '\\' => Some("＼"),
-        '&' => Some("＆"),
-        '@' => Some("＠"),
-        '#' => Some("＃"),
-        '$' => Some("＄"),
-        '%' => Some("％"),
-        '^' => Some("＾"),
-        '|' => Some("｜"),
-        '~' => Some("～"),
-        '<' => Some("＜"),
-        '>' => Some("＞"),
-        ':' => Some("："),
-        ';' => Some("；"),
-        '_' => Some("＿"),
-        '"' => Some("＂"),
-        '`' => Some("｀"),
-        '0' => Some("０"),
-        '1' => Some("１"),
-        '2' => Some("２"),
-        '3' => Some("３"),
-        '4' => Some("４"),
-        '5' => Some("５"),
-        '6' => Some("６"),
-        '7' => Some("７"),
-        '8' => Some("８"),
-        '9' => Some("９"),
-        _ => None,
+/// Full-width punctuation/digit mapping. Delegates to the shared table in
+/// `core::romaji::to_fullwidth_char` so the Fcitx5, IBus, and F9 paths all
+/// agree on which characters convert (previously three drifting copies).
+///
+/// Excludes characters the romaji converter owns (a-z, A-Z, `'` for the
+/// n'-disambiguation trick, `-` for long-vowel input, ` ` as a bunsetsu
+/// delimiter) — those go through `ctx.engine.process_key(ch)` instead of
+/// landing in the preedit as full-width symbols.
+fn to_fullwidth(ch: char) -> Option<String> {
+    if ch.is_ascii_alphabetic() || matches!(ch, '\'' | '-' | ' ') {
+        return None;
     }
+    crate::core::romaji::to_fullwidth_char(ch).map(|c| c.to_string())
 }
 
 fn is_printable_ascii(keyval: u32) -> bool {
@@ -356,7 +324,7 @@ pub unsafe extern "C" fn bonolith_handle_key(
     if is_printable_ascii(keyval) {
         if let Some(ch) = char::from_u32(keyval) {
             if let Some(fw) = to_fullwidth(ch) {
-                ctx.engine.append_raw(fw);
+                ctx.engine.append_raw(&fw);
                 return true;
             }
             // Alphabetic → romaji input
@@ -427,7 +395,7 @@ fn handle_conversion_key(ctx: &mut BonolithContext, keyval: u32, has_shift: bool
             // Process the incoming character (punctuation, letter, etc.)
             if let Some(ch) = char::from_u32(keyval) {
                 if let Some(fw) = to_fullwidth(ch) {
-                    ctx.engine.append_raw(fw);
+                    ctx.engine.append_raw(&fw);
                 } else if ch.is_ascii_alphabetic() || ch == '-' || ch == '\'' {
                     ctx.engine.process_key(ch.to_ascii_lowercase());
                 }

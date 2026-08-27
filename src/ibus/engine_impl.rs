@@ -439,55 +439,21 @@ impl BonolithEngine {
             return Ok(has_preedit);
         }
 
-        // Symbol/punctuation/digit → full-width equivalent in preedit (F8 for half-width)
+        // Symbol/punctuation/digit → full-width equivalent in preedit.
+        // Alphabetics / -/'/' ' fall through to the romaji-input branch
+        // below — to_fullwidth_char maps them too, but Bonolith wants
+        // a-z routed through process_key (so 「ka」→ か), and reserves
+        // `'` for n'-disambiguation and `-` for long-vowel input.
         if let Some(ch) = keyval_to_char(keyval) {
-            let fw = match ch {
-                ',' => Some("、"),
-                '.' => Some("。"),
-                '!' => Some("！"),
-                '?' => Some("？"),
-                '(' => Some("（"),
-                ')' => Some("）"),
-                '[' => Some("［"),
-                ']' => Some("］"),
-                '{' => Some("｛"),
-                '}' => Some("｝"),
-                '+' => Some("＋"),
-                '=' => Some("＝"),
-                '*' => Some("＊"),
-                '/' => Some("／"),
-                '\\' => Some("＼"),
-                '&' => Some("＆"),
-                '@' => Some("＠"),
-                '#' => Some("＃"),
-                '$' => Some("＄"),
-                '%' => Some("％"),
-                '^' => Some("＾"),
-                '|' => Some("｜"),
-                '~' => Some("～"),
-                '<' => Some("＜"),
-                '>' => Some("＞"),
-                ':' => Some("："),
-                ';' => Some("；"),
-                '_' => Some("＿"),
-                '"' => Some("＂"),
-                '`' => Some("｀"),
-                '0' => Some("０"),
-                '1' => Some("１"),
-                '2' => Some("２"),
-                '3' => Some("３"),
-                '4' => Some("４"),
-                '5' => Some("５"),
-                '6' => Some("６"),
-                '7' => Some("７"),
-                '8' => Some("８"),
-                '9' => Some("９"),
-                _ => None,
+            let fw = if ch.is_ascii_alphabetic() || matches!(ch, '\'' | '-' | ' ') {
+                None
+            } else {
+                bonolith::core::romaji::to_fullwidth_char(ch)
             };
             if let Some(sym) = fw {
                 let preedit = {
                     let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
-                    engine.append_raw(sym);
+                    engine.append_raw(&sym.to_string());
                     engine.preedit().to_string()
                 };
                 self.send_preedit(&emitter, &preedit).await?;
