@@ -33,6 +33,12 @@ const SCHEMA_VERSION: i32 = 1;
 const MIGRATION_FLAG: &str = "legacy_json_migrated";
 
 pub struct DictStore {
+    /// SQLite connection guarded behind a Mutex. Poison recovery via
+    /// `unwrap_or_else(|e| e.into_inner())` is safe here: rusqlite protects
+    /// the in-progress statement itself, so any panic that poisoned the
+    /// lock left the connection either at a statement boundary or ended
+    /// its transaction cleanly; retrying is preferable to letting a
+    /// single panic wedge every subsequent read/write.
     conn: Mutex<Connection>,
 }
 
@@ -108,7 +114,7 @@ impl DictStore {
     }
 
     fn init_schema(&self) -> io::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute_batch(
             "BEGIN;
              CREATE TABLE IF NOT EXISTS meta (
@@ -164,7 +170,7 @@ impl DictStore {
         let entries = read_legacy_dict_json(dict_json)?;
         let scores = read_legacy_scores_json(scores_json)?;
 
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction().map_err(sqlite_to_io)?;
         for entry in &entries {
             tx.execute(
@@ -249,7 +255,7 @@ impl DictStore {
             HashMap::new()
         };
 
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction().map_err(sqlite_to_io)?;
 
         let mut entries_added: usize = 0;
@@ -330,7 +336,7 @@ impl DictStore {
     }
 
     fn is_migrated(&self) -> io::Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let val: Option<String> = conn
             .query_row(
                 "SELECT value FROM meta WHERE key = ?1",
@@ -342,7 +348,7 @@ impl DictStore {
     }
 
     pub fn load_user_entries(&self) -> io::Result<Vec<DictionaryEntry>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
             .prepare("SELECT reading, surface, pos, frequency FROM user_entries")
             .map_err(sqlite_to_io)?;
@@ -370,7 +376,7 @@ impl DictStore {
     }
 
     pub fn upsert_user_entry(&self, entry: &DictionaryEntry) -> io::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT INTO user_entries (reading, surface, pos, frequency)
              VALUES (?1, ?2, ?3, ?4)
@@ -389,7 +395,7 @@ impl DictStore {
     }
 
     pub fn remove_user_entry(&self, reading: &str, surface: &str) -> io::Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let n = conn
             .execute(
                 "DELETE FROM user_entries WHERE reading = ?1 AND surface = ?2",
@@ -400,7 +406,7 @@ impl DictStore {
     }
 
     pub fn clear_user_scores(&self) -> io::Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let n = conn
             .execute("DELETE FROM user_scores", [])
             .map_err(sqlite_to_io)?;
@@ -408,7 +414,7 @@ impl DictStore {
     }
 
     pub fn load_user_scores(&self) -> io::Result<HashMap<String, u32>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
             .prepare("SELECT reading, surface, count FROM user_scores")
             .map_err(sqlite_to_io)?;
@@ -432,7 +438,7 @@ impl DictStore {
     /// single transaction. Used by FFI flows that operate via
     /// `Dictionary::replace_user_entries`.
     pub fn replace_all_user_entries(&self, entries: &[DictionaryEntry]) -> io::Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction().map_err(sqlite_to_io)?;
         tx.execute("DELETE FROM user_entries", [])
             .map_err(sqlite_to_io)?;
@@ -456,7 +462,7 @@ impl DictStore {
     /// Increment the count for `(reading, surface)`. Inserts the row at
     /// count=1 if absent. Used per-commit by UserScorer.
     pub fn increment_score(&self, reading: &str, surface: &str) -> io::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT INTO user_scores (reading, surface, count) VALUES (?1, ?2, 1)
              ON CONFLICT(reading, surface) DO UPDATE SET count = count + 1",

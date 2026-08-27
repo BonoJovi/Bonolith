@@ -8,10 +8,46 @@
 
 use std::ffi::CString;
 use std::os::raw::c_char;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
+use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::core::dictionary::{DictionaryEntry, PartOfSpeech};
 use crate::engine::{ConversionEngine, SharedCore};
+
+/// Acquire a write lock, unpoisoning on the fly. Poisoning happens when a
+/// previous holder panicked; the shared engine data is our own and cannot
+/// leave the process in a state that we cannot recover from — returning
+/// `into_inner()` gives us the guard back so the extern "C" caller keeps
+/// working instead of the whole IME dying on the next FFI call.
+fn write_lock_recover<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|e| e.into_inner())
+}
+
+fn read_lock_recover<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn mutex_lock_recover<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Wrap an extern "C" function body so a panic can never unwind past the
+/// FFI boundary. Any panic (which would otherwise be undefined behavior
+/// when it escapes into C/C++) is caught, logged with a source-location
+/// hint, and turned into the caller-provided default return value.
+fn ffi_boundary<R, F>(default: R, body: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    match catch_unwind(AssertUnwindSafe(body)) {
+        Ok(v) => v,
+        Err(_) => {
+            log::error!("bonolith FFI: panic caught at boundary; returning default");
+            default
+        }
+    }
+}
 
 // X11 keysym values (shared by IBus and Fcitx5)
 const KEY_SPACE: u32 = 0x0020;
@@ -698,44 +734,48 @@ pub unsafe extern "C" fn bonolith_dict_add_entry(
     reading: *const c_char,
     surface: *const c_char,
 ) -> bool {
-    let reading = match unsafe { std::ffi::CStr::from_ptr(reading) }.to_str() {
-        Ok(s) => s.to_string(),
-        Err(_) => return false,
-    };
-    let surface = match unsafe { std::ffi::CStr::from_ptr(surface) }.to_str() {
-        Ok(s) => s.to_string(),
-        Err(_) => return false,
-    };
-    if reading.is_empty() || surface.is_empty() {
-        return false;
-    }
+    ffi_boundary(false, || {
+        let reading = match unsafe { std::ffi::CStr::from_ptr(reading) }.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return false,
+        };
+        let surface = match unsafe { std::ffi::CStr::from_ptr(surface) }.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return false,
+        };
+        if reading.is_empty() || surface.is_empty() {
+            return false;
+        }
 
-    let entry = DictionaryEntry {
-        reading,
-        surface,
-        pos: PartOfSpeech::Noun,
-        frequency: 8000,
-    };
+        let entry = DictionaryEntry {
+            reading,
+            surface,
+            pos: PartOfSpeech::Noun,
+            frequency: 8000,
+        };
 
-    let shared = SharedCore::global();
-    let mut dict = shared.dictionary.write().unwrap();
-    dict.add_entry(entry);
-    dict.sync_user_entries_to_store().is_ok()
+        let shared = SharedCore::global();
+        let mut dict = write_lock_recover(&shared.dictionary);
+        dict.add_entry(entry);
+        dict.sync_user_entries_to_store().is_ok()
+    })
 }
 
 /// Delete a user dictionary entry by index. Returns true on success.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_dict_delete_entry(index: i32) -> bool {
-    let shared = SharedCore::global();
-    let mut dict = shared.dictionary.write().unwrap();
-    let mut entries = dict.user_entries().to_vec();
-    let idx = index as usize;
-    if idx >= entries.len() {
-        return false;
-    }
-    entries.remove(idx);
-    dict.replace_user_entries(entries);
-    dict.sync_user_entries_to_store().is_ok()
+    ffi_boundary(false, || {
+        let shared = SharedCore::global();
+        let mut dict = write_lock_recover(&shared.dictionary);
+        let mut entries = dict.user_entries().to_vec();
+        let idx = index as usize;
+        if idx >= entries.len() {
+            return false;
+        }
+        entries.remove(idx);
+        dict.replace_user_entries(entries);
+        dict.sync_user_entries_to_store().is_ok()
+    })
 }
 
 /// Update a user dictionary entry by index. Empty strings mean "no change".
@@ -746,124 +786,168 @@ pub unsafe extern "C" fn bonolith_dict_update_entry(
     new_reading: *const c_char,
     new_surface: *const c_char,
 ) -> bool {
-    let new_reading = match unsafe { std::ffi::CStr::from_ptr(new_reading) }.to_str() {
-        Ok(s) => s.to_string(),
-        Err(_) => return false,
-    };
-    let new_surface = match unsafe { std::ffi::CStr::from_ptr(new_surface) }.to_str() {
-        Ok(s) => s.to_string(),
-        Err(_) => return false,
-    };
+    ffi_boundary(false, || {
+        let new_reading = match unsafe { std::ffi::CStr::from_ptr(new_reading) }.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return false,
+        };
+        let new_surface = match unsafe { std::ffi::CStr::from_ptr(new_surface) }.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return false,
+        };
 
-    let shared = SharedCore::global();
-    let mut dict = shared.dictionary.write().unwrap();
-    let mut entries = dict.user_entries().to_vec();
-    let idx = index as usize;
-    if idx >= entries.len() {
-        return false;
-    }
-    if !new_reading.is_empty() {
-        entries[idx].reading = new_reading;
-    }
-    if !new_surface.is_empty() {
-        entries[idx].surface = new_surface;
-    }
-    dict.replace_user_entries(entries);
-    dict.sync_user_entries_to_store().is_ok()
+        let shared = SharedCore::global();
+        let mut dict = write_lock_recover(&shared.dictionary);
+        let mut entries = dict.user_entries().to_vec();
+        let idx = index as usize;
+        if idx >= entries.len() {
+            return false;
+        }
+        if !new_reading.is_empty() {
+            entries[idx].reading = new_reading;
+        }
+        if !new_surface.is_empty() {
+            entries[idx].surface = new_surface;
+        }
+        dict.replace_user_entries(entries);
+        dict.sync_user_entries_to_store().is_ok()
+    })
 }
 
 /// Get all user dictionary entries. Caller must free with bonolith_dict_free_entries().
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_dict_get_user_entries() -> BonolithDictEntries {
-    let shared = SharedCore::global();
-    let dict = shared.dictionary.read().unwrap();
-    let user = dict.user_entries();
+    let empty = BonolithDictEntries {
+        entries: ptr::null_mut(),
+        count: 0,
+    };
+    ffi_boundary(empty, || {
+        let shared = SharedCore::global();
+        let dict = read_lock_recover(&shared.dictionary);
+        let user = dict.user_entries();
 
-    if user.is_empty() {
-        return BonolithDictEntries {
-            entries: ptr::null_mut(),
-            count: 0,
-        };
-    }
-
-    let count = user.len();
-    let layout = std::alloc::Layout::array::<BonolithDictEntry>(count).unwrap();
-    let entries = unsafe { std::alloc::alloc(layout) as *mut BonolithDictEntry };
-
-    for (i, e) in user.iter().enumerate() {
-        let reading = CString::new(e.reading.as_str()).unwrap_or_default();
-        let surface = CString::new(e.surface.as_str()).unwrap_or_default();
-        unsafe {
-            (*entries.add(i)).reading = reading.into_raw();
-            (*entries.add(i)).surface = surface.into_raw();
+        if user.is_empty() {
+            return BonolithDictEntries {
+                entries: ptr::null_mut(),
+                count: 0,
+            };
         }
-    }
 
-    BonolithDictEntries {
-        entries,
-        count: count as i32,
-    }
+        let count = user.len();
+        let layout = match std::alloc::Layout::array::<BonolithDictEntry>(count) {
+            Ok(l) => l,
+            Err(e) => {
+                log::error!("bonolith_dict_get_user_entries: layout overflow count={count}: {e}");
+                return BonolithDictEntries {
+                    entries: ptr::null_mut(),
+                    count: 0,
+                };
+            }
+        };
+        let entries = unsafe { std::alloc::alloc(layout) as *mut BonolithDictEntry };
+        if entries.is_null() {
+            log::error!(
+                "bonolith_dict_get_user_entries: allocation failed count={count}"
+            );
+            return BonolithDictEntries {
+                entries: ptr::null_mut(),
+                count: 0,
+            };
+        }
+
+        for (i, e) in user.iter().enumerate() {
+            let reading = CString::new(e.reading.as_str()).unwrap_or_default();
+            let surface = CString::new(e.surface.as_str()).unwrap_or_default();
+            unsafe {
+                (*entries.add(i)).reading = reading.into_raw();
+                (*entries.add(i)).surface = surface.into_raw();
+            }
+        }
+
+        BonolithDictEntries {
+            entries,
+            count: count as i32,
+        }
+    })
 }
 
 /// Free entries returned by bonolith_dict_get_user_entries().
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_dict_free_entries(result: BonolithDictEntries) {
-    if result.entries.is_null() {
-        return;
-    }
-    for i in 0..result.count as usize {
-        unsafe {
-            let entry = &*result.entries.add(i);
-            if !entry.reading.is_null() {
-                drop(CString::from_raw(entry.reading as *mut c_char));
-            }
-            if !entry.surface.is_null() {
-                drop(CString::from_raw(entry.surface as *mut c_char));
+    ffi_boundary((), || {
+        if result.entries.is_null() {
+            return;
+        }
+        for i in 0..result.count as usize {
+            unsafe {
+                let entry = &*result.entries.add(i);
+                if !entry.reading.is_null() {
+                    drop(CString::from_raw(entry.reading as *mut c_char));
+                }
+                if !entry.surface.is_null() {
+                    drop(CString::from_raw(entry.surface as *mut c_char));
+                }
             }
         }
-    }
-    let layout = std::alloc::Layout::array::<BonolithDictEntry>(result.count as usize).unwrap();
-    unsafe { std::alloc::dealloc(result.entries as *mut u8, layout) };
+        // Layout must match the one used to allocate. If array::<T>(count)
+        // failed at allocation time, the caller received a null pointer
+        // and returned above — so if we got this far, count is valid.
+        match std::alloc::Layout::array::<BonolithDictEntry>(result.count as usize) {
+            Ok(layout) => unsafe {
+                std::alloc::dealloc(result.entries as *mut u8, layout);
+            },
+            Err(e) => log::error!(
+                "bonolith_dict_free_entries: layout mismatch count={} err={e}",
+                result.count,
+            ),
+        }
+    })
 }
 
 /// Export dictionary to a file path. Returns true on success.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_dict_export(path: *const c_char) -> bool {
-    let path = match unsafe { std::ffi::CStr::from_ptr(path) }.to_str() {
-        Ok(s) => std::path::PathBuf::from(s),
-        Err(_) => return false,
-    };
-    let shared = SharedCore::global();
-    let dict = shared.dictionary.read().unwrap();
-    dict.export(&path).is_ok()
+    ffi_boundary(false, || {
+        let path = match unsafe { std::ffi::CStr::from_ptr(path) }.to_str() {
+            Ok(s) => std::path::PathBuf::from(s),
+            Err(_) => return false,
+        };
+        let shared = SharedCore::global();
+        let dict = read_lock_recover(&shared.dictionary);
+        dict.export(&path).is_ok()
+    })
 }
 
 /// Import dictionary from a file path. Returns number of entries imported, or -1 on error.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_dict_import(path: *const c_char) -> i32 {
-    let path = match unsafe { std::ffi::CStr::from_ptr(path) }.to_str() {
-        Ok(s) => std::path::PathBuf::from(s),
-        Err(_) => return -1,
-    };
-    let shared = SharedCore::global();
-    let mut dict = shared.dictionary.write().unwrap();
-    match dict.import(&path) {
-        Ok(count) => {
-            let _ = dict.sync_user_entries_to_store();
-            count as i32
+    ffi_boundary(-1, || {
+        let path = match unsafe { std::ffi::CStr::from_ptr(path) }.to_str() {
+            Ok(s) => std::path::PathBuf::from(s),
+            Err(_) => return -1,
+        };
+        let shared = SharedCore::global();
+        let mut dict = write_lock_recover(&shared.dictionary);
+        match dict.import(&path) {
+            Ok(count) => {
+                let _ = dict.sync_user_entries_to_store();
+                count as i32
+            }
+            Err(_) => -1,
         }
-        Err(_) => -1,
-    }
+    })
 }
 
 /// Clear all user learning history (in-memory counts and persistent store).
 /// Returns the number of rows deleted, or -1 on error.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_clear_learning() -> i32 {
-    let shared = SharedCore::global();
-    let mut user_scorer = shared.user_scorer.lock().unwrap();
-    match user_scorer.clear_scores() {
-        Ok(n) => n as i32,
-        Err(_) => -1,
-    }
+    ffi_boundary(-1, || {
+        let shared = SharedCore::global();
+        let mut user_scorer = mutex_lock_recover(&shared.user_scorer);
+        match user_scorer.clear_scores() {
+            Ok(n) => n as i32,
+            Err(_) => -1,
+        }
+    })
 }

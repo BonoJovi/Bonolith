@@ -744,12 +744,14 @@ impl Dictionary {
                 }
                 _ => None,
             };
-            let should_merge = merge_right_pos.is_some();
-            if should_merge {
+            let Some(synthetic_pos) = merge_right_pos else {
+                i += 1;
+                continue;
+            };
+            {
                 let right = segs.remove(i + 1);
                 let left = &mut segs[i];
                 let merged_reading = format!("{}{}", left.reading, right.reading);
-                let synthetic_pos = merge_right_pos.unwrap();
                 // Which side plays which role in the synthetic surface? For
                 // affix compounds we want to filter candidates to their role
                 // (Prefix / Noun / Suffix) so the Cartesian product doesn't
@@ -856,8 +858,6 @@ impl Dictionary {
                     candidates: merged_candidates,
                 };
                 // Don't advance i — the new merged segment may itself be mergeable.
-            } else {
-                i += 1;
             }
         }
         segs
@@ -882,7 +882,8 @@ impl Dictionary {
         }
         let mut byte_offsets = vec![0usize];
         for c in &chars {
-            byte_offsets.push(byte_offsets.last().unwrap() + c.len_utf8());
+            let prev = byte_offsets.last().copied().unwrap_or(0);
+            byte_offsets.push(prev + c.len_utf8());
         }
         let mut out: Vec<DictionaryEntry> = Vec::new();
         for split in 1..chars.len() {
@@ -1697,10 +1698,13 @@ fn collect_verb_stems(
     let mut out = Vec::new();
     for &(reading, surface, freq) in overrides {
         let reading_chars: Vec<char> = reading.chars().collect();
+        // Guarded: len >= 3, so last() is always Some.
+        let Some(&last) = reading_chars.last() else {
+            continue;
+        };
         if reading_chars.len() < 3 {
             continue;
         }
-        let last = *reading_chars.last().unwrap();
         if !VERB_BASE_KANA.contains(&last) {
             continue;
         }

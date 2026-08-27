@@ -59,11 +59,11 @@ impl BonolithEngine {
     /// Returns true if it (or a prior call) left the engine enabled.
     fn apply_force_enable(&self) -> bool {
         let active = matches!(
-            *self.force.lock().unwrap(),
+            *self.force.lock().unwrap_or_else(|e| e.into_inner()),
             Some(deadline) if std::time::Instant::now() < deadline
         );
         if active {
-            let mut enabled = self.enabled.lock().unwrap();
+            let mut enabled = self.enabled.lock().unwrap_or_else(|e| e.into_inner());
             if !*enabled {
                 *enabled = true;
                 info!("Bonolith: force-enable window → enabled=true");
@@ -227,7 +227,7 @@ impl BonolithEngine {
         // the orphan release. Text-carrying apps derive input from press
         // events, so consuming releases is safe.
         if is_release(state) {
-            let enabled = *self.enabled.lock().unwrap();
+            let enabled = *self.enabled.lock().unwrap_or_else(|e| e.into_inner());
             if enabled {
                 return Ok(true);
             }
@@ -253,13 +253,13 @@ impl BonolithEngine {
         // these as toggle keys.
         if !has_modifier(state) && !self.is_toggle_key(keyval, state) {
             if keyval == IBUS_KEY_HENKAN_MODE {
-                *self.enabled.lock().unwrap() = true;
+                *self.enabled.lock().unwrap_or_else(|e| e.into_inner()) = true;
                 info!("Bonolith: Henkan → enabled=true (absolute ON)");
                 return Ok(true);
             }
             if keyval == IBUS_KEY_MUHENKAN {
                 let _ = self.cancel_input(&emitter).await;
-                *self.enabled.lock().unwrap() = false;
+                *self.enabled.lock().unwrap_or_else(|e| e.into_inner()) = false;
                 info!("Bonolith: Muhenkan → enabled=false (absolute OFF)");
                 return Ok(true);
             }
@@ -267,14 +267,14 @@ impl BonolithEngine {
 
         // Toggle key check — must come before modifier pass-through
         if self.is_toggle_key(keyval, state) {
-            let was_enabled = *self.enabled.lock().unwrap();
+            let was_enabled = *self.enabled.lock().unwrap_or_else(|e| e.into_inner());
             if was_enabled {
                 let _ = self.cancel_input(&emitter).await;
-                *self.enabled.lock().unwrap() = false;
+                *self.enabled.lock().unwrap_or_else(|e| e.into_inner()) = false;
             } else {
-                *self.enabled.lock().unwrap() = true;
+                *self.enabled.lock().unwrap_or_else(|e| e.into_inner()) = true;
             }
-            let now = *self.enabled.lock().unwrap();
+            let now = *self.enabled.lock().unwrap_or_else(|e| e.into_inner());
             info!("Bonolith: Toggle → enabled={}", now);
             return Ok(true);
         }
@@ -284,12 +284,12 @@ impl BonolithEngine {
             return Ok(false);
         }
 
-        let enabled = *self.enabled.lock().unwrap();
+        let enabled = *self.enabled.lock().unwrap_or_else(|e| e.into_inner());
         if !enabled {
             return Ok(false);
         }
 
-        let converting = *self.converting.lock().unwrap();
+        let converting = *self.converting.lock().unwrap_or_else(|e| e.into_inner());
 
         // Tab while a preedit/conversion is active → commit current text and
         // consume the key (Ok(true)). Focus does NOT move: this matches the
@@ -300,7 +300,7 @@ impl BonolithEngine {
         // consistent instead of diverging on framework preedit defaults.
         if keyval == IBUS_KEY_TAB {
             let text = {
-                let mut engine = self.engine.lock().unwrap();
+                let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
                 if converting {
                     engine.commit_conversion()
                 } else {
@@ -327,7 +327,7 @@ impl BonolithEngine {
                 let _ = Self::hide_preedit_text(&emitter).await;
                 let _ = Self::hide_lookup_table(&emitter).await;
                 let _ = Self::hide_auxiliary_text(&emitter).await;
-                *self.converting.lock().unwrap() = false;
+                *self.converting.lock().unwrap_or_else(|e| e.into_inner()) = false;
                 return Ok(true);
             }
             return Ok(false);
@@ -346,7 +346,7 @@ impl BonolithEngine {
         if keyval == IBUS_KEY_F6 {
             if converting {
                 let conv = {
-                    let mut engine = self.engine.lock().unwrap();
+                    let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
                     engine.convert_focused_to_hiragana().cloned()
                 };
                 if let Some(conv) = conv {
@@ -395,7 +395,7 @@ impl BonolithEngine {
             // Printable key not handled by conversion — commit conversion first,
             // then fall through to process the key as new input
             let text = {
-                let mut engine = self.engine.lock().unwrap();
+                let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
                 engine.commit_conversion()
             };
             if let Some(text) = text {
@@ -406,7 +406,7 @@ impl BonolithEngine {
                 let _ = Self::hide_preedit_text(&emitter).await;
                 let _ = Self::hide_lookup_table(&emitter).await;
                 let _ = Self::hide_auxiliary_text(&emitter).await;
-                *self.converting.lock().unwrap() = false;
+                *self.converting.lock().unwrap_or_else(|e| e.into_inner()) = false;
             }
             // Fall through to process the key as new input
         }
@@ -435,7 +435,7 @@ impl BonolithEngine {
         // interference (e.g. Shift+Arrow inserting stray characters), pass through otherwise
         if matches!(keyval, IBUS_KEY_LEFT | IBUS_KEY_RIGHT | IBUS_KEY_UP | IBUS_KEY_DOWN
                           | IBUS_KEY_PAGE_UP | IBUS_KEY_PAGE_DOWN) {
-            let has_preedit = !self.engine.lock().unwrap().preedit().is_empty();
+            let has_preedit = !self.engine.lock().unwrap_or_else(|e| e.into_inner()).preedit().is_empty();
             return Ok(has_preedit);
         }
 
@@ -486,7 +486,7 @@ impl BonolithEngine {
             };
             if let Some(sym) = fw {
                 let preedit = {
-                    let mut engine = self.engine.lock().unwrap();
+                    let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
                     engine.append_raw(sym);
                     engine.preedit().to_string()
                 };
@@ -499,7 +499,7 @@ impl BonolithEngine {
         if let Some(ch) = keyval_to_char(keyval) {
             if ch.is_ascii_alphabetic() || ch == '-' || ch == '\'' {
                 let preedit = {
-                    let mut engine = self.engine.lock().unwrap();
+                    let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
                     engine.process_key(ch.to_ascii_lowercase());
                     engine.preedit().to_string()
                 };
@@ -510,7 +510,7 @@ impl BonolithEngine {
         }
 
         // Consume unhandled keys while preedit is active to prevent stray characters
-        let has_preedit = !self.engine.lock().unwrap().preedit().is_empty();
+        let has_preedit = !self.engine.lock().unwrap_or_else(|e| e.into_inner()).preedit().is_empty();
         if has_preedit {
             return Ok(true);
         }
@@ -527,7 +527,7 @@ impl BonolithEngine {
         // Adopt an open force-on window so the dialog's field shows 日本語ON the
         // moment it gains focus (no keystroke needed).
         self.apply_force_enable();
-        info!("Bonolith: FocusIn (enabled={})", *self.enabled.lock().unwrap());
+        info!("Bonolith: FocusIn (enabled={})", *self.enabled.lock().unwrap_or_else(|e| e.into_inner()));
         // Reset the client's IM state on focus so the XIM proxy doesn't carry
         // a stale buffer from the previous window (Mozc parity).
         let _ = Self::hide_preedit_text(&emitter).await;
@@ -563,7 +563,7 @@ impl BonolithEngine {
                 });
             }
             "bonolith-clear-learning" => {
-                let shared = self.engine.lock().unwrap().shared_core();
+                let shared = self.engine.lock().unwrap_or_else(|e| e.into_inner()).shared_core();
                 std::thread::spawn(move || {
                     Self::run_clear_learning(shared);
                 });
@@ -581,8 +581,8 @@ impl BonolithEngine {
         // we must commit manually to preserve the "click-away keeps typed text"
         // contract (Mozc/Google IME parity).
         let commit_str = {
-            let mut engine = self.engine.lock().unwrap();
-            let converting = *self.converting.lock().unwrap();
+            let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
+            let converting = *self.converting.lock().unwrap_or_else(|e| e.into_inner());
             let preedit = engine.preedit().to_string();
             if converting {
                 engine.commit_conversion().unwrap_or_default()
@@ -604,11 +604,11 @@ impl BonolithEngine {
         let _ = Self::hide_lookup_table(&emitter).await;
         let _ = Self::hide_auxiliary_text(&emitter).await;
         {
-            let mut engine = self.engine.lock().unwrap();
+            let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
             engine.reset();
             engine.clear_conversion();
         }
-        *self.converting.lock().unwrap() = false;
+        *self.converting.lock().unwrap_or_else(|e| e.into_inner()) = false;
         // Deliberately keep `enabled` — standard IMEs hold 日本語ON/OFF per
         // input context across focus changes. Clearing it here made every
         // focus-out drop the mode, and neither focus_in nor IBus' enable
@@ -632,7 +632,7 @@ impl BonolithEngine {
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) {
         self.apply_force_enable();
-        info!("Bonolith: Enable (enabled={})", *self.enabled.lock().unwrap());
+        info!("Bonolith: Enable (enabled={})", *self.enabled.lock().unwrap_or_else(|e| e.into_inner()));
         // Reset the client's IM state on enable (Mozc parity).
         let _ = Self::hide_preedit_text(&emitter).await;
         let _ = Self::hide_lookup_table(&emitter).await;
@@ -646,7 +646,7 @@ impl BonolithEngine {
     ) {
         info!("Bonolith: Disable");
         let _ = self.cancel_input(&emitter).await;
-        *self.enabled.lock().unwrap() = false;
+        *self.enabled.lock().unwrap_or_else(|e| e.into_inner()) = false;
     }
 
     /// Set cursor location (unused but required by interface).
@@ -755,14 +755,14 @@ impl BonolithEngine {
         form: usize,
     ) -> zbus::fdo::Result<bool> {
         let state = {
-            let mut engine = self.engine.lock().unwrap();
+            let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
             engine.start_kana_conversion(form).cloned()
         };
         let Some(state) = state else {
             return Ok(false);
         };
         self.show_conversion_state(emitter, &state).await?;
-        *self.converting.lock().unwrap() = true;
+        *self.converting.lock().unwrap_or_else(|e| e.into_inner()) = true;
         Ok(true)
     }
 
@@ -771,7 +771,7 @@ impl BonolithEngine {
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<bool> {
         let state = {
-            let mut engine = self.engine.lock().unwrap();
+            let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
             engine.start_conversion().cloned()
         };
 
@@ -780,7 +780,7 @@ impl BonolithEngine {
         };
 
         self.show_conversion_state(emitter, &state).await?;
-        *self.converting.lock().unwrap() = true;
+        *self.converting.lock().unwrap_or_else(|e| e.into_inner()) = true;
         // Surface LLM context reranking once the background pass finishes.
         self.spawn_rerank_refresh(emitter);
 
@@ -799,7 +799,7 @@ impl BonolithEngine {
             // Space / Down → next candidate for focused segment
             IBUS_KEY_SPACE | IBUS_KEY_DOWN => {
                 let conv = {
-                    let mut engine = self.engine.lock().unwrap();
+                    let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
                     engine.cycle_candidate(1).cloned()
                 };
                 if let Some(conv) = conv {
@@ -810,7 +810,7 @@ impl BonolithEngine {
             // Up → previous candidate for focused segment
             IBUS_KEY_UP => {
                 let conv = {
-                    let mut engine = self.engine.lock().unwrap();
+                    let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
                     engine.cycle_candidate(-1).cloned()
                 };
                 if let Some(conv) = conv {
@@ -821,7 +821,7 @@ impl BonolithEngine {
             // Right → move focus to next segment (or Shift+Right → extend segment)
             IBUS_KEY_RIGHT => {
                 let conv = {
-                    let mut engine = self.engine.lock().unwrap();
+                    let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
                     if has_shift {
                         engine.resize_segment(1).cloned()
                     } else {
@@ -840,7 +840,7 @@ impl BonolithEngine {
             // Left → move focus to previous segment (or Shift+Left → shrink segment)
             IBUS_KEY_LEFT => {
                 let conv = {
-                    let mut engine = self.engine.lock().unwrap();
+                    let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
                     if has_shift {
                         engine.resize_segment(-1).cloned()
                     } else {
@@ -859,7 +859,7 @@ impl BonolithEngine {
             // Enter → commit composed text (with learning)
             IBUS_KEY_RETURN => {
                 let text = {
-                    let mut engine = self.engine.lock().unwrap();
+                    let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
                     engine.commit_conversion()
                 };
                 if let Some(text) = text {
@@ -870,7 +870,7 @@ impl BonolithEngine {
                     let _ = Self::hide_preedit_text(emitter).await;
                     let _ = Self::hide_lookup_table(emitter).await;
                     let _ = Self::hide_auxiliary_text(emitter).await;
-                    *self.converting.lock().unwrap() = false;
+                    *self.converting.lock().unwrap_or_else(|e| e.into_inner()) = false;
                 }
                 Ok(true)
             }
@@ -959,7 +959,7 @@ impl BonolithEngine {
             const POLL_INTERVAL_MS: u64 = 60;
             const MAX_POLLS: u32 = 34; // ~2.0s total
             for _ in 0..MAX_POLLS {
-                if engine.lock().unwrap().has_llm_rerank_result() {
+                if engine.lock().unwrap_or_else(|e| e.into_inner()).has_llm_rerank_result() {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
@@ -968,10 +968,10 @@ impl BonolithEngine {
             // Apply and snapshot the refreshed state under one lock. Skip if the
             // user already left conversion mode (committed / cancelled).
             let refreshed = {
-                if !*converting.lock().unwrap() {
+                if !*converting.lock().unwrap_or_else(|e| e.into_inner()) {
                     return;
                 }
-                let mut engine = engine.lock().unwrap();
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
                 if !engine.apply_llm_rerank() {
                     return;
                 }
@@ -981,7 +981,7 @@ impl BonolithEngine {
             if let Some(state) = refreshed {
                 // Re-check converting after the await-free section; harmless race
                 // at worst repaints a still-valid panel.
-                if *converting.lock().unwrap() {
+                if *converting.lock().unwrap_or_else(|e| e.into_inner()) {
                     if let Err(e) = Self::emit_conversion_state(&emitter, &state).await {
                         debug!("Bonolith: rerank refresh emit failed: {e}");
                     }
@@ -997,7 +997,7 @@ impl BonolithEngine {
         half: bool,
     ) -> zbus::fdo::Result<bool> {
         let conv = {
-            let mut engine = self.engine.lock().unwrap();
+            let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
             if half {
                 engine.convert_focused_to_halfwidth_katakana().cloned()
             } else {
@@ -1016,7 +1016,7 @@ impl BonolithEngine {
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<bool> {
         let conv = {
-            let mut engine = self.engine.lock().unwrap();
+            let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
             engine.convert_focused_to_romaji().cloned()
         };
         if let Some(conv) = conv {
@@ -1031,7 +1031,7 @@ impl BonolithEngine {
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<bool> {
         let conv = {
-            let mut engine = self.engine.lock().unwrap();
+            let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
             engine.convert_focused_to_fullwidth_romaji().cloned()
         };
         if let Some(conv) = conv {
@@ -1045,7 +1045,7 @@ impl BonolithEngine {
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<bool> {
         let preedit = {
-            let mut engine = self.engine.lock().unwrap();
+            let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
             let p = engine.preedit().to_string();
             if p.is_empty() {
                 return Ok(false);
@@ -1071,11 +1071,11 @@ impl BonolithEngine {
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<bool> {
         {
-            let mut engine = self.engine.lock().unwrap();
+            let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
             engine.reset();
             engine.clear_conversion();
         }
-        *self.converting.lock().unwrap() = false;
+        *self.converting.lock().unwrap_or_else(|e| e.into_inner()) = false;
         Self::hide_preedit_text(emitter).await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Self::hide_lookup_table(emitter).await
@@ -1090,12 +1090,12 @@ impl BonolithEngine {
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
         {
-            let mut engine = self.engine.lock().unwrap();
+            let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
             engine.clear_conversion();
         }
-        *self.converting.lock().unwrap() = false;
+        *self.converting.lock().unwrap_or_else(|e| e.into_inner()) = false;
         let preedit = {
-            let engine = self.engine.lock().unwrap();
+            let engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
             engine.preedit().to_string()
         };
         self.send_preedit(emitter, &preedit).await
@@ -1237,13 +1237,14 @@ impl BonolithEngine {
                 if path.is_empty() {
                     return;
                 }
-                let mut dict = match Dictionary::with_default_store() {
-                    Ok(d) => d,
-                    Err(e) => {
-                        warn!("Bonolith: could not open dict store for import: {}", e);
-                        return;
-                    }
-                };
+                // Import into the SHARED live dictionary (not a fresh
+                // Dictionary::with_default_store). The fresh instance would
+                // persist the imported entries to sqlite fine, but the
+                // running engine's in-memory dict would not pick them up
+                // until the daemon restarts — the user reported this as
+                // "count is shown but entries don't appear".
+                let shared = SharedCore::global();
+                let mut dict = shared.dictionary.write().unwrap_or_else(|e| e.into_inner());
                 match dict.import(std::path::Path::new(&path)) {
                     Ok(added) => {
                         if let Err(e) = dict.sync_user_entries_to_store() {
@@ -1315,7 +1316,7 @@ impl BonolithEngine {
                 // Add to live dictionary via SharedCore
                 let shared = SharedCore::global();
                 {
-                    let mut dict = shared.dictionary.write().unwrap();
+                    let mut dict = shared.dictionary.write().unwrap_or_else(|e| e.into_inner());
                     dict.add_entry(entry);
                     if let Err(e) = dict.sync_user_entries_to_store() {
                         warn!("Bonolith: Failed to save user dict: {}", e);
@@ -1355,7 +1356,7 @@ impl BonolithEngine {
             return;
         }
 
-        let mut user_scorer = shared.user_scorer.lock().unwrap();
+        let mut user_scorer = shared.user_scorer.lock().unwrap_or_else(|e| e.into_inner());
         match user_scorer.clear_scores() {
             Ok(n) => {
                 let _ = std::process::Command::new("zenity")
@@ -1382,7 +1383,7 @@ impl BonolithEngine {
     fn run_manage_dict() {
         let shared = SharedCore::global();
         let user_entries: Vec<DictionaryEntry> = {
-            let dict = shared.dictionary.read().unwrap();
+            let dict = shared.dictionary.read().unwrap_or_else(|e| e.into_inner());
             dict.user_entries().to_vec()
         };
 
@@ -1525,7 +1526,7 @@ impl BonolithEngine {
     /// Save modified user entries to file and apply to live dictionary.
     fn save_and_apply_user_entries(entries: Vec<DictionaryEntry>) {
         let shared = SharedCore::global();
-        let mut dict = shared.dictionary.write().unwrap();
+        let mut dict = shared.dictionary.write().unwrap_or_else(|e| e.into_inner());
         dict.replace_user_entries(entries);
         if let Err(e) = dict.sync_user_entries_to_store() {
             warn!("Bonolith: Failed to save user dict: {}", e);
@@ -1546,7 +1547,7 @@ impl BonolithEngine {
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<bool> {
         let new_preedit = {
-            let mut engine = self.engine.lock().unwrap();
+            let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
             if !engine.delete_last() {
                 return Ok(false);
             }

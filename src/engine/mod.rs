@@ -309,9 +309,9 @@ impl ConversionEngine {
             return None;
         }
 
-        let dict = self.shared.dictionary.read().unwrap();
+        let dict = self.shared.dictionary.read().unwrap_or_else(|e| e.into_inner());
         let segments = {
-            let user_scorer = self.shared.user_scorer.lock().unwrap();
+            let user_scorer = self.shared.user_scorer.lock().unwrap_or_else(|e| e.into_inner());
             dict.segment_with_boost(&kana, |reading, entries| {
                 // Don't boost single-char segments — learned single-kana scores (の, が, い...)
                 // are very high and distort segmentation by encouraging excessive splitting.
@@ -420,7 +420,10 @@ impl ConversionEngine {
             if cur_reading.len() <= 1 {
                 return self.conversion.as_ref();
             }
-            let last_ch = *cur_reading.last().unwrap();
+            // Guarded above: cur_reading.len() > 1 → last() is Some.
+            let Some(&last_ch) = cur_reading.last() else {
+                return self.conversion.as_ref();
+            };
             let new_cur: String = cur_reading[..cur_reading.len() - 1].iter().collect();
             state.segments[focus].reading = new_cur;
 
@@ -449,7 +452,12 @@ impl ConversionEngine {
         // into one inseparable chunk. On an extend the focused segment grew by a
         // deliberate merge, so it is kept whole.
         self.relookup_segment(focus);
-        if focus + 1 < self.conversion.as_ref().unwrap().segments.len() {
+        let seg_len = self
+            .conversion
+            .as_ref()
+            .map(|s| s.segments.len())
+            .unwrap_or(0);
+        if focus + 1 < seg_len {
             if delta < 0 {
                 self.relookup_or_split_segment(focus + 1);
             } else {
@@ -565,14 +573,14 @@ impl ConversionEngine {
             return Vec::new();
         }
 
-        let segments = self.shared.dictionary.read().unwrap().segment(&kana);
+        let segments = self.shared.dictionary.read().unwrap_or_else(|e| e.into_inner()).segment(&kana);
         if segments.is_empty() {
             return Vec::new();
         }
 
         let candidates = self.build_candidates(&segments);
 
-        let llm = self.shared.llm.lock().unwrap();
+        let llm = self.shared.llm.lock().unwrap_or_else(|e| e.into_inner());
         let mut scored: Vec<ConversionCandidate> = candidates
             .into_iter()
             .map(|text| {
@@ -663,7 +671,7 @@ impl ConversionEngine {
         // record() persists immediately when the scorer is store-attached,
         // so no separate save step is needed.
         {
-            let mut user_scorer = self.shared.user_scorer.lock().unwrap();
+            let mut user_scorer = self.shared.user_scorer.lock().unwrap_or_else(|e| e.into_inner());
             for seg in &state.segments {
                 if seg.user_selected {
                     let surface = &seg.candidates[seg.selected];
@@ -685,7 +693,7 @@ impl ConversionEngine {
     /// Clear all user learning history (scores) from memory and the database.
     /// Returns the number of rows deleted, or an error string.
     pub fn clear_learning_history(&self) -> Result<usize, String> {
-        let mut user_scorer = self.shared.user_scorer.lock().unwrap();
+        let mut user_scorer = self.shared.user_scorer.lock().unwrap_or_else(|e| e.into_inner());
         user_scorer.clear_scores().map_err(|e| e.to_string())
     }
 
@@ -709,7 +717,7 @@ impl ConversionEngine {
     /// Candidates are ordered by effective score (dictionary frequency + user learning).
     /// LLM reranking is triggered separately in the background.
     fn build_segment_states(&self, segments: &[Segment]) -> Vec<SegmentState> {
-        let user_scorer = self.shared.user_scorer.lock().unwrap();
+        let user_scorer = self.shared.user_scorer.lock().unwrap_or_else(|e| e.into_inner());
         segments
             .iter()
             .map(|seg| {
@@ -760,7 +768,7 @@ impl ConversionEngine {
         // and uses the magnitude directly, so repeated selections keep adding
         // weight instead of saturating once the surface reaches rank 0.
         let seg_info: Vec<(String, Vec<(String, f64)>)> = {
-            let user_scorer = self.shared.user_scorer.lock().unwrap();
+            let user_scorer = self.shared.user_scorer.lock().unwrap_or_else(|e| e.into_inner());
             state
                 .segments
                 .iter()
@@ -783,13 +791,13 @@ impl ConversionEngine {
         let inflight = self.rerank_inflight.clone();
 
         // Clear previous result and mark a pass in flight (cleared when applied).
-        *result_slot.lock().unwrap() = None;
+        *result_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
         inflight.store(true, Ordering::Relaxed);
 
         thread::spawn(move || {
             // Catch any panics to prevent crashing the IBus process
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let llm = shared.llm.lock().unwrap();
+                let llm = shared.llm.lock().unwrap_or_else(|e| e.into_inner());
                 let committed_context = llm.context().to_string();
                 // running_context accumulates chosen candidates as we go through segments.
                 // Start empty — committed_context is passed separately to score_with_context.
@@ -857,7 +865,7 @@ impl ConversionEngine {
 
             match result {
                 Ok(reranked) => {
-                    *result_slot.lock().unwrap() = Some(reranked);
+                    *result_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(reranked);
                     log::info!("LLM background reranking complete");
                 }
                 Err(_) => {
@@ -876,7 +884,7 @@ impl ConversionEngine {
     /// Returns true if candidates were updated.
     pub fn apply_llm_rerank(&mut self) -> bool {
         let reranked = {
-            let mut slot = self.llm_rerank_result.lock().unwrap();
+            let mut slot = self.llm_rerank_result.lock().unwrap_or_else(|e| e.into_inner());
             slot.take()
         };
 
@@ -936,7 +944,7 @@ impl ConversionEngine {
 
     /// Check if LLM reranking results are ready (non-blocking).
     pub fn has_llm_rerank_result(&self) -> bool {
-        self.llm_rerank_result.lock().unwrap().is_some()
+        self.llm_rerank_result.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
 
     /// True while a background rerank pass is outstanding (triggered but its
@@ -1048,7 +1056,12 @@ impl ConversionEngine {
                 // Use LLM result only if it strongly disagrees (base scores much higher)
                 if base_llm > best_llm + 0.15 {
                     log::info!("Segmentation filter: LLM overrode heuristic, keeping base");
-                    return alternatives.into_iter().next().unwrap();
+                    // Invariant: alternatives always includes the base
+                    // segmentation at index 0 (seeded above).
+                    return alternatives
+                        .into_iter()
+                        .next()
+                        .expect("alternatives always contains the base segmentation");
                 }
             }
             log::info!(
@@ -1067,7 +1080,12 @@ impl ConversionEngine {
             );
         }
 
-        alternatives.into_iter().nth(scored[0].0).unwrap()
+        // scored[0].0 is an index into alternatives (built above from the
+        // same alternatives.iter().enumerate()), so nth() is always Some.
+        alternatives
+            .into_iter()
+            .nth(scored[0].0)
+            .expect("scored indices are always valid alternatives positions")
     }
 
     /// Generate alternative segmentations by merging adjacent segment pairs.
@@ -1278,12 +1296,12 @@ impl ConversionEngine {
             Some(state) => state.segments[idx].reading.clone(),
             None => return,
         };
-        let dict = self.shared.dictionary.read().unwrap();
+        let dict = self.shared.dictionary.read().unwrap_or_else(|e| e.into_inner());
         // Use candidates_for_unit (not a flat lookup) so a manually resized
         // boundary that glues a particle onto an adjacent word still yields real
         // word candidates instead of collapsing to bare kana.
         let mut entries = dict.candidates_for_unit(&reading);
-        let user_scorer = self.shared.user_scorer.lock().unwrap();
+        let user_scorer = self.shared.user_scorer.lock().unwrap_or_else(|e| e.into_inner());
         entries.sort_by(|a, b| {
             let score_a = Self::effective_score_with(&user_scorer, &reading, a);
             let score_b = Self::effective_score_with(&user_scorer, &reading, b);
@@ -1321,7 +1339,7 @@ impl ConversionEngine {
             None => return,
         };
         let subs = {
-            let dict = self.shared.dictionary.read().unwrap();
+            let dict = self.shared.dictionary.read().unwrap_or_else(|e| e.into_inner());
             dict.segment(&reading)
         };
         if subs.len() < 2 {
@@ -1588,7 +1606,7 @@ mod tests {
             .collect();
 
         // Inject a stale result whose readings don't match the live layout.
-        *engine.llm_rerank_result.lock().unwrap() = Some(vec![(
+        *engine.llm_rerank_result.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![(
             "ZZ-bogus-reading".to_string(),
             vec!["☃".to_string(), "☔".to_string()],
         )]);
@@ -1635,7 +1653,7 @@ mod tests {
             let top1_after = |n: u32| -> String {
                 let shared = SharedCore::new_hermetic();
                 {
-                    let mut user = shared.user_scorer.lock().unwrap();
+                    let mut user = shared.user_scorer.lock().unwrap_or_else(|e| e.into_inner());
                     for _ in 0..n {
                         user.record(reading, target);
                     }
@@ -1889,7 +1907,7 @@ mod tests {
         // Verify that the filter generates multi-merge alternatives
         // (merging non-overlapping segment pairs simultaneously)
         let engine = ConversionEngine::new();
-        let dict = engine.shared.dictionary.read().unwrap();
+        let dict = engine.shared.dictionary.read().unwrap_or_else(|e| e.into_inner());
 
         let base = vec![
             Segment {

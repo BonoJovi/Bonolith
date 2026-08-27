@@ -116,14 +116,11 @@ fn parse_keyval(name: &str) -> Option<u32> {
         "henkan" | "henkan_mode" => Some(IBUS_KEY_HENKAN_MODE),
         "muhenkan" => Some(IBUS_KEY_MUHENKAN),
         // Single ASCII character
-        s if s.len() == 1 => {
-            let ch = s.chars().next().unwrap();
-            if ch.is_ascii_graphic() {
-                Some(ch as u32)
-            } else {
-                None
-            }
-        }
+        s if s.len() == 1 => s
+            .chars()
+            .next()
+            .filter(|ch| ch.is_ascii_graphic())
+            .map(|ch| ch as u32),
         // Hex keysym for advanced users: "0xff2a"
         s if s.starts_with("0x") => u32::from_str_radix(&s[2..], 16).ok(),
         other => {

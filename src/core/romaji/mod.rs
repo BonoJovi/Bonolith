@@ -83,8 +83,8 @@ impl RomajiConverter {
         }
 
         // 5. Non-alpha passthrough (punctuation like '-')
-        if self.buffer.len() == 1 {
-            let ch = self.buffer.chars().next().unwrap();
+        // Buffer is guaranteed non-empty by the len==1 guard.
+        if let Some(ch) = self.buffer.chars().next().filter(|_| self.buffer.len() == 1) {
             if !ch.is_ascii_alphabetic() {
                 if let Some(kana) = exact_lookup(&self.buffer) {
                     self.buffer.clear();

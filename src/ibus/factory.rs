@@ -65,13 +65,13 @@ impl BonolithControl {
     /// key flips itself 日本語ON. Idempotent and order-independent — safe to
     /// call on every field focus-in.
     async fn force_enable(&self) {
-        *self.force.lock().unwrap() = Some(Instant::now() + FORCE_WINDOW);
+        *self.force.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() + FORCE_WINDOW);
         info!("Bonolith Control: ForceEnable (+{:?})", FORCE_WINDOW);
     }
 
     /// Close the force-on window early (dialog is closing).
     async fn force_enable_clear(&self) {
-        *self.force.lock().unwrap() = None;
+        *self.force.lock().unwrap_or_else(|e| e.into_inner()) = None;
         info!("Bonolith Control: ForceEnableClear");
     }
 }
