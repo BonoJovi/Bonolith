@@ -175,6 +175,23 @@ const PRIORITY_OVERRIDES: &[(&str, &str, u32)] = &[
     ("つくる", "作る", 12000),  // was 2449 / bumped past hiragana つくりました 11444
     ("あう", "会う", 2850),     // was 2743, below 遭う/遇う 2768
     ("さがす", "探す", 5800),   // was 2817; base competitor 捜す 2850, inflection 捜します 5666
+    // 再 Prefix (4213) is buried under 際 Noun (4950) as the dominant surface
+    // for reading さい, so probe_2piece_alternatives puts 際+確認 above 再+
+    // 確認 despite 際確認 being a nonsense compound. Lift 再 above 際 for
+    // the Prefix path only — the Noun ranking (際 top when さい stands
+    // alone) is left untouched.
+    ("さい", "再", 5000),       // was 4213 (Prefix); bumps above 際 Noun 4950
+    // します family — IPADIC ships these as Verb 7000, which is only just
+    // above し(Noun 5002)+ます(Aux 6248) split cost. Once the user has
+    // learned ます|ます (score 0.228 → boost 2.28) the split cost falls by
+    // ~2, edging out します and turning お願いします into お願い+し+ます —
+    // then the affix-compound merge picks up お願い+し as Noun+Suffix and
+    // top surface becomes お願い市. Raise the whole family so the single
+    // unit stays comfortably below the boosted split.
+    ("します", "します", 9500),
+    ("しました", "しました", 9500),
+    ("しません", "しません", 9000),
+    ("しましょう", "しましょう", 9000),
 ];
 
 pub struct Dictionary {
@@ -462,7 +479,58 @@ impl Dictionary {
             })
             .collect();
 
+        let segments = self.split_particle_head_segments(segments);
         self.merge_affix_compounds(segments)
+    }
+
+    /// Break up 2-char segments whose reading decomposes as (strong Particle
+    /// single char) + (content word), when only the middle-of-a-sentence
+    /// context makes the tail-as-Suffix reading (がき→書き) win in the DP.
+    /// Turning がき into が+き lets the natural もの+が+き parse survive
+    /// merge_affix_compounds — otherwise the Noun+Suffix reclass fuses
+    /// もの+がき into 物書き and the whole bunsetsu collapses.
+    ///
+    /// Applied only to segments the DP judged as one word (via a single
+    /// dict entry) — segments the DP already split remain untouched.
+    fn split_particle_head_segments(&self, segs: Vec<Segment>) -> Vec<Segment> {
+        let mut out: Vec<Segment> = Vec::with_capacity(segs.len());
+        for seg in segs {
+            let chars: Vec<char> = seg.reading.chars().collect();
+            if chars.len() != 2 {
+                out.push(seg);
+                continue;
+            }
+            if !Self::right_reading_looks_like_particle_head(&seg, self) {
+                out.push(seg);
+                continue;
+            }
+            let head_r = chars[0].to_string();
+            let tail_r = chars[1].to_string();
+            let head_cands: Vec<DictionaryEntry> =
+                self.lookup(&head_r).into_iter().cloned().collect();
+            let tail_cands: Vec<DictionaryEntry> =
+                self.lookup(&tail_r).into_iter().cloned().collect();
+            if head_cands.is_empty() || tail_cands.is_empty() {
+                out.push(seg);
+                continue;
+            }
+            let head_start = seg.start;
+            let head_seg = Segment {
+                reading: head_r,
+                start: head_start,
+                len: 1,
+                candidates: head_cands,
+            };
+            let tail_seg = Segment {
+                reading: tail_r,
+                start: head_start + 1,
+                len: 1,
+                candidates: tail_cands,
+            };
+            out.push(head_seg);
+            out.push(tail_seg);
+        }
+        out
     }
 
     /// Return the dominant (highest-frequency) PartOfSpeech for a segment, if any.
@@ -482,11 +550,175 @@ impl Dictionary {
     ///
     /// Merged POS reflects the right element so the result does not
     /// re-trigger the same rule.
+    /// Reclassify a segment's effective merge-time POS when it has a strong
+    /// affix candidate that dominant_pos missed because a homograph wins on
+    /// raw frequency. Common single-kana suffixes like か→化 (5054),
+    /// かい→会 (3704), にん→人 (1859) lose the dominant race to か Particle
+    /// (7424), かい Particle (4582), 忍 Noun (4206); without this the merge
+    /// classifies せいじ+か as Noun+Particle and produces 政治か instead of
+    /// 政治化, and skips なん+にん entirely so 何+忍 stays split.
+    ///
+    /// Only fires when the left-side POS makes an affix compound plausible
+    /// (Noun or Prefix), and only when the Suffix candidate is common enough
+    /// to be a real affix (freq ≥ 1500 — filters out と→都 800, は→派 649,
+    /// が→画 366, で→出 1 for the everyday particle readings).
+    ///
+    /// The `dict` argument lets us peek inside the right segment: if its
+    /// reading starts with a strong Particle (がき → が+き, 部+はい → は+
+    /// い) and the remainder is a viable content word, the Noun+Suffix
+    /// reclass would fuse across a natural Particle boundary. In that case
+    /// we leave the dominant POS alone and let the merge fall through.
+    fn effective_right_merge_pos(
+        seg: &Segment,
+        dominant: Option<PartOfSpeech>,
+        left_pos: Option<PartOfSpeech>,
+        dict: &Dictionary,
+    ) -> Option<PartOfSpeech> {
+        const SUFFIX_MERGE_THRESHOLD: u32 = 1500;
+        if !matches!(
+            left_pos,
+            Some(PartOfSpeech::Noun) | Some(PartOfSpeech::Prefix)
+        ) {
+            return dominant;
+        }
+        // Particle-head suppression runs even when dominant is already
+        // Suffix — がき's 書き (Suffix) tops the group at 4400 thanks to a
+        // PRIORITY_OVERRIDE, so returning Suffix here would still fuse
+        // もの+がき into 物書き and mask the intended もの+が+き parse.
+        if matches!(dominant, Some(PartOfSpeech::Auxiliary) | Some(PartOfSpeech::Verb)) {
+            return dominant;
+        }
+        if matches!(dominant, Some(PartOfSpeech::Suffix)) {
+            if Self::right_reading_looks_like_particle_head(seg, dict) {
+                // Downgrade to Noun so the (Noun, Noun) branch skips the
+                // merge; the natural Particle-headed parse survives.
+                return Some(PartOfSpeech::Noun);
+            }
+            return dominant;
+        }
+        let has_strong_suffix = seg.candidates.iter().any(|e| {
+            e.pos == PartOfSpeech::Suffix && e.frequency >= SUFFIX_MERGE_THRESHOLD
+        });
+        if !has_strong_suffix {
+            return dominant;
+        }
+        if Self::right_reading_looks_like_particle_head(seg, dict) {
+            return dominant;
+        }
+        // Particle-dominant readings whose Suffix homograph is a niche
+        // proper-noun ending (だけ → 岳 as in 剣岳/穂高岳) should stay
+        // Particle in modern-text conversion — reclassifying to Suffix
+        // makes 件だけ fuse into 県岳 (min freq 2574) instead of a
+        // 件+だけ bunsetsu. Only fires when the dominant Particle is much
+        // stronger than the strongest Suffix candidate.
+        if Self::particle_dominates_suffix(seg) {
+            return dominant;
+        }
+        Some(PartOfSpeech::Suffix)
+    }
+
+    /// True when the segment's Particle candidate is dramatically stronger
+    /// than its Suffix candidate — the ratio ≥ 3 filters だけ (9713 vs 2574,
+    /// ×3.77) while leaving か (7424 vs 5054, ×1.47) and かい (4582 vs 3704,
+    /// ×1.24) firing as before.
+    fn particle_dominates_suffix(seg: &Segment) -> bool {
+        let mut top_particle = 0u32;
+        let mut top_suffix = 0u32;
+        for e in &seg.candidates {
+            match e.pos {
+                PartOfSpeech::Particle if e.frequency > top_particle => {
+                    top_particle = e.frequency;
+                }
+                PartOfSpeech::Suffix if e.frequency > top_suffix => {
+                    top_suffix = e.frequency;
+                }
+                _ => {}
+            }
+        }
+        top_particle >= 6000 && top_suffix > 0 && top_particle >= top_suffix * 3
+    }
+
+    /// True when the segment's reading decomposes cleanly as
+    /// (strong Particle single char) + (content word). Used to veto the
+    /// Noun→Suffix merge reclass so the natural Particle-headed parse
+    /// wins instead of being fused into a compound noun.
+    ///
+    /// Particle threshold 7000 is chosen so common bunsetsu markers (が
+    /// 9814 / を 9430 / に 9113 / は 8968) all pass while an incidental
+    /// homograph like で→出 (Suffix 1) never does.
+    fn right_reading_looks_like_particle_head(seg: &Segment, dict: &Dictionary) -> bool {
+        const HEAD_PARTICLE_MIN: u32 = 7000;
+        const TAIL_CONTENT_MIN: u32 = 2000;
+        let mut it = seg.reading.chars();
+        let first = match it.next() {
+            Some(c) => c,
+            None => return false,
+        };
+        let tail: String = it.collect();
+        if tail.is_empty() {
+            return false;
+        }
+        let head_r = first.to_string();
+        let head_ents = dict.lookup(&head_r);
+        let head_strong = head_ents.iter().any(|e| {
+            e.pos == PartOfSpeech::Particle && e.frequency >= HEAD_PARTICLE_MIN
+        });
+        if !head_strong {
+            return false;
+        }
+        let tail_ents = dict.lookup(&tail);
+        tail_ents.iter().any(|e| {
+            matches!(
+                e.pos,
+                PartOfSpeech::Noun | PartOfSpeech::Verb | PartOfSpeech::Adjective
+            ) && e.frequency >= TAIL_CONTENT_MIN
+        })
+    }
+
+    /// Reclassify the left segment's POS when a strong Prefix candidate would
+    /// let the pair merge into an affix compound. IPADIC often has both a
+    /// Prefix and a Noun surface for the same reading (さい: 際 Noun 4950 /
+    /// 再 Prefix 4213; ふ: 歩 Noun 4764 / 不 Prefix 4503), and dominant_pos
+    /// picks the Noun by raw freq. That kills the Prefix+Noun merge for
+    /// さい+かくにん (再確認) and ふ+きょう (不況). A high 3500 threshold
+    /// filters out marginal Prefix homographs like き→貴 (2087).
+    fn effective_left_merge_pos(
+        seg: &Segment,
+        dominant: Option<PartOfSpeech>,
+        right_pos: Option<PartOfSpeech>,
+    ) -> Option<PartOfSpeech> {
+        const PREFIX_MERGE_THRESHOLD: u32 = 3500;
+        if !matches!(dominant, Some(PartOfSpeech::Noun)) {
+            return dominant;
+        }
+        if !matches!(
+            right_pos,
+            Some(PartOfSpeech::Noun) | Some(PartOfSpeech::Suffix)
+        ) {
+            return dominant;
+        }
+        let has_strong_prefix = seg.candidates.iter().any(|e| {
+            e.pos == PartOfSpeech::Prefix && e.frequency >= PREFIX_MERGE_THRESHOLD
+        });
+        if has_strong_prefix {
+            Some(PartOfSpeech::Prefix)
+        } else {
+            dominant
+        }
+    }
+
     fn merge_affix_compounds(&self, mut segs: Vec<Segment>) -> Vec<Segment> {
         let mut i = 0;
         while i + 1 < segs.len() {
-            let cur = Self::dominant_pos(&segs[i]);
-            let nxt = Self::dominant_pos(&segs[i + 1]);
+            let raw_cur = Self::dominant_pos(&segs[i]);
+            let raw_nxt = Self::dominant_pos(&segs[i + 1]);
+            // First pass: refine the right POS given the raw left POS. Then
+            // refine the left POS given the refined right POS. Two passes let
+            // Noun+Noun cases where BOTH sides need reclassification (さい+
+            // かくにん where 再 Prefix is buried under 際 Noun and 確認 is a
+            // straight Noun) still fire as Prefix+Noun.
+            let nxt = Self::effective_right_merge_pos(&segs[i + 1], raw_nxt, raw_cur, self);
+            let cur = Self::effective_left_merge_pos(&segs[i], raw_cur, nxt);
             let is_noun_particle = matches!(
                 (cur, nxt),
                 (Some(PartOfSpeech::Noun), Some(PartOfSpeech::Particle))
@@ -518,6 +750,23 @@ impl Dictionary {
                 let left = &mut segs[i];
                 let merged_reading = format!("{}{}", left.reading, right.reading);
                 let synthetic_pos = merge_right_pos.unwrap();
+                // Which side plays which role in the synthetic surface? For
+                // affix compounds we want to filter candidates to their role
+                // (Prefix / Noun / Suffix) so the Cartesian product doesn't
+                // pull in the same homograph that dominant_pos already
+                // side-stepped (せいじ+か's か Particle at 7424).
+                let (l_role, r_role) = match (cur, nxt) {
+                    (Some(PartOfSpeech::Noun), Some(PartOfSpeech::Suffix)) => {
+                        (Some(PartOfSpeech::Noun), Some(PartOfSpeech::Suffix))
+                    }
+                    (Some(PartOfSpeech::Prefix), Some(PartOfSpeech::Noun)) => {
+                        (Some(PartOfSpeech::Prefix), Some(PartOfSpeech::Noun))
+                    }
+                    (Some(PartOfSpeech::Prefix), Some(PartOfSpeech::Suffix)) => {
+                        (Some(PartOfSpeech::Prefix), Some(PartOfSpeech::Suffix))
+                    }
+                    _ => (None, None),
+                };
                 let merged_candidates = {
                     // For Noun+Particle, always use Cartesian product: the DP
                     // already chose N+P over any homophone dict entry (e.g.
@@ -531,11 +780,47 @@ impl Dictionary {
                     if !from_dict.is_empty() {
                         from_dict
                     } else {
-                        // Synthetic: Cartesian product of top-3 candidates from each side
-                        let l_tops: Vec<_> = left.candidates.iter().take(3).collect();
-                        let r_tops: Vec<_> = right.candidates.iter().take(3).collect();
+                        // Synthetic: Cartesian product of top-5 candidates
+                        // from each side, filtered by role when this is an
+                        // affix compound. Filtering falls back to the raw
+                        // top-5 if the role-filtered list is empty (defensive
+                        // — shouldn't happen once effective_right_merge_pos
+                        // fires, but keeps the merge productive either way).
+                        //
+                        // Additionally probe alternative 2-piece splits of
+                        // the merged reading: when the DP picked さいかく+
+                        // にん (才覚 4426 + 人 Suffix 1859) the primary
+                        // cartesian top is 才覚人 at 1859, but the same
+                        // reading also decomposes as さい+かくにん (再/際
+                        // + 確認). Merging those alternatives into the
+                        // candidate list keeps 再確認 / 何時間 reachable
+                        // instead of disappearing under a suboptimal DP
+                        // choice.
+                        // Widened to 5 (was 3) so common Suffix homograph
+                        // groups still surface their long-tail members: for
+                        // か, top-5 Suffix reaches 家 (rank 5), keeping
+                        // 政治家 / 芸術家 / 研究家 discoverable next to the
+                        // 化 leader from a single reading.
+                        fn take_top<'a>(
+                            cands: &'a [DictionaryEntry],
+                            role: Option<PartOfSpeech>,
+                        ) -> Vec<&'a DictionaryEntry> {
+                            if let Some(p) = role {
+                                let filtered: Vec<&DictionaryEntry> = cands
+                                    .iter()
+                                    .filter(|e| e.pos == p)
+                                    .take(5)
+                                    .collect();
+                                if !filtered.is_empty() {
+                                    return filtered;
+                                }
+                            }
+                            cands.iter().take(5).collect()
+                        }
+                        let l_tops = take_top(&left.candidates, l_role);
+                        let r_tops = take_top(&right.candidates, r_role);
                         let mr = merged_reading.clone();
-                        l_tops
+                        let mut cands: Vec<DictionaryEntry> = l_tops
                             .iter()
                             .flat_map(|l| {
                                 let mr = mr.clone();
@@ -546,7 +831,22 @@ impl Dictionary {
                                     frequency: l.frequency.min(r.frequency),
                                 })
                             })
-                            .collect()
+                            .collect();
+                        cands.extend(self.probe_2piece_alternatives(&merged_reading));
+                        // Sort highest-freq first, then drop duplicate
+                        // surfaces globally (not just adjacent — same-surface
+                        // entries land far apart when many surfaces share the
+                        // same freq band and would slip past dedup_by).
+                        cands.sort_by(|a, b| b.frequency.cmp(&a.frequency));
+                        let mut seen: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
+                        cands.retain(|e| seen.insert(e.surface.clone()));
+                        // 30 keeps the long-tail Suffix homograph reachable
+                        // (for せいじか, top-5 Suffix × top-5 left Noun fills
+                        // 25 slots at freq bands 5054/3255/2784/2682/2598 —
+                        // 家 sits in the last band).
+                        cands.truncate(30);
+                        cands
                     }
                 };
                 *left = Segment {
@@ -561,6 +861,83 @@ impl Dictionary {
             }
         }
         segs
+    }
+
+    /// Enumerate 2-piece decompositions of a merged reading whose left half
+    /// resolves to a Noun/Prefix and right half to a Noun/Suffix, and return
+    /// the top-scoring cartesian entries as extra candidates.
+    ///
+    /// The DP occasionally picks a longer left prefix that gives a low-freq
+    /// compound (さいかく+人 = 才覚人 at 1859) when a shorter Prefix+Noun
+    /// split of the same reading would produce a much stronger word (さい+
+    /// かくにん = 再/際 + 確認 at ≥4213). Merging the alternative splits into
+    /// the candidate pool keeps those forms discoverable without needing a
+    /// bespoke dict entry per compound.
+    fn probe_2piece_alternatives(&self, reading: &str) -> Vec<DictionaryEntry> {
+        let chars: Vec<char> = reading.chars().collect();
+        if chars.len() < 3 {
+            // 2-char readings can only split as 1+1; the merge already
+            // produced that cartesian, so alternatives contribute nothing.
+            return Vec::new();
+        }
+        let mut byte_offsets = vec![0usize];
+        for c in &chars {
+            byte_offsets.push(byte_offsets.last().unwrap() + c.len_utf8());
+        }
+        let mut out: Vec<DictionaryEntry> = Vec::new();
+        for split in 1..chars.len() {
+            let (lb, rb) = (byte_offsets[split], byte_offsets[chars.len()]);
+            let left_r = &reading[..lb];
+            let right_r = &reading[lb..rb];
+            let left_char_count = split;
+            let right_char_count = chars.len() - split;
+            let l_ents = self.lookup(left_r);
+            let r_ents = self.lookup(right_r);
+            if l_ents.is_empty() || r_ents.is_empty() {
+                continue;
+            }
+            for l in l_ents.iter().take(4) {
+                if !matches!(l.pos, PartOfSpeech::Noun | PartOfSpeech::Prefix) {
+                    continue;
+                }
+                for r in r_ents.iter().take(4) {
+                    if !matches!(r.pos, PartOfSpeech::Noun | PartOfSpeech::Suffix) {
+                        continue;
+                    }
+                    // Noun+Noun alternatives are only trustworthy when the
+                    // right side looks like a real compound-forming word:
+                    // multi-char AND high-freq (≥ 5000, matching entries
+                    // like 時間 9523, 確認 5030, 学校 8376). Single-char
+                    // right pieces are almost always Suffix-role in
+                    // practice (し→市, か→化, き→気) and their Noun
+                    // homographs degenerate into nonsense compounds like
+                    // お願い+市 or 何+忍 that would sort above the
+                    // legitimate Noun+Suffix product on raw freq alone.
+                    if l.pos == PartOfSpeech::Noun
+                        && r.pos == PartOfSpeech::Noun
+                        && (right_char_count < 2 || r.frequency < 5000)
+                    {
+                        continue;
+                    }
+                    // Guard against 1-char Prefix+Noun where the "Prefix"
+                    // is a weak homograph — same reasoning as the Noun+Noun
+                    // rule above.
+                    if l.pos == PartOfSpeech::Prefix
+                        && left_char_count < 2
+                        && l.frequency < 3000
+                    {
+                        continue;
+                    }
+                    out.push(DictionaryEntry {
+                        reading: reading.to_string(),
+                        surface: format!("{}{}", l.surface, r.surface),
+                        pos: PartOfSpeech::Noun,
+                        frequency: l.frequency.min(r.frequency),
+                    });
+                }
+            }
+        }
+        out
     }
 
     /// Build candidate entries for a reading the user has forced into a single
@@ -717,10 +1094,11 @@ impl Dictionary {
         let verb_families = collect_verb_stems(PRIORITY_OVERRIDES);
 
         // Precompute the top RAW kanji-form frequency per (reading, POS) for
-        // Verb/Adjective. Used below to cap emphatic-katakana surface variants
-        // (ツクった / カエった / ハサんだ …) that IPADIC assigns unrealistically
-        // low costs to; without the cap, the compound ×2 boost lets them
-        // dominate the canonical kanji form of the same reading.
+        // Verb/Adjective/Noun. Used below to cap emphatic-katakana surface
+        // variants (ツクった / カエった / ハサんだ / モノ / コト …) that
+        // IPADIC assigns unrealistically low costs to; without the cap, the
+        // compound ×2 boost or a marginal +50 lead over the kanji dominant
+        // lets them dominate the canonical form of the same reading.
         //
         // The cap deliberately uses raw IPADIC freq (not the post-override
         // value), so a PRIORITY_OVERRIDES bump like つくる→作る at 12000 only
@@ -731,7 +1109,10 @@ impl Dictionary {
         let mut max_kanji_freq: std::collections::HashMap<(&'static str, PartOfSpeech), u32> =
             std::collections::HashMap::new();
         for &(reading, surface, pos, freq) in builtin_dict::BUILTIN_ENTRIES {
-            if !matches!(pos, PartOfSpeech::Verb | PartOfSpeech::Adjective) {
+            if !matches!(
+                pos,
+                PartOfSpeech::Verb | PartOfSpeech::Adjective | PartOfSpeech::Noun
+            ) {
                 continue;
             }
             if !surface_contains_kanji(surface) {
@@ -760,14 +1141,21 @@ impl Dictionary {
                         break;
                     }
                 }
-                // Emphatic-katakana cap: keep the kata variant in candidates
-                // but never above the reading's canonical kanji form.
-                if is_kata_dominant(surface) {
-                    if let Some(&kanji_top) = max_kanji_freq.get(&(reading, pos)) {
-                        let cap = kanji_top.saturating_sub(200).max(500);
-                        if frequency > cap {
-                            frequency = cap;
-                        }
+            }
+            // Emphatic-katakana cap: keep the kata variant in candidates but
+            // never above the reading's canonical kanji form. Applied to
+            // Verb / Adjective / Noun — the same IPADIC artifact that makes
+            // ツクった beat 作った also makes モノ (3302) beat 物 (3248) and
+            // コト (2795) beat 事 (1188) for common everyday nouns.
+            if matches!(
+                pos,
+                PartOfSpeech::Verb | PartOfSpeech::Adjective | PartOfSpeech::Noun
+            ) && is_kata_dominant(surface)
+            {
+                if let Some(&kanji_top) = max_kanji_freq.get(&(reading, pos)) {
+                    let cap = kanji_top.saturating_sub(200).max(500);
+                    if frequency > cap {
+                        frequency = cap;
                     }
                 }
             }
@@ -871,6 +1259,39 @@ impl Dictionary {
             ("くださる", "くださる"),
             ("ております", "ております"),
             ("いたします", "いたします"),
+            // Counter + か Particle ("何回か / 何人か / 何時間か") — the
+            // approximate-quantity phrase. Without a direct entry the DP
+            // merges 何回+か via Noun+Suffix reclass (か→化 5054) and the
+            // surface becomes 何回化. Register these as high-freq Noun
+            // compounds so the direct match beats the compound cartesian.
+            ("なんかいか",   "何回か"),
+            ("なんにんか",   "何人か"),
+            ("なんにちか",   "何日か"),
+            ("なんじかんか", "何時間か"),
+            ("なんどか",     "何度か"),
+            ("なんこか",     "何個か"),
+            ("なんぼんか",   "何本か"),
+            ("なんさつか",   "何冊か"),
+            ("なんねんか",   "何年か"),
+            ("なんかげつか", "何ヶ月か"),
+            ("いくつか",     "いくつか"),
+            ("いくらか",     "いくらか"),
+            // Colloquial coordinating し ("〜だし、〜ですし") — IPADIC has
+            // し only as a low-freq Particle (2158) buried under 市 5002 /
+            // 氏 4646, so ですし segments as です+すし(寿司 4372)+... and
+            // becomes "で鮨". Register the everyday compound forms so they
+            // win the whole substring instead. だし alone is skipped: its
+            // canonical noun reading is 出汁 (4201) / 山車 (4290), and a
+            // 9000-freq hiragana entry would clobber that. だしね / だしよ /
+            // だしよね are unambiguous colloquial forms and safe to boost.
+            ("ですし", "ですし"),
+            ("ですしね", "ですしね"),
+            ("ですしよ", "ですしよ"),
+            ("ですしよね", "ですしよね"),
+            ("ですしから", "ですしから"),
+            ("だしね", "だしね"),
+            ("だしよ", "だしよ"),
+            ("だしよね", "だしよね"),
         ];
         for &(reading, surface) in auxiliaries {
             self.add_entry(DictionaryEntry {
@@ -1057,6 +1478,33 @@ impl Dictionary {
             // 「桃のうち」: proverb phrase. IPADIC splits as もも+のうち (農地).
             // Single entry fixes the tail segment of すもももももももものうち.
             ("もものうち", "桃のうち"),
+            // 〜値 (value) suffix compounds — IPADIC ships 値 with reading
+            // ち as Suffix at freq 1, so 期待値 / 平均値 / 最大値 segment
+            // as きたい+ち, へいきん+ち etc. and the ち slot resolves to
+            // 血/知/治 by dict rank. Register the common IT/math compounds
+            // directly so the DP short-circuits to the correct kanji.
+            ("きたいち",       "期待値"),
+            ("へいきんち",     "平均値"),
+            ("さいだいち",     "最大値"),
+            ("さいしょうち",   "最小値"),
+            ("ぜったいち",     "絶対値"),
+            ("すうち",         "数値"),
+            ("しきべつち",     "識別値"),
+            ("しきべつし",     "識別子"),
+            ("ひょうじゅんち", "標準値"),
+            ("じっそくち",     "実測値"),
+            ("かんそくち",     "観測値"),
+            ("しょきち",       "初期値"),
+            ("こていち",       "固定値"),
+            // Counter/measure + だけ ("〜件だけ / 〜人だけ / 〜個だけ" —
+            // "only N of them"). Without a direct entry the Noun+Particle
+            // cartesian for けんだけ still ranks 県 (7717) above 件 (3627)
+            // for the left slot; the direct compound short-circuits that.
+            ("けんだけ",       "件だけ"),
+            ("にんだけ",       "人だけ"),
+            ("こだけ",         "個だけ"),
+            ("ほんだけ",       "本だけ"),
+            ("だいだけ",       "台だけ"),
         ];
         for &(reading, surface) in compound_nouns {
             self.add_entry(DictionaryEntry {
@@ -1484,6 +1932,279 @@ mod tests {
                     "kata variant ranked at {k}, expected after all kanji forms (last at {last_k}) for {reading}",
                 );
             }
+        }
+    }
+
+    #[test]
+    fn value_and_counter_compounds_short_circuit_dp() {
+        // Regression: きたいち used to segment as きたい+ち (奇態+血) and
+        // けんだけ merged Noun+Suffix into 県+岳 (min 2574). Direct
+        // compound entries in compound_nouns short-circuit both.
+        let dict = Dictionary::new();
+        for &(reading, expected_top) in &[
+            ("きたいち", "期待値"),
+            ("へいきんち", "平均値"),
+            ("さいだいち", "最大値"),
+            ("しきべつし", "識別子"),
+            ("けんだけ", "件だけ"),
+            ("にんだけ", "人だけ"),
+        ] {
+            let segs = dict.segment(reading);
+            let joined: Vec<&str> = segs.iter().map(|s| s.reading.as_str()).collect();
+            assert_eq!(joined, vec![reading], "{reading} should merge to one seg");
+            let top = segs[0].candidates.first().map(|e| e.surface.as_str());
+            assert_eq!(top, Some(expected_top), "{reading} top mismatch");
+        }
+    }
+
+    #[test]
+    fn counter_plus_ka_is_particle_not_suffix() {
+        // Regression: なんかいか used to segment as one merged 何回化
+        // because か→化 Suffix (5054) triggers Noun+Suffix reclass on
+        // 何回+か. Direct dict entries for the common counter+か phrases
+        // let the DP short-circuit that merge and produce 何回か.
+        let dict = Dictionary::new();
+        for &(reading, expected_top) in &[
+            ("なんかいか", "何回か"),
+            ("なんにんか", "何人か"),
+            ("なんじかんか", "何時間か"),
+            ("いくつか", "いくつか"),
+        ] {
+            let segs = dict.segment(reading);
+            let joined: Vec<&str> = segs.iter().map(|s| s.reading.as_str()).collect();
+            assert_eq!(joined, vec![reading], "{reading} should merge into one seg");
+            let top = segs[0].candidates.first().map(|e| e.surface.as_str());
+            assert_eq!(top, Some(expected_top), "{reading} top mismatch");
+        }
+    }
+
+    #[test]
+    fn monogaki_stays_particle_split_in_context() {
+        // Regression: ものがきに inside a sentence used to fuse into
+        // Noun+Suffix compound (物書きに) even though the natural parse is
+        // もの+が+き+に. IPADIC bumps がき→書き (Suffix 4400) above 餓鬼
+        // (Noun 4353) via PRIORITY_OVERRIDES, so the DP treats がき as one
+        // Suffix and the affix merge glues もの onto it. split_particle_
+        // head_segments breaks がき back into が+き before the merge runs.
+        let dict = Dictionary::new();
+        for reading in ["ものがきになる", "まわりのものがきになる"] {
+            let segs = dict.segment(reading);
+            let joined: Vec<&str> =
+                segs.iter().map(|s| s.reading.as_str()).collect();
+            assert!(
+                joined.iter().all(|r| !r.contains("ものがき")),
+                "{reading}: no segment should contain ものがき, got {joined:?}",
+            );
+            // ものが and きに should each be a segment (Noun+Particle bunsetsu).
+            assert!(
+                joined.contains(&"ものが") && joined.contains(&"きに"),
+                "{reading}: expected ものが/きに bunsetsu, got {joined:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn common_noun_kata_capped_below_kanji() {
+        // IPADIC ships モノ (3302) above 物 (3248) and コト (2795) above
+        // 事 (1188). Extending the kata cap to Nouns keeps them in the
+        // candidate list but never above the canonical kanji form.
+        let dict = Dictionary::new();
+        for &(reading, wrong_kata_top) in &[
+            ("もの", "モノ"),
+            ("こと", "コト"),
+            ("とき", "トキ"),
+        ] {
+            let top = dict.lookup(reading).first().map(|e| e.surface.to_string());
+            assert_ne!(
+                top.as_deref(),
+                Some(wrong_kata_top),
+                "{reading}: {wrong_kata_top} should not top",
+            );
+        }
+    }
+
+    #[test]
+    fn desushi_stays_hiragana_conjunction() {
+        // Regression: ですしね used to segment as です+すし(寿司)+ね and
+        // display "で鮨ね". The colloquial coordinator し is an IPADIC
+        // Particle at freq 2158 — buried under 市/氏/寿司 — so the DP
+        // preferred the 2-char noun over the 1-char particle. Add explicit
+        // hiragana compound entries for the common ですし/だし forms.
+        let dict = Dictionary::new();
+        for &(reading, expected_top) in &[
+            ("ですし", "ですし"),
+            ("ですしね", "ですしね"),
+            ("ですしよ", "ですしよ"),
+            ("ですしよね", "ですしよね"),
+            ("だしね", "だしね"),
+            ("だしよ", "だしよ"),
+        ] {
+            let segs = dict.segment(reading);
+            let joined: Vec<&str> = segs.iter().map(|s| s.reading.as_str()).collect();
+            assert_eq!(
+                joined,
+                vec![reading],
+                "{reading} should stay one segment"
+            );
+            let top = segs[0].candidates.first().map(|e| e.surface.as_str());
+            assert_eq!(top, Some(expected_top), "{reading} top mismatch");
+        }
+        // だし alone stays ambiguous (dashi / 山車 / 出汁) — the compound
+        // entry we skipped must NOT hijack it.
+        let segs = dict.segment("だし");
+        let top = segs[0].candidates.first().map(|e| e.surface.as_str());
+        assert_ne!(top, Some("だし"), "だし alone must not top as hiragana");
+    }
+
+    #[test]
+    fn shimasu_survives_masu_learning_boost() {
+        // Real-world regression: once the user records ます|ます (score 0.228),
+        // the DP for お願いします starts splitting します into し+ます — the
+        // ×10 boost cuts split cost by 2.28 and edges out the base freq-7000
+        // します Verb entry. The affix-compound merge then pulls お願い+し
+        // into a Noun+Suffix compound and the top surface becomes お願い市.
+        // PRIORITY_OVERRIDES bumps します-family to 9000-9500 so the single
+        // unit stays comfortably below the boosted split.
+        let dict = Dictionary::new();
+        let scores: std::collections::HashMap<(&str, &str), f64> = [
+            (("ます", "ます"), 0.228),
+            (("さい", "再"), 0.455),
+        ]
+        .into_iter()
+        .collect();
+        let boost = |r: &str, entries: &[&DictionaryEntry]| {
+            if r.chars().count() <= 1 {
+                return 0.0;
+            }
+            let mut best = 0.0_f64;
+            for e in entries {
+                if let Some(&s) = scores.get(&(r, e.surface.as_str())) {
+                    best = best.max(s);
+                }
+            }
+            best * 10.0
+        };
+        for reading in ["おねがいします", "さいかくにんをおねがいします"] {
+            let segs = dict.segment_with_boost(reading, boost);
+            let joined: Vec<&str> = segs.iter().map(|s| s.reading.as_str()).collect();
+            assert!(
+                joined.iter().any(|r| *r == "します"),
+                "expected します to stay as a single segment for {reading}, got {joined:?}",
+            );
+            for s in &segs {
+                if s.reading == "します" {
+                    assert_eq!(
+                        s.candidates.first().map(|e| e.surface.as_str()),
+                        Some("します"),
+                        "expected します top for the します segment",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn affix_merge_survives_user_scorer_boost() {
+        // Real-world regression: a user with さい|再 (3 uses) and かん|感 (1)
+        // in their learning history saw the DP pick なんじ+かん (汝感) and
+        // さいかく+にん (才覚人) — the desired 何時間 / 再確認 didn't even
+        // appear in the candidate list. probe_2piece_alternatives now
+        // enumerates the alternate split so the intended compound is
+        // reachable.
+        let dict = Dictionary::new();
+        let scores: std::collections::HashMap<(&str, &str), f64> = [
+            (("さい", "再"), 0.455),
+            (("なん", "なん"), 0.365),
+            (("なん", "何"), 0.228),
+            (("にん", "人"), 0.228),
+            (("かん", "感"), 0.228),
+            (("かん", "間"), 0.228),
+        ]
+        .into_iter()
+        .collect();
+        for &(reading, expected_top) in &[
+            ("なんじかん", "何時間"),
+            ("さいかくにん", "再確認"),
+            ("なんにん", "何人"),
+        ] {
+            let segs = dict.segment_with_boost(reading, |r, entries| {
+                if r.chars().count() <= 1 {
+                    return 0.0;
+                }
+                let mut best = 0.0_f64;
+                for e in entries {
+                    if let Some(&s) = scores.get(&(r, e.surface.as_str())) {
+                        best = best.max(s);
+                    }
+                }
+                best * 10.0
+            });
+            assert_eq!(segs.len(), 1, "{reading} should be a single merged segment");
+            let top = segs[0].candidates.first().map(|e| e.surface.as_str());
+            assert_eq!(top, Some(expected_top), "{reading} top mismatch under learned boost");
+        }
+    }
+
+    #[test]
+    fn affix_merge_reclassifies_particle_homograph_as_suffix() {
+        // Regression for readings whose right-side dominant candidate is a
+        // Particle but a strong Suffix homograph exists (か→化 5054 vs か
+        // Particle 7424). Without effective_right_merge_pos the merge fired
+        // as Noun+Particle → 政治+か (hiragana), instead of Noun+Suffix →
+        // 政治化 (kanji).
+        let dict = Dictionary::new();
+        for &(reading, expected_top) in &[
+            ("せいじか", "政治化"),
+            ("かっせいか", "活性化"),
+            ("じつようか", "実用化"),
+            ("じどうか", "自動化"),
+            ("みんしゅか", "民主化"),
+            ("せんもんか", "専門化"),
+        ] {
+            let segs = dict.segment(reading);
+            assert_eq!(segs.len(), 1, "{reading} should merge to a single segment, got {segs:?}");
+            let top = segs[0].candidates.first().map(|e| e.surface.as_str());
+            assert_eq!(top, Some(expected_top), "{reading} top mismatch");
+            // The 家 alternative must still be discoverable within top-5
+            // (widened cartesian keeps the long-tail Suffix homograph).
+            let has_ka_ie = segs[0].candidates.iter().any(|e| e.surface.ends_with('家'));
+            assert!(has_ka_ie, "{reading}: expected 家 form in candidate list");
+        }
+    }
+
+    #[test]
+    fn affix_merge_reclassifies_noun_homograph_as_suffix() {
+        // にん→人 Suffix (1859) is buried under 忍 Noun (4206) as dominant.
+        // Without the ≥1500 suffix threshold, なん+にん stayed two segments.
+        let dict = Dictionary::new();
+        for &(reading, expected_top) in &[
+            ("なんにん", "何人"),
+            ("なんじかん", "何時間"),
+        ] {
+            let segs = dict.segment(reading);
+            assert_eq!(segs.len(), 1, "{reading} should merge to a single segment, got {segs:?}");
+            let top = segs[0].candidates.first().map(|e| e.surface.as_str());
+            assert_eq!(top, Some(expected_top), "{reading} top mismatch");
+        }
+    }
+
+    #[test]
+    fn affix_merge_reclassifies_prefix_homograph() {
+        // さい dominant is 際 Noun (4950); 再 Prefix (4213) needs
+        // effective_left_merge_pos to enable the Prefix+Noun merge for
+        // 再確認. Similarly for ふ (歩 vs 不), み (未 already dominant).
+        let dict = Dictionary::new();
+        for &(reading, expected_top) in &[
+            ("さいかくにん", "再確認"),
+            ("ふかのう", "不可能"),
+            ("ひこうかい", "非公開"),
+            ("むかんけい", "無関係"),
+            ("みかくにん", "未確認"),
+        ] {
+            let segs = dict.segment(reading);
+            assert_eq!(segs.len(), 1, "{reading} should merge to a single segment, got {segs:?}");
+            let top = segs[0].candidates.first().map(|e| e.surface.as_str());
+            assert_eq!(top, Some(expected_top), "{reading} top mismatch");
         }
     }
 
