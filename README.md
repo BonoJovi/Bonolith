@@ -4,7 +4,7 @@
 
 **An LLM-powered Japanese input method for Linux — IBus & Fcitx5**
 
-[![Version](https://img.shields.io/badge/Version-3.1.2-blue)](https://github.com/BonoJovi/Bonolith/releases)
+[![Version](https://img.shields.io/badge/Version-3.1.3-blue)](https://github.com/BonoJovi/Bonolith/releases)
 [![Rust](https://img.shields.io/badge/Rust-2024-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/bonojovi)
