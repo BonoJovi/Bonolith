@@ -174,6 +174,10 @@ pub struct Dictionary {
     /// Optional persistent store. When attached, mutations to the user
     /// portion of the dictionary are written through to SQLite.
     store: Option<Arc<DictStore>>,
+    /// True once `finalize_sort` has been called. `add_entry` skips its
+    /// per-node re-sort until this flips, so bulk load stays O(N) instead
+    /// of the O(N²) it would be if every insertion re-sorted.
+    sorted: bool,
 }
 
 impl Dictionary {
@@ -184,10 +188,22 @@ impl Dictionary {
             trie: Trie::new(),
             user_start: 0,
             store: None,
+            sorted: false,
         };
         dict.load_builtin();
         dict.user_start = dict.entries.len();
+        dict.finalize_sort();
         dict
+    }
+
+    /// Sort every trie posting list by descending frequency so that
+    /// `lookup` / `prefix_lookup` / `common_prefix_search` can hand back
+    /// pre-ordered results directly. Runtime insertions call
+    /// [`Trie::resort_node`] on just the affected reading.
+    fn finalize_sort(&mut self) {
+        let freqs: Vec<u32> = self.entries.iter().map(|e| e.frequency).collect();
+        self.trie.sort_by_freq(&freqs);
+        self.sorted = true;
     }
 
     /// Attach a persistent store. Subsequent calls to
@@ -223,20 +239,27 @@ impl Dictionary {
         store.replace_all_user_entries(&self.entries[self.user_start..])
     }
 
-    /// Add a single entry.
+    /// Add a single entry. During bulk-load (before `finalize_sort`) this
+    /// just appends — the trailing `finalize_sort` orders every posting
+    /// list once. After finalization each add re-sorts only its own node
+    /// so the pre-sort invariant relied on by `lookup` still holds.
     pub fn add_entry(&mut self, entry: DictionaryEntry) {
         let idx = self.entries.len();
         let reading = entry.reading.clone();
         self.entries.push(entry);
         self.trie.insert(&reading, idx);
+        if self.sorted {
+            let entries = &self.entries;
+            self.trie.resort_node(&reading, |i| entries[i].frequency);
+        }
     }
 
-    /// Exact lookup: return all candidates for a reading, sorted by frequency (descending).
+    /// Exact lookup: return all candidates for a reading, sorted by
+    /// frequency (descending). Order comes from the pre-sorted trie
+    /// posting list — no per-call sort.
     pub fn lookup(&self, reading: &str) -> Vec<&DictionaryEntry> {
         let indices = self.trie.exact_lookup(reading);
-        let mut entries: Vec<&DictionaryEntry> = indices.iter().map(|&i| &self.entries[i]).collect();
-        entries.sort_by(|a, b| b.frequency.cmp(&a.frequency));
-        entries
+        indices.iter().map(|&i| &self.entries[i]).collect()
     }
 
     /// Common prefix search: find all dictionary words that are prefixes of `input`.
@@ -246,9 +269,8 @@ impl Dictionary {
             .common_prefix_search(input)
             .into_iter()
             .map(|(len, indices)| {
-                let mut entries: Vec<&DictionaryEntry> =
+                let entries: Vec<&DictionaryEntry> =
                     indices.iter().map(|&i| &self.entries[i]).collect();
-                entries.sort_by(|a, b| b.frequency.cmp(&a.frequency));
                 (len, entries)
             })
             .collect()
@@ -257,9 +279,7 @@ impl Dictionary {
     /// Prefix lookup: return candidates for all readings starting with `prefix`.
     pub fn prefix_lookup(&self, prefix: &str) -> Vec<&DictionaryEntry> {
         let indices = self.trie.prefix_lookup(prefix);
-        let mut entries: Vec<&DictionaryEntry> = indices.iter().map(|&i| &self.entries[i]).collect();
-        entries.sort_by(|a, b| b.frequency.cmp(&a.frequency));
-        entries
+        indices.iter().map(|&i| &self.entries[i]).collect()
     }
 
     /// Segment a kana string into words using minimum-cost dynamic programming.
@@ -324,7 +344,7 @@ impl Dictionary {
 
             let prefix_infos: Vec<PrefixInfo> = prefixes
                 .iter()
-                .map(|(len, indices)| {
+                .map(|&(len, indices)| {
                     // Group candidates by POS; take the max-frequency entry per POS
                     // so each POS transition is scored on its strongest candidate.
                     let mut best_freq_by_pos = [0u32; PC];
@@ -336,10 +356,10 @@ impl Dictionary {
                         }
                     }
 
-                    let boost = if *len < max_prefix_len {
+                    let boost = if len < max_prefix_len {
                         0.0
                     } else {
-                        let reading = &input[byte_offsets[i]..byte_offsets[i + *len]];
+                        let reading = &input[byte_offsets[i]..byte_offsets[i + len]];
                         let entries: Vec<&DictionaryEntry> = indices
                             .iter()
                             .map(|&idx| &self.entries[idx])
@@ -347,7 +367,7 @@ impl Dictionary {
                         boost_fn(reading, &entries)
                     };
 
-                    PrefixInfo { len: *len, best_freq_by_pos, boost }
+                    PrefixInfo { len, best_freq_by_pos, boost }
                 })
                 .collect();
 
