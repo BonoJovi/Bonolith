@@ -288,7 +288,13 @@ pub fn hiragana_to_romaji(s: &str) -> String {
                         let next_slice: String = chars[i + 1..i + 1 + len].iter().collect();
                         if let Some(romaji) = kana_to_romaji_lookup(&next_slice) {
                             if let Some(consonant) = romaji.chars().next() {
-                                if consonant.is_ascii_alphabetic() {
+                                // Only double if the next mora actually starts
+                                // with a consonant. Bare vowels (あいうえお)
+                                // otherwise emitted "aa"/"ii"/... for "っあ" —
+                                // e.g. F9/F10 turned "あっあ" into "aaa"
+                                // instead of the correct "axtua".
+                                let is_vowel = matches!(consonant, 'a' | 'e' | 'i' | 'o' | 'u');
+                                if consonant.is_ascii_alphabetic() && !is_vowel {
                                     result.push(consonant);
                                     doubled = true;
                                 }
