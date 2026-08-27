@@ -879,6 +879,16 @@ impl BonolithEngine {
                 self.cancel_conversion(emitter).await?;
                 Ok(true)
             }
+            // Backspace → cancel conversion, return to preedit (Mozc parity).
+            // Without this arm, Backspace fell through to the outer function
+            // key handler as a "non-printable, consumed silently" key —
+            // conversion mode stayed active and the user had to press
+            // Escape to actually cancel. Fable 5 tagged [6] as Fcitx5-only,
+            // but IBus had the equivalent silently-eaten variant.
+            IBUS_KEY_BACKSPACE => {
+                self.cancel_conversion(emitter).await?;
+                Ok(true)
+            }
             _ => Ok(false),
         }
     }
