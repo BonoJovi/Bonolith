@@ -48,6 +48,37 @@ pub struct ConversionState {
     pub focus: usize,
 }
 
+/// The five kana display forms Bonolith cycles through with F6-F10.
+/// Used by [`ConversionEngine::convert_focused_to`] so the shared
+/// "swap the focused segment's surface to X" code path has one place
+/// to live instead of five near-identical wrappers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KanaForm {
+    Hiragana,          // F6  — reading as-is
+    Katakana,          // F7  — full-width カタカナ
+    HalfwidthKatakana, // F8  — ｶﾀｶﾅ
+    FullwidthRomaji,   // F9  — ａｂｃ (Mozc / Google IME / ATOK convention)
+    Romaji,            // F10 — abc (half-width ASCII)
+}
+
+impl KanaForm {
+    /// Transform the given hiragana reading into this form. Hiragana is
+    /// the identity mapping; the others delegate to `core::romaji`.
+    pub fn apply(self, reading: &str) -> String {
+        match self {
+            KanaForm::Hiragana => reading.to_string(),
+            KanaForm::Katakana => crate::core::romaji::hiragana_to_katakana(reading),
+            KanaForm::HalfwidthKatakana => {
+                crate::core::romaji::hiragana_to_halfwidth_katakana(reading)
+            }
+            KanaForm::Romaji => crate::core::romaji::hiragana_to_romaji(reading),
+            KanaForm::FullwidthRomaji => {
+                crate::core::romaji::hiragana_to_fullwidth_romaji(reading)
+            }
+        }
+    }
+}
+
 impl ConversionState {
     /// Get the composed text from all segments' selected candidates.
     pub fn composed_text(&self) -> String {
@@ -478,14 +509,26 @@ impl ConversionEngine {
 
     /// Set the focused segment's selected candidate to its hiragana reading (F6).
     pub fn convert_focused_to_hiragana(&mut self) -> Option<&ConversionState> {
+        self.convert_focused_to(KanaForm::Hiragana)
+    }
+
+    /// Reset the focused segment to one of the five kana forms — hiragana
+    /// (F6), full/half-width katakana (F7/F8), full/half-width romaji
+    /// (F9/F10). Adds the transformed text as a new candidate when the
+    /// segment doesn't already contain it, and marks the segment as
+    /// user-selected so later LLM rerank passes leave it alone. Replaces
+    /// five near-identical convert_focused_to_* helpers.
+    pub fn convert_focused_to(&mut self, form: KanaForm) -> Option<&ConversionState> {
         let state = self.conversion.as_mut()?;
         let seg = &mut state.segments[state.focus];
-        if let Some(pos) = seg.candidates.iter().position(|c| c == &seg.reading) {
-            seg.selected = pos;
-        } else {
-            seg.candidates.push(seg.reading.clone());
-            seg.selected = seg.candidates.len() - 1;
-        }
+        let text = form.apply(&seg.reading);
+        seg.selected = match seg.candidates.iter().position(|c| c == &text) {
+            Some(p) => p,
+            None => {
+                seg.candidates.push(text);
+                seg.candidates.len() - 1
+            }
+        };
         seg.user_selected = true;
         self.conversion.as_ref()
     }
@@ -546,17 +589,7 @@ impl ConversionEngine {
 
     /// Convert the focused segment's reading to katakana and set it as the selected candidate.
     pub fn convert_focused_to_katakana(&mut self) -> Option<&ConversionState> {
-        let state = self.conversion.as_mut()?;
-        let seg = &mut state.segments[state.focus];
-        let katakana = crate::core::romaji::hiragana_to_katakana(&seg.reading);
-        if let Some(pos) = seg.candidates.iter().position(|c| c == &katakana) {
-            seg.selected = pos;
-        } else {
-            seg.candidates.push(katakana);
-            seg.selected = seg.candidates.len() - 1;
-        }
-        seg.user_selected = true;
-        self.conversion.as_ref()
+        self.convert_focused_to(KanaForm::Katakana)
     }
 
     /// Clear conversion state (on commit or cancel).
@@ -602,49 +635,19 @@ impl ConversionEngine {
         scored
     }
 
-    /// Convert the focused segment's reading to half-width romaji (F9 during conversion mode).
+    /// Convert the focused segment's reading to half-width romaji (F10 during conversion mode).
     pub fn convert_focused_to_romaji(&mut self) -> Option<&ConversionState> {
-        let state = self.conversion.as_mut()?;
-        let seg = &mut state.segments[state.focus];
-        let romaji = crate::core::romaji::hiragana_to_romaji(&seg.reading);
-        if let Some(pos) = seg.candidates.iter().position(|c| c == &romaji) {
-            seg.selected = pos;
-        } else {
-            seg.candidates.push(romaji);
-            seg.selected = seg.candidates.len() - 1;
-        }
-        seg.user_selected = true;
-        self.conversion.as_ref()
+        self.convert_focused_to(KanaForm::Romaji)
     }
 
-    /// Convert the focused segment's reading to full-width romaji (F10 during conversion mode).
+    /// Convert the focused segment's reading to full-width romaji (F9 during conversion mode).
     pub fn convert_focused_to_fullwidth_romaji(&mut self) -> Option<&ConversionState> {
-        let state = self.conversion.as_mut()?;
-        let seg = &mut state.segments[state.focus];
-        let fw_romaji = crate::core::romaji::hiragana_to_fullwidth_romaji(&seg.reading);
-        if let Some(pos) = seg.candidates.iter().position(|c| c == &fw_romaji) {
-            seg.selected = pos;
-        } else {
-            seg.candidates.push(fw_romaji);
-            seg.selected = seg.candidates.len() - 1;
-        }
-        seg.user_selected = true;
-        self.conversion.as_ref()
+        self.convert_focused_to(KanaForm::FullwidthRomaji)
     }
 
     /// Convert the focused segment's reading to half-width katakana.
     pub fn convert_focused_to_halfwidth_katakana(&mut self) -> Option<&ConversionState> {
-        let state = self.conversion.as_mut()?;
-        let seg = &mut state.segments[state.focus];
-        let hw = crate::core::romaji::hiragana_to_halfwidth_katakana(&seg.reading);
-        if let Some(pos) = seg.candidates.iter().position(|c| c == &hw) {
-            seg.selected = pos;
-        } else {
-            seg.candidates.push(hw);
-            seg.selected = seg.candidates.len() - 1;
-        }
-        seg.user_selected = true;
-        self.conversion.as_ref()
+        self.convert_focused_to(KanaForm::HalfwidthKatakana)
     }
 
     /// Commit the selected candidate and update context.
