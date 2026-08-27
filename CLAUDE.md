@@ -17,15 +17,20 @@
 
 ## Install & Restart
 
+Install is done via `scripts/install.sh`, which handles both IBus and
+Fcitx5, restarts daemons, and internally escalates for `/usr/bin` writes.
+**Do not** prefix `sudo` and **do not** invoke `cp`/`pkill`/`ibus-daemon`
+directly — the script is the only supported path.
+
 ```bash
-# Build
+# Rust build (always required after src/ changes)
 cargo build --release
 
-# IBus — install and restart
-sudo pkill -f ibus-daemon && sleep 1 && sudo rm -f /usr/bin/ibus-engine-bonolith && sudo cp target/release/bonolith /usr/bin/ibus-engine-bonolith && sleep 2 && ibus-daemon -drx
+# Fcitx5 addon rebuild (only when fcitx5/*.cpp or CMakeLists changed)
+(cd fcitx5/build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr && make)
 
-# Fcitx5 — build and install
-cd fcitx5/build && make clean && cmake .. -DCMAKE_INSTALL_PREFIX=/usr && make && sudo make install && fcitx5 -r -d
+# Install both frontends + restart daemons
+./scripts/install.sh
 ```
 
 ## Commands
