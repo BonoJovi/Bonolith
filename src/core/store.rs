@@ -136,7 +136,7 @@ impl DictStore {
         conn.execute(
             "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value
-               WHERE meta.value < excluded.value",
+               WHERE CAST(meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)",
             params![SCHEMA_VERSION.to_string()],
         )
         .map_err(sqlite_to_io)?;

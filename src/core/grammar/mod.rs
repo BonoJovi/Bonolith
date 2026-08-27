@@ -287,10 +287,18 @@ fn calculate_score(issues: &[GrammarIssue]) -> f64 {
 }
 
 /// Can this POS precede a particle?
+///
+/// Verbs and adjectives take particles all the time in real Japanese
+/// (見たが / 楽しくて / 行きたいと …). Omitting them penalized correct
+/// sentences in the legacy `convert()` scoring path.
 fn can_precede_particle(pos: PartOfSpeech) -> bool {
     matches!(
         pos,
-        PartOfSpeech::Noun | PartOfSpeech::Adverb | PartOfSpeech::Interjection
+        PartOfSpeech::Noun
+            | PartOfSpeech::Adverb
+            | PartOfSpeech::Interjection
+            | PartOfSpeech::Verb
+            | PartOfSpeech::Adjective
     )
 }
 
