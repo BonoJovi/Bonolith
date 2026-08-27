@@ -498,12 +498,29 @@ impl ConversionEngine {
         let romaji = crate::core::romaji::hiragana_to_romaji(&kana);
         let fw_romaji = crate::core::romaji::hiragana_to_fullwidth_romaji(&kana);
 
-        let mut candidates = vec![kana.clone(), katakana, half_katakana, romaji, fw_romaji];
-        // Deduplicate while preserving order
-        let mut seen = std::collections::HashSet::new();
-        candidates.retain(|c| seen.insert(c.clone()));
+        // Look up the requested form BEFORE deduping. The old code deduped
+        // the vec first and then indexed by `form`, so on strings whose
+        // renderings collide — e.g. "ー" where kana==katakana == "ー" —
+        // F8 (form=2, half-width katakana) mapped to index 2 of the deduped
+        // list, which was the ASCII "-", not "ｰ".
+        let forms = [kana.clone(), katakana, half_katakana, romaji, fw_romaji];
+        let selected_text = forms
+            .get(form)
+            .cloned()
+            .unwrap_or_else(|| forms[0].clone());
 
-        let selected = form.min(candidates.len().saturating_sub(1));
+        let mut candidates: Vec<String> = Vec::with_capacity(forms.len());
+        let mut seen = std::collections::HashSet::new();
+        for f in forms.iter() {
+            if seen.insert(f.clone()) {
+                candidates.push(f.clone());
+            }
+        }
+
+        let selected = candidates
+            .iter()
+            .position(|c| c == &selected_text)
+            .unwrap_or(0);
 
         self.conversion = Some(ConversionState {
             kana: kana.clone(),
@@ -760,10 +777,14 @@ impl ConversionEngine {
 
         let shared = self.shared.clone();
         let result_slot = self.llm_rerank_result.clone();
+        // Clone the inflight flag into the worker so a panic path can clear
+        // it — otherwise `rerank_inflight` stays latched and the frontend
+        // wastes ~2 s polling for a result that will never arrive.
+        let inflight = self.rerank_inflight.clone();
 
         // Clear previous result and mark a pass in flight (cleared when applied).
         *result_slot.lock().unwrap() = None;
-        self.rerank_inflight.store(true, Ordering::Relaxed);
+        inflight.store(true, Ordering::Relaxed);
 
         thread::spawn(move || {
             // Catch any panics to prevent crashing the IBus process
@@ -841,6 +862,11 @@ impl ConversionEngine {
                 }
                 Err(_) => {
                     log::warn!("LLM background reranking panicked, discarding results");
+                    // Without this, `rerank_inflight` stays true until the
+                    // next conversion overwrites it, so the current pass's
+                    // poll-refresh loop burns ~2 s waiting for a result the
+                    // panicked thread will never produce.
+                    inflight.store(false, Ordering::Relaxed);
                 }
             }
         });

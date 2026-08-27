@@ -2,8 +2,9 @@ use std::collections::HashMap;
 
 pub struct TrieNode {
     children: HashMap<char, TrieNode>,
-    /// Entry indices into Dictionary.entries, in insertion order. Callers that
-    /// want frequency ordering (e.g. Dictionary::lookup) sort at read time.
+    /// Entry indices into Dictionary.entries. Pre-sorted by descending
+    /// frequency once at build time via [`Trie::sort_by_freq`]; callers
+    /// therefore read this slice directly without a per-lookup sort.
     pub entry_indices: Vec<usize>,
 }
 
@@ -53,9 +54,14 @@ impl Trie {
         &node.entry_indices
     }
 
-    /// Common prefix search: find all prefixes of `input` that exist as dictionary entries.
-    /// Returns Vec of (prefix_char_length, entry_indices).
-    pub fn common_prefix_search(&self, input: &str) -> Vec<(usize, Vec<usize>)> {
+    /// Common prefix search: find all prefixes of `input` that exist as
+    /// dictionary entries. Returns `(prefix_char_length, entry_indices)`
+    /// tuples, with `entry_indices` borrowed directly from the trie —
+    /// segmentation calls this on every character position, so cloning
+    /// each posting `Vec<usize>` at the caller's boundary was pure
+    /// throwaway allocation on the hot path. Order matches the pre-sorted
+    /// posting list (descending frequency), so callers don't sort either.
+    pub fn common_prefix_search(&self, input: &str) -> Vec<(usize, &[usize])> {
         let mut results = Vec::new();
         let mut node = &self.root;
         let mut char_len = 0;
@@ -66,7 +72,7 @@ impl Trie {
                     node = child;
                     char_len += 1;
                     if !node.entry_indices.is_empty() {
-                        results.push((char_len, node.entry_indices.clone()));
+                        results.push((char_len, node.entry_indices.as_slice()));
                     }
                 }
                 None => break,
@@ -99,6 +105,41 @@ impl Trie {
             }
         }
         node.entry_indices.retain(|&idx| idx != entry_idx);
+    }
+
+    /// Sort every posting list in the trie by the provided key (descending).
+    /// `key_of[entry_idx]` supplies the sort key — typically an entry's
+    /// frequency. Callers run this once after mass-loading so the hot-path
+    /// `lookup`/`prefix_lookup`/`common_prefix_search` can return already-
+    /// ordered slices without re-sorting on every query.
+    pub fn sort_by_freq(&mut self, key_of: &[u32]) {
+        Self::sort_recursive(&mut self.root, key_of);
+    }
+
+    fn sort_recursive(node: &mut TrieNode, key_of: &[u32]) {
+        node.entry_indices.sort_by(|&a, &b| key_of[b].cmp(&key_of[a]));
+        for child in node.children.values_mut() {
+            Self::sort_recursive(child, key_of);
+        }
+    }
+
+    /// Re-sort just the posting list at `reading`. Cheap variant for
+    /// per-entry mutations (user dictionary add) so we don't have to walk
+    /// the whole trie again. `key_of(idx)` supplies the sort key on demand
+    /// — usually only 1–2 entries share a reading, so no full freq vec is
+    /// materialized.
+    pub fn resort_node<F>(&mut self, reading: &str, key_of: F)
+    where
+        F: Fn(usize) -> u32,
+    {
+        let mut node = &mut self.root;
+        for ch in reading.chars() {
+            match node.children.get_mut(&ch) {
+                Some(child) => node = child,
+                None => return,
+            }
+        }
+        node.entry_indices.sort_by(|&a, &b| key_of(b).cmp(&key_of(a)));
     }
 
     fn collect_all(node: &TrieNode, results: &mut Vec<usize>) {
@@ -140,8 +181,10 @@ mod tests {
         let results = trie.common_prefix_search("きょうは");
         // Should find: き (len=1), きょう (len=3), but NOT きょうと (input too short at は)
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0], (1, vec![0]));     // き
-        assert_eq!(results[1], (3, vec![1]));     // きょう
+        assert_eq!(results[0].0, 1);
+        assert_eq!(results[0].1, &[0][..]);        // き
+        assert_eq!(results[1].0, 3);
+        assert_eq!(results[1].1, &[1][..]);        // きょう
     }
 
     #[test]

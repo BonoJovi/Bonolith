@@ -2,8 +2,9 @@
 ///
 /// Implements org.freedesktop.IBus.Factory which creates engine instances
 /// on demand from the IBus daemon.
-use log::info;
+use log::{info, warn};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zbus::{connection::Builder, interface, object_server::SignalEmitter, Connection};
@@ -75,6 +76,13 @@ impl BonolithControl {
     }
 }
 
+/// Monotonic engine sequence — mirrors the C IBus convention of
+/// `/org/freedesktop/IBus/Engine/{N}` so every input context gets its own
+/// object path. Sharing a path across contexts made the second CreateEngine
+/// a silent no-op (zbus `ObjectServer::at` returns `Ok(false)`), which
+/// multiplexed every window onto the first engine and cross-wired state.
+static ENGINE_SEQ: AtomicU64 = AtomicU64::new(0);
+
 #[interface(name = "org.freedesktop.IBus.Factory")]
 impl BonolithFactory {
     /// Called by IBus daemon to create a new engine instance.
@@ -84,16 +92,28 @@ impl BonolithFactory {
         #[zbus(connection)] connection: &Connection,
         engine_name: &str,
     ) -> zbus::fdo::Result<zbus::zvariant::OwnedObjectPath> {
-        info!("Bonolith Factory: CreateEngine({})", engine_name);
+        let id = ENGINE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = format!("/org/freedesktop/IBus/Engine/{}", id);
+        info!("Bonolith Factory: CreateEngine({}) → {}", engine_name, path);
 
-        let path = format!("/org/freedesktop/IBus/Engine/{}", engine_name);
-        let engine = BonolithEngine::new(&self.config, self.force.clone());
+        let engine = BonolithEngine::new(&self.config, self.force.clone(), path.clone());
 
-        connection
+        let inserted = connection
             .object_server()
             .at(path.as_str(), engine)
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+        if !inserted {
+            warn!(
+                "Bonolith Factory: object path {} already registered — engine sequence collision",
+                path
+            );
+            return Err(zbus::fdo::Error::Failed(format!(
+                "engine path {} already registered",
+                path
+            )));
+        }
 
         Ok(path
             .try_into()

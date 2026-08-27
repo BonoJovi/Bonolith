@@ -228,11 +228,19 @@ pub unsafe extern "C" fn bonolith_handle_key(
     }
 
     // F6 → hiragana
+    //
+    // F6-F10 are always consumed while Bonolith is the active IM
+    // (bonolith_handle_key is only entered in that case). Returning false
+    // for an empty-preedit F-key leaked the raw keysym to the host, where
+    // a terminal turned e.g. F7 into `\e[18~` and the trailing tilde
+    // appeared as input. Only the `converting=true` latch is gated —
+    // that flag must not go on when there is no reading to convert,
+    // otherwise a subsequent Space is silently swallowed by
+    // cycle_candidate's no-op.
     if keyval == KEY_F6 {
         if ctx.converting {
             ctx.engine.convert_focused_to_hiragana();
-        } else {
-            ctx.engine.start_kana_conversion(0);
+        } else if ctx.engine.start_kana_conversion(0).is_some() {
             ctx.converting = true;
         }
         return true;
@@ -253,8 +261,7 @@ pub unsafe extern "C" fn bonolith_handle_key(
                 KEY_F10 => { ctx.engine.convert_focused_to_romaji(); }
                 _ => { ctx.engine.convert_focused_to_katakana(); }
             }
-        } else {
-            ctx.engine.start_kana_conversion(form);
+        } else if ctx.engine.start_kana_conversion(form).is_some() {
             ctx.converting = true;
         }
         return true;
@@ -285,12 +292,18 @@ pub unsafe extern "C" fn bonolith_handle_key(
         return true;
     }
 
-    // Escape → cancel input
+    // Escape → cancel input, but only consume if there was actually something
+    // to cancel. Swallowing Esc unconditionally would eat vim's mode exit and
+    // dialog-close Esc while Bonolith is active (IBus side already checks
+    // similarly on Tab/Enter).
     if keyval == KEY_ESCAPE {
-        ctx.engine.reset();
-        ctx.engine.clear_conversion();
-        ctx.converting = false;
-        return true;
+        if ctx.converting || !ctx.engine.preedit().is_empty() {
+            ctx.engine.reset();
+            ctx.engine.clear_conversion();
+            ctx.converting = false;
+            return true;
+        }
+        return false;
     }
 
     // Backspace — consume if there was anything to delete
@@ -356,6 +369,15 @@ fn handle_conversion_key(ctx: &mut BonolithContext, keyval: u32, has_shift: bool
             true
         }
         KEY_ESCAPE => {
+            ctx.engine.clear_conversion();
+            ctx.converting = false;
+            true
+        }
+        // Backspace during conversion → cancel back to preedit (Mozc parity).
+        // Without this arm the key falls through `_ => false`, so the host
+        // app receives the Backspace and deletes a character of already-
+        // committed text. The IBus side already consumes it.
+        KEY_BACKSPACE => {
             ctx.engine.clear_conversion();
             ctx.converting = false;
             true

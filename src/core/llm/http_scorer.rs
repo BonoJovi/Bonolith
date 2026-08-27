@@ -8,8 +8,8 @@
 ///   llama-server -m ~/.local/share/bonolith/models/qwen2.5-1.5b-instruct-q4_k_m.gguf \
 ///     --host 127.0.0.1 --port 8080 --ctx-size 512
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
@@ -19,13 +19,33 @@ use super::LlmScorer;
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8080";
 const SCORE_TIMEOUT: Duration = Duration::from_millis(500);
 const HEALTH_TIMEOUT: Duration = Duration::from_millis(200);
+/// Hard ceiling for a scoring request (send + response headers + body).
+/// `timeout_recv_body` alone leaves header wait unbounded, so a cold-KV
+/// llama-server used to be able to stall Space for several seconds.
+const SCORE_GLOBAL_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Cap on the header-response wait specifically. llama-server is
+/// non-streaming and only writes headers after generation completes, so
+/// this bounds the "silence before the first byte" window that the
+/// body-recv timeout misses.
+const SCORE_RECV_RESPONSE_TIMEOUT: Duration = Duration::from_millis(1200);
+/// How long to short-circuit after an observed failure before probing
+/// again. Previously the `warned` latch was permanent, so a transient 503
+/// silently disabled the LLM signal for the rest of the process life
+/// (the "LLM warned 一方向性 (v1.2.3)" incident). 30 s is short enough to
+/// self-heal after a restart of llama-server and long enough that a
+/// wedged server doesn't get pounded on every keystroke.
+const WARNED_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// LLM scorer that communicates with a local llama-server via HTTP.
 pub struct HttpLlamaScorer {
     endpoint: String,
     agent: ureq::Agent,
-    /// Suppress repeated warnings after first failure
-    warned: AtomicBool,
+    /// Unix epoch (seconds) at which the last failure was observed.
+    /// 0 = no known failure. Non-zero within `WARNED_COOLDOWN` = short-
+    /// circuit HTTP for this window; older stamps re-arm the probe so the
+    /// scorer can self-heal after transient server hiccups instead of
+    /// latching off for the process lifetime.
+    warned_at: AtomicU64,
 }
 
 #[derive(Serialize)]
@@ -112,18 +132,51 @@ impl HttpLlamaScorer {
             }
         }
 
-        // Use longer timeouts for actual scoring requests
+        // Use longer timeouts for actual scoring requests. `timeout_global`
+        // is the hard ceiling: without it a llama-server whose KV is cold
+        // (or whose parent process wedged) could stall Space indefinitely
+        // because header-response wait defaults to unbounded.
         let agent = ureq::Agent::config_builder()
             .timeout_connect(Some(HEALTH_TIMEOUT))
+            .timeout_recv_response(Some(SCORE_RECV_RESPONSE_TIMEOUT))
             .timeout_recv_body(Some(SCORE_TIMEOUT))
+            .timeout_global(Some(SCORE_GLOBAL_TIMEOUT))
             .build()
             .new_agent();
 
         Some(Self {
             endpoint: endpoint.to_string(),
             agent,
-            warned: AtomicBool::new(false),
+            warned_at: AtomicU64::new(0),
         })
+    }
+
+    /// Return the current unix time in seconds, or 0 if the clock is
+    /// pre-epoch (never — but avoid panicking).
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// True if we are currently inside the fail-fast cooldown window.
+    fn cooldown_active(&self) -> bool {
+        let ts = self.warned_at.load(Ordering::Relaxed);
+        if ts == 0 {
+            return false;
+        }
+        Self::now_secs().saturating_sub(ts) < WARNED_COOLDOWN.as_secs()
+    }
+
+    /// Mark that a request just failed. Returns true if this is the first
+    /// failure of a new cooldown window (i.e., the previous window had
+    /// already elapsed or this is the very first failure) — callers use
+    /// that to decide `warn!` vs `debug!`.
+    fn mark_failed(&self) -> bool {
+        let was_fresh = !self.cooldown_active();
+        self.warned_at.store(Self::now_secs(), Ordering::Relaxed);
+        was_fresh
     }
 
     /// Connect to the default endpoint, checking BONOLITH_LLM_ENDPOINT env var.
@@ -144,8 +197,10 @@ impl HttpLlamaScorer {
         // Fast-fail: once the server has been observed unreachable
         // (e.g., user ran `bonolith llm off` mid-session), skip the HTTP
         // round-trip entirely and return the neutral score so we
-        // don't pay the connect-timeout per keystroke.
-        if self.warned.load(Ordering::Relaxed) {
+        // don't pay the connect-timeout per keystroke. The cooldown lets
+        // the scorer re-probe after `WARNED_COOLDOWN` so a transient 503
+        // no longer disables scoring for the process lifetime.
+        if self.cooldown_active() {
             return 0.5;
         }
         if candidate.is_empty() {
@@ -169,7 +224,7 @@ impl HttpLlamaScorer {
         let resp = match self.agent.post(&url).send_json(&req) {
             Ok(r) => r,
             Err(e) => {
-                if !self.warned.swap(true, Ordering::Relaxed) {
+                if self.mark_failed() {
                     warn!("HttpLlamaScorer: completion request failed: {}", e);
                 } else {
                     debug!("HttpLlamaScorer: completion request failed: {}", e);
@@ -224,7 +279,7 @@ impl LlmScorer for HttpLlamaScorer {
     }
 
     fn warm_cache(&self, context: &str) {
-        if context.is_empty() || self.warned.load(Ordering::Relaxed) {
+        if context.is_empty() || self.cooldown_active() {
             return;
         }
         // Send a no-generation request to warm the server's KV cache
@@ -238,7 +293,7 @@ impl LlmScorer for HttpLlamaScorer {
             n_probs: 0,
         };
         if let Err(e) = self.agent.post(&url).send_json(&req) {
-            if !self.warned.swap(true, Ordering::Relaxed) {
+            if self.mark_failed() {
                 warn!("HttpLlamaScorer: warm_cache failed: {}", e);
             }
         }

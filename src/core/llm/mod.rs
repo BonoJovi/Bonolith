@@ -67,12 +67,21 @@ impl LlmEngine {
     /// Update the committed context (called after each commit).
     pub fn update_context(&mut self, committed_text: &str) {
         self.context.push_str(committed_text);
-        // Keep last 200 chars for context window
-        if self.context.len() > 200 {
-            let start = self.context.len() - 200;
-            // Find a char boundary
-            let start = self.context.ceil_char_boundary(start);
-            self.context = self.context[start..].to_string();
+        // Keep last 200 *characters*. The prior version measured `.len()`
+        // (bytes) then sliced at `len - 200`, which in Japanese kept only
+        // ~66 chars — well under the homophone-rerank window we need
+        // (subject 80+ chars back for 機械/機会 style flips).
+        const MAX_CHARS: usize = 200;
+        let char_count = self.context.chars().count();
+        if char_count > MAX_CHARS {
+            let skip = char_count - MAX_CHARS;
+            let byte_start = self
+                .context
+                .char_indices()
+                .nth(skip)
+                .map(|(i, _)| i)
+                .unwrap_or(self.context.len());
+            self.context = self.context[byte_start..].to_string();
         }
     }
 

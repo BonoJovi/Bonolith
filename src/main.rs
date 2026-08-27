@@ -1,9 +1,11 @@
 mod ibus;
 
-use log::info;
+use log::{info, warn};
 
 use bonolith::core::dictionary::Dictionary;
+use std::future::poll_fn;
 use std::path::PathBuf;
+use std::pin::Pin;
 
 fn init_logging() {
     // TODO: File logging disabled due to I/O latency. Re-enable after
@@ -233,14 +235,50 @@ async fn main() {
             info!("Bonolith - Japanese AI-powered Input Method");
             info!("Starting Bonolith engine...");
 
+            // Warm the shared core (343k-entry trie + LLM health probe) up
+            // front so the first CreateEngine from ibus-daemon doesn't have
+            // to wait for it. Registering with the daemon and *then* doing
+            // a multi-hundred-ms sync init made the first focus_in on some
+            // apps drop keystrokes into the raw channel while the engine
+            // object was still constructing.
+            tokio::task::spawn_blocking(|| {
+                let _ = bonolith::engine::SharedCore::global();
+            })
+            .await
+            .ok();
+
             match ibus::start_ibus_service().await {
                 Ok((connection, _control)) => {
                     info!("Bonolith: IBus service started successfully");
                     // `_control` (session-bus org.bonolith.Control) is held for the
                     // loop's lifetime so its bus name stays claimed.
+                    //
+                    // Drain a MessageStream to detect ibus-daemon going away.
+                    // The previous `loop { monitor_activity().await }` never
+                    // returned even when the daemon died, so the process
+                    // stayed alive as a zombie holding org.bonolith.Control —
+                    // any subsequent install (pkill + `ibus-daemon -drx`)
+                    // could not reclaim the name and the word-register
+                    // force-enable path went silently dead. MessageStream is
+                    // a broadcast subscription, so this doesn't steal
+                    // messages from the ObjectServer dispatch.
+                    use zbus::export::futures_core::Stream;
+                    let mut stream = zbus::MessageStream::from(connection.clone());
                     loop {
-                        connection.monitor_activity().await;
+                        match poll_fn(|cx| Pin::new(&mut stream).poll_next(cx)).await {
+                            Some(Ok(_)) => continue,
+                            Some(Err(e)) => {
+                                warn!("Bonolith: IBus message stream error: {}", e);
+                                break;
+                            }
+                            None => {
+                                info!("Bonolith: IBus connection closed");
+                                break;
+                            }
+                        }
                     }
+                    info!("Bonolith: exiting after IBus disconnect");
+                    std::process::exit(0);
                 }
                 Err(e) => {
                     eprintln!("Bonolith: Failed to start IBus service: {}", e);

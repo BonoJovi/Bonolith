@@ -10,3 +10,6 @@
 # Python bytecode cache from helper scripts
 scripts/__pycache__/
 *.pyc
+
+# Work directory (temporary files, not for commit)
+/work/

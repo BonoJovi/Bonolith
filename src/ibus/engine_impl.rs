@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use log::{debug, info, warn};
 use zbus::object_server::SignalEmitter;
-use zbus::{interface, zvariant};
+use zbus::{interface, zvariant, Connection};
 
 use bonolith::core::dictionary::{Dictionary, DictionaryEntry, PartOfSpeech};
 use bonolith::engine::{ConversionEngine, ConversionState, SharedCore};
@@ -31,13 +31,17 @@ pub struct BonolithEngine {
     /// Shared force-on window set by the word-register dialog (see
     /// `factory::ForceEnable`).
     force: ForceEnable,
+    /// Object path this engine is registered at — used by `destroy` to remove
+    /// itself from the connection's `ObjectServer` so old engines don't leak.
+    object_path: String,
 }
 
 impl BonolithEngine {
-    pub fn new(config: &BonolithConfig, force: ForceEnable) -> Self {
+    pub fn new(config: &BonolithConfig, force: ForceEnable, object_path: String) -> Self {
         let toggle_keys = config.compile_toggle_keys();
         info!(
-            "Bonolith: Engine created with {} toggle key binding(s)",
+            "Bonolith: Engine created at {} with {} toggle key binding(s)",
+            object_path,
             toggle_keys.len()
         );
         Self {
@@ -46,6 +50,7 @@ impl BonolithEngine {
             converting: Arc::new(Mutex::new(false)),
             toggle_keys,
             force,
+            object_path,
         }
     }
 
@@ -309,21 +314,35 @@ impl BonolithEngine {
                 }
             };
             if let Some(text) = text {
-                Self::commit_text(&emitter, ibus_text(&text)).await
-                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-                Self::hide_preedit_text(&emitter).await
-                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-                Self::hide_lookup_table(&emitter).await
-                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-                Self::hide_auxiliary_text(&emitter).await
-                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                // Best-effort emit. Engine state has already been mutated
+                // (commit_conversion / engine.commit take internal state),
+                // so a `?` here used to leave `converting=true` latched when
+                // a hide-signal failed, jamming further input. Log and
+                // finish the state cleanup instead — a broken D-Bus means
+                // the daemon is already gone and text loss is unavoidable,
+                // but the residual `converting=true` was.
+                if let Err(e) = Self::commit_text(&emitter, ibus_text(&text)).await {
+                    warn!("Bonolith: commit_text emission failed: {}", e);
+                }
+                let _ = Self::hide_preedit_text(&emitter).await;
+                let _ = Self::hide_lookup_table(&emitter).await;
+                let _ = Self::hide_auxiliary_text(&emitter).await;
                 *self.converting.lock().unwrap() = false;
                 return Ok(true);
             }
             return Ok(false);
         }
 
-        // F6 → hiragana
+        // F6-F10 → kana form selection.
+        //
+        // Bonolith always owns F6-F10 while the engine is enabled (we get
+        // here only after the `!enabled` gate above). start_kana_conversion
+        // returns Ok(false) for an empty preedit — propagating that let
+        // IBus pass the raw keysym to the app, where a terminal expanded
+        // F7 into `\e[18~` and printed the trailing tilde. Discard the
+        // "did we actually enter conversion mode" bool and always report
+        // the key as consumed; the empty-preedit case is a no-op instead
+        // of a passthrough.
         if keyval == IBUS_KEY_F6 {
             if converting {
                 let conv = {
@@ -333,11 +352,10 @@ impl BonolithEngine {
                 if let Some(conv) = conv {
                     self.show_conversion_state(&emitter, &conv).await?;
                 }
-                return Ok(true);
             } else {
-                // Enter kana conversion mode with hiragana selected
-                return self.start_kana_conversion(&emitter, 0).await;
+                let _ = self.start_kana_conversion(&emitter, 0).await?;
             }
+            return Ok(true);
         }
 
         // F7 → full-width katakana, F8 → half-width katakana, F9 → full-width romaji, F10 → half-width romaji
@@ -359,7 +377,8 @@ impl BonolithEngine {
                     }
                 }
             } else {
-                return self.start_kana_conversion(&emitter, form).await;
+                let _ = self.start_kana_conversion(&emitter, form).await?;
+                return Ok(true);
             }
         }
 
@@ -380,14 +399,13 @@ impl BonolithEngine {
                 engine.commit_conversion()
             };
             if let Some(text) = text {
-                Self::commit_text(&emitter, ibus_text(&text)).await
-                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-                Self::hide_preedit_text(&emitter).await
-                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-                Self::hide_lookup_table(&emitter).await
-                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-                Self::hide_auxiliary_text(&emitter).await
-                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                // Same best-effort emission pattern — see the Tab arm above.
+                if let Err(e) = Self::commit_text(&emitter, ibus_text(&text)).await {
+                    warn!("Bonolith: commit_text emission failed: {}", e);
+                }
+                let _ = Self::hide_preedit_text(&emitter).await;
+                let _ = Self::hide_lookup_table(&emitter).await;
+                let _ = Self::hide_auxiliary_text(&emitter).await;
                 *self.converting.lock().unwrap() = false;
             }
             // Fall through to process the key as new input
@@ -591,7 +609,12 @@ impl BonolithEngine {
             engine.clear_conversion();
         }
         *self.converting.lock().unwrap() = false;
-        *self.enabled.lock().unwrap() = false;
+        // Deliberately keep `enabled` — standard IMEs hold 日本語ON/OFF per
+        // input context across focus changes. Clearing it here made every
+        // focus-out drop the mode, and neither focus_in nor IBus' enable
+        // callback restore it, so the next keystroke fell through as raw
+        // Latin. Preedit/converting state is cleaned above; the mode bit
+        // belongs to the context, not to the transient composition.
     }
 
     /// Reset engine state.
@@ -631,6 +654,31 @@ impl BonolithEngine {
 
     /// Set capabilities (unused but required by interface).
     async fn set_capabilities(&self, _cap: u32) {}
+
+    /// Called by IBus daemon when this engine is no longer needed (typically
+    /// when the input context that owns it goes away). Removes the object
+    /// from the `ObjectServer` so we don't leak engines — without this, every
+    /// context we ever served stays live for the lifetime of the process.
+    async fn destroy(
+        &self,
+        #[zbus(connection)] connection: &Connection,
+    ) -> zbus::fdo::Result<()> {
+        info!("Bonolith: Destroy engine at {}", self.object_path);
+        let path = self.object_path.clone();
+        match connection
+            .object_server()
+            .remove::<Self, _>(path.as_str())
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => warn!(
+                "Bonolith: Destroy called on {} but object was not registered",
+                path
+            ),
+            Err(e) => warn!("Bonolith: Destroy remove({}) failed: {}", path, e),
+        }
+        Ok(())
+    }
 
     // ---- IBus Signals ----
 
@@ -815,20 +863,29 @@ impl BonolithEngine {
                     engine.commit_conversion()
                 };
                 if let Some(text) = text {
-                    Self::commit_text(emitter, ibus_text(&text)).await
-                        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-                    Self::hide_preedit_text(emitter).await
-                        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-                    Self::hide_lookup_table(emitter).await
-                        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-                    Self::hide_auxiliary_text(emitter).await
-                        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                    // Same best-effort emission pattern — see the Tab arm.
+                    if let Err(e) = Self::commit_text(emitter, ibus_text(&text)).await {
+                        warn!("Bonolith: commit_text emission failed: {}", e);
+                    }
+                    let _ = Self::hide_preedit_text(emitter).await;
+                    let _ = Self::hide_lookup_table(emitter).await;
+                    let _ = Self::hide_auxiliary_text(emitter).await;
                     *self.converting.lock().unwrap() = false;
                 }
                 Ok(true)
             }
             // Escape → cancel conversion, return to preedit
             IBUS_KEY_ESCAPE => {
+                self.cancel_conversion(emitter).await?;
+                Ok(true)
+            }
+            // Backspace → cancel conversion, return to preedit (Mozc parity).
+            // Without this arm, Backspace fell through to the outer function
+            // key handler as a "non-printable, consumed silently" key —
+            // conversion mode stayed active and the user had to press
+            // Escape to actually cancel. Fable 5 tagged [6] as Fcitx5-only,
+            // but IBus had the equivalent silently-eaten variant.
+            IBUS_KEY_BACKSPACE => {
                 self.cancel_conversion(emitter).await?;
                 Ok(true)
             }
