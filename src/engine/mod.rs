@@ -777,10 +777,14 @@ impl ConversionEngine {
 
         let shared = self.shared.clone();
         let result_slot = self.llm_rerank_result.clone();
+        // Clone the inflight flag into the worker so a panic path can clear
+        // it — otherwise `rerank_inflight` stays latched and the frontend
+        // wastes ~2 s polling for a result that will never arrive.
+        let inflight = self.rerank_inflight.clone();
 
         // Clear previous result and mark a pass in flight (cleared when applied).
         *result_slot.lock().unwrap() = None;
-        self.rerank_inflight.store(true, Ordering::Relaxed);
+        inflight.store(true, Ordering::Relaxed);
 
         thread::spawn(move || {
             // Catch any panics to prevent crashing the IBus process
@@ -858,6 +862,11 @@ impl ConversionEngine {
                 }
                 Err(_) => {
                     log::warn!("LLM background reranking panicked, discarding results");
+                    // Without this, `rerank_inflight` stays true until the
+                    // next conversion overwrites it, so the current pass's
+                    // poll-refresh loop burns ~2 s waiting for a result the
+                    // panicked thread will never produce.
+                    inflight.store(false, Ordering::Relaxed);
                 }
             }
         });
