@@ -333,7 +333,16 @@ impl BonolithEngine {
             return Ok(false);
         }
 
-        // F6 → hiragana
+        // F6-F10 → kana form selection.
+        //
+        // Bonolith always owns F6-F10 while the engine is enabled (we get
+        // here only after the `!enabled` gate above). start_kana_conversion
+        // returns Ok(false) for an empty preedit — propagating that let
+        // IBus pass the raw keysym to the app, where a terminal expanded
+        // F7 into `\e[18~` and printed the trailing tilde. Discard the
+        // "did we actually enter conversion mode" bool and always report
+        // the key as consumed; the empty-preedit case is a no-op instead
+        // of a passthrough.
         if keyval == IBUS_KEY_F6 {
             if converting {
                 let conv = {
@@ -343,11 +352,10 @@ impl BonolithEngine {
                 if let Some(conv) = conv {
                     self.show_conversion_state(&emitter, &conv).await?;
                 }
-                return Ok(true);
             } else {
-                // Enter kana conversion mode with hiragana selected
-                return self.start_kana_conversion(&emitter, 0).await;
+                let _ = self.start_kana_conversion(&emitter, 0).await?;
             }
+            return Ok(true);
         }
 
         // F7 → full-width katakana, F8 → half-width katakana, F9 → full-width romaji, F10 → half-width romaji
@@ -369,7 +377,8 @@ impl BonolithEngine {
                     }
                 }
             } else {
-                return self.start_kana_conversion(&emitter, form).await;
+                let _ = self.start_kana_conversion(&emitter, form).await?;
+                return Ok(true);
             }
         }
 
