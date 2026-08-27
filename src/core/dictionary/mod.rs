@@ -31,7 +31,7 @@ pub struct DictionaryEntry {
     pub frequency: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PartOfSpeech {
     Noun,
     Verb,
@@ -158,12 +158,23 @@ const PRIORITY_OVERRIDES: &[(&str, &str, u32)] = &[
     // Same exclusion rule — context-dependent verbs (着る/切る, 図る/測る,
     // 上る/登る, 治す/直す, 帰る/変える) are left to the LLM.
     ("みる", "見る", 4200),     // was 2999, below 海松/水松 4120 (seaweed nouns)
-    ("いのる", "祈る", 2900),   // was 2678, below 祷る 2850
-    ("およぐ", "泳ぐ", 2900),   // was 2770, below 游ぐ 2850
-    ("とじる", "閉じる", 2900), // was 2845, below 綴じる 2850
-    ("つくる", "作る", 7300),   // was 2449; also clears the katakana artifact ツクる 7264
+    // For the four families below, load_builtin propagates the freq to every
+    // inflection whose reading starts with the stem and whose surface starts
+    // with the kanji stem. Compound generation gives rare-kanji rivals like
+    // 祷った / 游いだ / 綴じた / 捜します a ~5700 boosted freq, so the
+    // elevation must sit above 5700 to keep the canonical kanji surface top.
+    ("いのる", "祈る", 5800),   // was 2678; base competitor 祷る 2850, inflection 祷った 5700
+    ("およぐ", "泳ぐ", 5800),   // was 2770; base competitor 游ぐ 2850, inflection 游いだ 5700
+    ("とじる", "閉じる", 5800), // was 2845; base competitor 綴じる 2850, inflection 綴じた 5696
+    // つくる family is the one PRIORITY_OVERRIDES verb whose hiragana inflections
+    // are boosted well above the base (つくりました reaches 11444 in IPADIC), so
+    // the elevation propagated to 作った / 作りました / 作られる needs a much
+    // higher ceiling than the other families. Load-time propagation (see
+    // load_builtin) applies this same freq to every inflection whose reading
+    // starts with "つく" and whose surface starts with "作".
+    ("つくる", "作る", 12000),  // was 2449 / bumped past hiragana つくりました 11444
     ("あう", "会う", 2850),     // was 2743, below 遭う/遇う 2768
-    ("さがす", "探す", 2900),   // was 2817, below 捜す 2850
+    ("さがす", "探す", 5800),   // was 2817; base competitor 捜す 2850, inflection 捜します 5666
 ];
 
 pub struct Dictionary {
@@ -695,11 +706,72 @@ impl Dictionary {
             .iter()
             .map(|&(r, s, f)| ((r, s), f))
             .collect();
+
+        // Reading/surface stems extracted from PRIORITY_OVERRIDES verb entries.
+        // For each override that names a kanji-preferred verb base form (e.g.
+        // つくる → 作る), we treat every inflection whose reading starts with
+        // "つく" *and* whose surface starts with "作" as belonging to the same
+        // family, and raise it to the base override's frequency. That lifts
+        // 作った / 作って / 作っている / 作ります / 作られる in one shot,
+        // instead of listing every form.
+        let verb_families = collect_verb_stems(PRIORITY_OVERRIDES);
+
+        // Precompute the top RAW kanji-form frequency per (reading, POS) for
+        // Verb/Adjective. Used below to cap emphatic-katakana surface variants
+        // (ツクった / カエった / ハサんだ …) that IPADIC assigns unrealistically
+        // low costs to; without the cap, the compound ×2 boost lets them
+        // dominate the canonical kanji form of the same reading.
+        //
+        // The cap deliberately uses raw IPADIC freq (not the post-override
+        // value), so a PRIORITY_OVERRIDES bump like つくる→作る at 12000 only
+        // lifts the kanji form itself — the kata variant is capped just below
+        // the raw kanji ceiling and ends up ranked below every hiragana form
+        // in the family, not sandwiched between the elevated kanji and the
+        // untouched hiragana.
+        let mut max_kanji_freq: std::collections::HashMap<(&'static str, PartOfSpeech), u32> =
+            std::collections::HashMap::new();
+        for &(reading, surface, pos, freq) in builtin_dict::BUILTIN_ENTRIES {
+            if !matches!(pos, PartOfSpeech::Verb | PartOfSpeech::Adjective) {
+                continue;
+            }
+            if !surface_contains_kanji(surface) {
+                continue;
+            }
+            max_kanji_freq
+                .entry((reading, pos))
+                .and_modify(|v| *v = (*v).max(freq))
+                .or_insert(freq);
+        }
+
         for &(reading, surface, pos, frequency) in builtin_dict::BUILTIN_ENTRIES {
-            let frequency = overrides
+            let mut frequency = overrides
                 .get(&(reading, surface))
                 .copied()
                 .unwrap_or(frequency);
+
+            if matches!(pos, PartOfSpeech::Verb | PartOfSpeech::Adjective) {
+                // Family-based elevation: propagate the base override's freq
+                // to every inflected kanji surface of the same verb family.
+                for &(read_stem, surf_stem, boost) in &verb_families {
+                    if reading.starts_with(read_stem) && surface.starts_with(surf_stem) {
+                        if frequency < boost {
+                            frequency = boost;
+                        }
+                        break;
+                    }
+                }
+                // Emphatic-katakana cap: keep the kata variant in candidates
+                // but never above the reading's canonical kanji form.
+                if is_kata_dominant(surface) {
+                    if let Some(&kanji_top) = max_kanji_freq.get(&(reading, pos)) {
+                        let cap = kanji_top.saturating_sub(200).max(500);
+                        if frequency > cap {
+                            frequency = cap;
+                        }
+                    }
+                }
+            }
+
             self.add_entry(DictionaryEntry {
                 reading: reading.to_string(),
                 surface: surface.to_string(),
@@ -879,6 +951,83 @@ impl Dictionary {
                 pos: PartOfSpeech::Auxiliary,
                 frequency: 8500,
             });
+        }
+
+        // Godan さ-row verb past/te forms. IPADIC tags 話し / 出し / 探し only
+        // under 連用形, and the standard compound generator emits た/て from
+        // 連用形 for ichidan verbs only (five-dan さ has an identical stem but
+        // no 連用タ接続 row in Verb.csv). As a result the auto-generated dict
+        // contains 話します but no 話した / 話して — user typing はなした
+        // used to reach only 話し手 (Noun) via segmentation.
+        //
+        // Frequencies are set high enough (≥ 8000) to survive segmentation:
+        // the DP's user_scorer boost multiplies learned はなし|話 selections
+        // by 10 (see engine::start_conversion), so a 3-char split cost easily
+        // beats a 4-char single-unit match at freq ≤ 6500. 8500 puts single
+        // unit cost at −35.2 vs split ≈ −35.0, keeping 話して as the top hit
+        // for typical learning histories.
+        //
+        // Each row lists a base reading and every kanji surface that shares it.
+        let godan_su_verbs: &[(&str, &[&str], u32)] = &[
+            ("はなす",     &["話す"],                     8500),
+            ("だす",       &["出す"],                     8500),
+            ("かす",       &["貸す"],                     8000),
+            ("おす",       &["押す"],                     8000),
+            ("けす",       &["消す"],                     8000),
+            ("なおす",     &["直す", "治す"],             8000),
+            ("おこす",     &["起こす"],                   8000),
+            ("うごかす",   &["動かす"],                   8000),
+            ("おとす",     &["落とす"],                   8000),
+            ("わたす",     &["渡す"],                     8000),
+            ("さがす",     &["探す", "捜す"],             8500),
+            ("しめす",     &["示す"],                     8000),
+            ("うつす",     &["移す", "写す", "映す"],     8000),
+            ("とおす",     &["通す"],                     8000),
+            ("かえす",     &["返す"],                     8000),
+            ("もどす",     &["戻す"],                     8000),
+            ("まわす",     &["回す"],                     8000),
+            ("ふやす",     &["増やす"],                   7500),
+            ("へらす",     &["減らす"],                   7500),
+            ("さす",       &["差す", "指す", "刺す"],     8000),
+            ("かくす",     &["隠す"],                     7500),
+            ("よごす",     &["汚す"],                     7500),
+            ("あらわす",   &["表す", "現す"],             7500),
+            ("たす",       &["足す"],                     7500),
+            ("いかす",     &["生かす"],                   7500),
+            ("あます",     &["余す"],                     7500),
+            ("うながす",   &["促す"],                     7500),
+            ("ためす",     &["試す"],                     8000),
+            ("のこす",     &["残す"],                     8000),
+            ("こわす",     &["壊す"],                     8000),
+            ("たおす",     &["倒す"],                     7500),
+            ("ころす",     &["殺す"],                     7500),
+            ("なくす",     &["無くす", "亡くす"],         7500),
+        ];
+        const SU_TAILS: &[(&str, &str)] = &[
+            ("した", "した"),
+            ("して", "して"),
+            ("している", "している"),
+            ("しています", "しています"),
+            ("していた", "していた"),
+            ("していない", "していない"),
+            ("しません", "しません"),  // negative polite
+        ];
+        for &(reading, surfaces, base_freq) in godan_su_verbs {
+            let read_stem_len = reading.len() - 'す'.len_utf8();
+            let read_stem = &reading[..read_stem_len];
+            for &(read_suf, surf_suf) in SU_TAILS {
+                let r = format!("{}{}", read_stem, read_suf);
+                for (i, surf) in surfaces.iter().enumerate() {
+                    let surf_stem_len = surf.len() - 'す'.len_utf8();
+                    let surf_stem = &surf[..surf_stem_len];
+                    self.add_entry(DictionaryEntry {
+                        reading: r.clone(),
+                        surface: format!("{}{}", surf_stem, surf_suf),
+                        pos: PartOfSpeech::Verb,
+                        frequency: base_freq.saturating_sub(i as u32 * 50),
+                    });
+                }
+            }
         }
 
         // Compound particles (格助詞連結) absent from IPADIC as single entries.
@@ -1062,6 +1211,66 @@ fn segment_cost(char_len: usize, frequency: u32) -> f64 {
     (char_len as f64) * -(frequency as f64).ln() + 1.0
 }
 
+fn surface_contains_kanji(surface: &str) -> bool {
+    surface.chars().any(|c| {
+        ('\u{4E00}'..='\u{9FFF}').contains(&c) || ('\u{3400}'..='\u{4DBF}').contains(&c)
+    })
+}
+
+/// Katakana-dominant surface: contains at least one katakana codepoint and no
+/// kanji. Both pure katakana (ツクる) and mixed kata+hiragana suffix (ツクった)
+/// match; kanji+katakana mixes (e.g., 挿ハサむ, hypothetical) do not.
+fn is_kata_dominant(surface: &str) -> bool {
+    let mut has_kata = false;
+    for c in surface.chars() {
+        if ('\u{4E00}'..='\u{9FFF}').contains(&c) || ('\u{3400}'..='\u{4DBF}').contains(&c) {
+            return false;
+        }
+        if ('\u{30A1}'..='\u{30F6}').contains(&c) {
+            has_kata = true;
+        }
+    }
+    has_kata
+}
+
+const VERB_BASE_KANA: &[char] = &['る', 'む', 'ぶ', 'く', 'ぐ', 'す', 'つ', 'う', 'ぬ'];
+
+/// Extract (reading_stem, surface_stem, freq) tuples from PRIORITY_OVERRIDES
+/// entries that describe kanji-preferred verb base forms. A stem is the base
+/// reading/surface with its trailing verb-base kana dropped, so that
+/// starts_with matching catches every inflection of the same family.
+///
+/// Entries with a reading shorter than 3 chars (e.g. あう, みる) are skipped —
+/// a 1-char stem would over-match unrelated verbs. Non-verb overrides (nouns,
+/// hiragana-only surfaces, etc.) are also skipped.
+fn collect_verb_stems(
+    overrides: &'static [(&'static str, &'static str, u32)],
+) -> Vec<(&'static str, &'static str, u32)> {
+    let mut out = Vec::new();
+    for &(reading, surface, freq) in overrides {
+        let reading_chars: Vec<char> = reading.chars().collect();
+        if reading_chars.len() < 3 {
+            continue;
+        }
+        let last = *reading_chars.last().unwrap();
+        if !VERB_BASE_KANA.contains(&last) {
+            continue;
+        }
+        if !surface_contains_kanji(surface) {
+            continue;
+        }
+        let read_stem = &reading[..reading.len() - last.len_utf8()];
+        // Trim the surface's trailing base kana if present (e.g., "見る" → "見",
+        // "作る" → "作"); otherwise keep the whole surface.
+        let surf_stem = match surface.chars().last() {
+            Some(sc) if sc == last => &surface[..surface.len() - sc.len_utf8()],
+            _ => surface,
+        };
+        out.push((read_stem, surf_stem, freq));
+    }
+    out
+}
+
 /// Read a dictionary JSON file and parse it into entries.
 /// Returns a rich io::Error including file path, line/column, and a hint
 /// when parsing fails (so users can fix manual edits without grepping logs).
@@ -1215,6 +1424,124 @@ mod tests {
         // the LLM decides these from context.
         let ame = dict.lookup("あめ");
         assert_eq!(ame.first().map(|e| e.surface.as_str()), Some("雨"));
+    }
+
+    #[test]
+    fn verb_inflection_prefers_kanji_over_katakana() {
+        // Every conjugated form of an override-listed verb family should top
+        // its group with the kanji surface, and its emphatic-katakana variant
+        // (IPADIC ships ツクった / サガした / トジた at 14–15K freq) must not.
+        let dict = Dictionary::new();
+        let cases: &[(&str, &str)] = &[
+            // 作る family (godan ら, 促音便)
+            ("つくった", "作った"),
+            ("つくって", "作って"),
+            ("つくっている", "作っている"),
+            ("つくっています", "作っています"),
+            ("つくります", "作ります"),
+            ("つくりました", "作りました"),
+            ("つくられる", "作られる"),
+            // 探す family (godan さ) — past/te forms live in load_symbol_entries;
+            // polite forms come from the generator.
+            ("さがした", "探した"),
+            ("さがして", "探して"),
+            ("さがしている", "探している"),
+            ("さがします", "探します"),
+            // 泳ぐ family (godan が, イ音便 → 泳いだ/泳いで)
+            ("およいだ", "泳いだ"),
+            ("およいで", "泳いで"),
+            ("およぎます", "泳ぎます"),
+            // 閉じる family (ichidan)
+            ("とじた", "閉じた"),
+            ("とじて", "閉じて"),
+            ("とじます", "閉じます"),
+            // 祈る family (godan ら)
+            ("いのった", "祈った"),
+            ("いのって", "祈って"),
+            ("いのります", "祈ります"),
+        ];
+        for &(reading, expected) in cases {
+            let results = dict.lookup(reading);
+            assert_eq!(
+                results.first().map(|e| e.surface.as_str()),
+                Some(expected),
+                "expected {expected} to top {reading}; top-5: {:?}",
+                results.iter().take(5).map(|e| e.surface.as_str()).collect::<Vec<_>>(),
+            );
+            // The kata variant, if present, must rank below every kanji form.
+            let kata_pos = results
+                .iter()
+                .position(|e| is_kata_dominant(&e.surface));
+            let last_kanji_pos = results
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| surface_contains_kanji(&e.surface))
+                .map(|(i, _)| i)
+                .max();
+            if let (Some(k), Some(last_k)) = (kata_pos, last_kanji_pos) {
+                assert!(
+                    k > last_k,
+                    "kata variant ranked at {k}, expected after all kanji forms (last at {last_k}) for {reading}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn godan_su_verb_survives_learned_split_boost() {
+        // Regression for the case that surfaced during install-and-test: the
+        // user had recorded a はなし|話 selection (~3 times), so the DP's
+        // ×10 boost pushed the はなし+て split cost below the single-unit
+        // はなして match, and 話し手 (Noun 4378) reappeared as top. The
+        // supplement's 8000+ base freq must keep the single unit winning.
+        let dict = Dictionary::new();
+        for &(reading, expected) in &[
+            ("はなして", "話して"),
+            ("はなした", "話した"),
+            ("だして", "出して"),
+            ("さがして", "探して"),
+        ] {
+            let segs = dict.segment_with_boost(reading, |r, entries| {
+                if r.chars().count() <= 1 { return 0.0; }
+                let mut best = 0.0_f64;
+                for e in entries {
+                    if r.len() == reading.len() - 'て'.len_utf8()
+                        && surface_contains_kanji(&e.surface)
+                    {
+                        best = best.max(0.455);
+                    }
+                }
+                best * 10.0
+            });
+            assert_eq!(segs.len(), 1, "{reading} should stay a single segment");
+            let top = segs[0].candidates.first().map(|e| e.surface.as_str());
+            assert_eq!(
+                top,
+                Some(expected),
+                "expected {expected} top for {reading} even under a learned split boost, got {:?}",
+                top,
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_katakana_verb_stays_on_top() {
+        // Loanword verbs whose canonical form is katakana (サボる, ダブる, ググる)
+        // have no kanji competitor, so the demotion path must NOT touch them.
+        let dict = Dictionary::new();
+        for &(reading, expected) in &[
+            ("さぼった", "サボった"),
+            ("さぼって", "サボって"),
+            ("だぶった", "ダブった"),
+        ] {
+            let top = dict.lookup(reading).first().map(|e| e.surface.to_string());
+            assert_eq!(
+                top.as_deref(),
+                Some(expected),
+                "expected {expected} to remain top for {reading}, got {:?}",
+                top,
+            );
+        }
     }
 
     #[test]
