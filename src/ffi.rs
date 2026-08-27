@@ -228,21 +228,22 @@ pub unsafe extern "C" fn bonolith_handle_key(
     }
 
     // F6 → hiragana
+    //
+    // F6-F10 are always consumed while Bonolith is the active IM
+    // (bonolith_handle_key is only entered in that case). Returning false
+    // for an empty-preedit F-key leaked the raw keysym to the host, where
+    // a terminal turned e.g. F7 into `\e[18~` and the trailing tilde
+    // appeared as input. Only the `converting=true` latch is gated —
+    // that flag must not go on when there is no reading to convert,
+    // otherwise a subsequent Space is silently swallowed by
+    // cycle_candidate's no-op.
     if keyval == KEY_F6 {
         if ctx.converting {
             ctx.engine.convert_focused_to_hiragana();
-            return true;
-        }
-        // Gate `converting = true` on the engine actually producing a
-        // conversion state — start_kana_conversion returns None when there
-        // is no reading. Setting converting=true unconditionally leaves the
-        // flag latched on empty preedit, so subsequent Space is silently
-        // swallowed by cycle_candidate's no-op.
-        if ctx.engine.start_kana_conversion(0).is_some() {
+        } else if ctx.engine.start_kana_conversion(0).is_some() {
             ctx.converting = true;
-            return true;
         }
-        return false;
+        return true;
     }
 
     // F7 → katakana, F8 → half-width katakana, F9 → full-width romaji, F10 → half-width romaji
@@ -260,13 +261,10 @@ pub unsafe extern "C" fn bonolith_handle_key(
                 KEY_F10 => { ctx.engine.convert_focused_to_romaji(); }
                 _ => { ctx.engine.convert_focused_to_katakana(); }
             }
-            return true;
-        }
-        if ctx.engine.start_kana_conversion(form).is_some() {
+        } else if ctx.engine.start_kana_conversion(form).is_some() {
             ctx.converting = true;
-            return true;
         }
-        return false;
+        return true;
     }
 
     // Conversion mode key handling
