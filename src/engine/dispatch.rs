@@ -257,6 +257,14 @@ pub fn dispatch_key(
                 ..KeyOutcome::default()
             };
         }
+        // start_conversion declined but a preedit is being built
+        // (buffer holds a partial syllable like "k" / "ky"). Consume
+        // Space silently so it does not leak to the app while the
+        // user's next keystroke completes the kana. Only pass through
+        // when truly nothing is pending.
+        if !engine.preedit().is_empty() {
+            return KeyOutcome::consumed_noop();
+        }
         return KeyOutcome::default();
     }
 

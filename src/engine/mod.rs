@@ -398,6 +398,20 @@ impl ConversionEngine {
     /// Start segment-based conversion (space key pressed).
     /// Returns the conversion state if successful.
     pub fn start_conversion(&mut self) -> Option<&ConversionState> {
+        // Non-destructive precheck: only flush if there is already
+        // committed output OR the pending buffer is a lone "n" (the
+        // sole case where flush produces kana). Without this guard,
+        // a Space on a mid-syllable buffer like "k" / "ky" silently
+        // dropped the buffer, returned None, and let dispatch pass
+        // Space through to the app — while the client's preedit
+        // still displayed "k" until the next redraw, so the next
+        // 'a' produced "あ" instead of "か". Leaving the buffer
+        // intact lets the caller consume Space as a no-op and the
+        // user keeps building the syllable.
+        let flush_would_produce_kana = self.romaji.buffer() == "n";
+        if self.romaji.output().is_empty() && !flush_would_produce_kana {
+            return None;
+        }
         self.romaji.flush();
         let kana = self.romaji.output().to_string();
         if kana.is_empty() {
@@ -1824,6 +1838,42 @@ mod tests {
         assert_eq!(engine.preedit(), "か");
         engine.process_key('n');
         assert_eq!(engine.preedit(), "かn");
+    }
+
+    /// Regression (bug_list_fable_5_review_2026-08-28 #4): Space on a
+    /// mid-syllable buffer like "k" must not destroy the buffer. Before
+    /// the fix, start_conversion flushed unconditionally, dropped "k",
+    /// returned None, and the next 'a' produced "あ" instead of "か".
+    /// The fix makes start_conversion a no-op precheck when output is
+    /// empty and buffer isn't a lone "n".
+    #[test]
+    fn start_conversion_preserves_partial_buffer() {
+        let mut engine = ConversionEngine::new();
+        engine.process_key('k');
+        assert_eq!(engine.preedit(), "k");
+        assert!(
+            engine.start_conversion().is_none(),
+            "start_conversion should decline on empty output + partial buffer",
+        );
+        assert_eq!(
+            engine.preedit(),
+            "k",
+            "start_conversion must not destroy the pending buffer",
+        );
+        // Next keystroke should still complete the syllable.
+        engine.process_key('a');
+        assert_eq!(engine.preedit(), "か");
+    }
+
+    /// A lone "n" in the buffer is the one case where flush produces
+    /// kana — start_conversion still runs its full pipeline.
+    #[test]
+    fn start_conversion_flushes_lone_n() {
+        let mut engine = ConversionEngine::new();
+        engine.process_key('n');
+        assert_eq!(engine.preedit(), "n");
+        let state = engine.start_conversion().expect("lone n should convert to ん");
+        assert!(!state.segments.is_empty());
     }
 
     /// "kyou" (きょう) — the single segment's top candidate should be
