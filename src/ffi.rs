@@ -150,27 +150,29 @@ pub unsafe extern "C" fn bonolith_handle_key(
     keyval: u32,
     state: u32,
 ) -> bool {
-    let ctx = unsafe { &mut *ctx };
+    ffi_boundary(false, || {
+        let ctx = unsafe { &mut *ctx };
 
-    // Consume releases for F6–F10 while composing so GTK apps don't open
-    // menus on F10-release. All other releases pass through.
-    if state & dispatch::RELEASE_MASK != 0 {
-        if matches!(keyval, KEY_F6 | KEY_F7 | KEY_F8 | KEY_F9 | KEY_F10)
-            && (!ctx.engine.preedit().is_empty() || ctx.converting)
-        {
-            return true;
+        // Consume releases for F6–F10 while composing so GTK apps don't open
+        // menus on F10-release. All other releases pass through.
+        if state & dispatch::RELEASE_MASK != 0 {
+            if matches!(keyval, KEY_F6 | KEY_F7 | KEY_F8 | KEY_F9 | KEY_F10)
+                && (!ctx.engine.preedit().is_empty() || ctx.converting)
+            {
+                return true;
+            }
+            return false;
         }
-        return false;
-    }
 
-    let event = KeyEvent { keyval, state };
-    let outcome = dispatch_key(&mut ctx.engine, &mut ctx.converting, event);
-    if let Some(text) = outcome.commit {
-        ctx.pending_commit = Some(text);
-    }
-    // DisplayUpdate / schedule_rerank_refresh are consumed by IBus only;
-    // the Fcitx5 client polls bonolith_get_ui_state / _poll_apply_rerank.
-    outcome.consumed
+        let event = KeyEvent { keyval, state };
+        let outcome = dispatch_key(&mut ctx.engine, &mut ctx.converting, event);
+        if let Some(text) = outcome.commit {
+            ctx.pending_commit = Some(text);
+        }
+        // DisplayUpdate / schedule_rerank_refresh are consumed by IBus only;
+        // the Fcitx5 client polls bonolith_get_ui_state / _poll_apply_rerank.
+        outcome.consumed
+    })
 }
 
 // ── State queries ────────────────────────────────────────────────────────────
@@ -179,10 +181,12 @@ pub unsafe extern "C" fn bonolith_handle_key(
 /// The returned pointer is valid until the next call to any bonolith_* function.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_get_preedit(ctx: *mut BonolithContext) -> *const c_char {
-    let ctx = unsafe { &mut *ctx };
-    let preedit = ctx.engine.preedit();
-    ctx.cache_preedit = CString::new(preedit).unwrap_or_default();
-    ctx.cache_preedit.as_ptr()
+    ffi_boundary(ptr::null(), || {
+        let ctx = unsafe { &mut *ctx };
+        let preedit = ctx.engine.preedit();
+        ctx.cache_preedit = CString::new(preedit).unwrap_or_default();
+        ctx.cache_preedit.as_ptr()
+    })
 }
 
 /// Poll for committed text. Returns null if nothing to commit.
@@ -190,21 +194,25 @@ pub unsafe extern "C" fn bonolith_get_preedit(ctx: *mut BonolithContext) -> *con
 /// The returned pointer is valid until the next call to any bonolith_* function.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_poll_commit(ctx: *mut BonolithContext) -> *const c_char {
-    let ctx = unsafe { &mut *ctx };
-    match ctx.pending_commit.take() {
-        Some(text) => {
-            ctx.cache_commit = CString::new(text).unwrap_or_default();
-            ctx.cache_commit.as_ptr()
+    ffi_boundary(ptr::null(), || {
+        let ctx = unsafe { &mut *ctx };
+        match ctx.pending_commit.take() {
+            Some(text) => {
+                ctx.cache_commit = CString::new(text).unwrap_or_default();
+                ctx.cache_commit.as_ptr()
+            }
+            None => ptr::null(),
         }
-        None => ptr::null(),
-    }
+    })
 }
 
 /// Returns true if the engine is in conversion mode.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_is_converting(ctx: *mut BonolithContext) -> bool {
-    let ctx = unsafe { &*ctx };
-    ctx.converting
+    ffi_boundary(false, || {
+        let ctx = unsafe { &*ctx };
+        ctx.converting
+    })
 }
 
 /// Returns true while a background LLM rerank pass is outstanding (triggered by
@@ -212,8 +220,10 @@ pub unsafe extern "C" fn bonolith_is_converting(ctx: *mut BonolithContext) -> bo
 /// this to decide whether to poll `bonolith_poll_apply_rerank`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_rerank_pending(ctx: *mut BonolithContext) -> bool {
-    let ctx = unsafe { &*ctx };
-    ctx.engine.rerank_inflight()
+    ffi_boundary(false, || {
+        let ctx = unsafe { &*ctx };
+        ctx.engine.rerank_inflight()
+    })
 }
 
 /// Apply the background LLM rerank result if it is ready. Returns true if the
@@ -221,112 +231,134 @@ pub unsafe extern "C" fn bonolith_rerank_pending(ctx: *mut BonolithContext) -> b
 /// blocking: returns false when no result is ready yet.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_poll_apply_rerank(ctx: *mut BonolithContext) -> bool {
-    let ctx = unsafe { &mut *ctx };
-    ctx.engine.apply_llm_rerank()
+    ffi_boundary(false, || {
+        let ctx = unsafe { &mut *ctx };
+        ctx.engine.apply_llm_rerank()
+    })
 }
 
 /// Returns true if there is preedit text.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_has_preedit(ctx: *mut BonolithContext) -> bool {
-    let ctx = unsafe { &*ctx };
-    !ctx.engine.preedit().is_empty()
+    ffi_boundary(false, || {
+        let ctx = unsafe { &*ctx };
+        !ctx.engine.preedit().is_empty()
+    })
 }
 
 /// Get the composed text during conversion mode.
 /// The returned pointer is valid until the next call to any bonolith_* function.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_composed_text(ctx: *mut BonolithContext) -> *const c_char {
-    let ctx = unsafe { &mut *ctx };
-    let text = ctx.engine.conversion_state()
-        .map(|s| s.composed_text())
-        .unwrap_or_default();
-    ctx.cache_composed = CString::new(text).unwrap_or_default();
-    ctx.cache_composed.as_ptr()
+    ffi_boundary(ptr::null(), || {
+        let ctx = unsafe { &mut *ctx };
+        let text = ctx.engine.conversion_state()
+            .map(|s| s.composed_text())
+            .unwrap_or_default();
+        ctx.cache_composed = CString::new(text).unwrap_or_default();
+        ctx.cache_composed.as_ptr()
+    })
 }
 
 /// Get the number of segments in the current conversion.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_segment_count(ctx: *mut BonolithContext) -> i32 {
-    let ctx = unsafe { &*ctx };
-    ctx.engine.conversion_state()
-        .map(|s| s.segments.len() as i32)
-        .unwrap_or(0)
+    ffi_boundary(0, || {
+        let ctx = unsafe { &*ctx };
+        ctx.engine.conversion_state()
+            .map(|s| s.segments.len() as i32)
+            .unwrap_or(0)
+    })
 }
 
 /// Get the currently focused segment index.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_focus_index(ctx: *mut BonolithContext) -> i32 {
-    let ctx = unsafe { &*ctx };
-    ctx.engine.conversion_state()
-        .map(|s| s.focus as i32)
-        .unwrap_or(0)
+    ffi_boundary(0, || {
+        let ctx = unsafe { &*ctx };
+        ctx.engine.conversion_state()
+            .map(|s| s.focus as i32)
+            .unwrap_or(0)
+    })
 }
 
 /// Get the character start position of a segment in the composed text.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_segment_start_chars(ctx: *mut BonolithContext, seg: i32) -> i32 {
-    let ctx = unsafe { &*ctx };
-    ctx.engine.conversion_state()
-        .and_then(|s| {
-            let ranges = s.segment_char_ranges();
-            ranges.get(seg as usize).map(|(start, _)| *start as i32)
-        })
-        .unwrap_or(0)
+    ffi_boundary(0, || {
+        let ctx = unsafe { &*ctx };
+        ctx.engine.conversion_state()
+            .and_then(|s| {
+                let ranges = s.segment_char_ranges();
+                ranges.get(seg as usize).map(|(start, _)| *start as i32)
+            })
+            .unwrap_or(0)
+    })
 }
 
 /// Get the character length of a segment in the composed text.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_segment_char_len(ctx: *mut BonolithContext, seg: i32) -> i32 {
-    let ctx = unsafe { &*ctx };
-    ctx.engine.conversion_state()
-        .and_then(|s| {
-            let ranges = s.segment_char_ranges();
-            ranges.get(seg as usize).map(|(start, end)| (end - start) as i32)
-        })
-        .unwrap_or(0)
+    ffi_boundary(0, || {
+        let ctx = unsafe { &*ctx };
+        ctx.engine.conversion_state()
+            .and_then(|s| {
+                let ranges = s.segment_char_ranges();
+                ranges.get(seg as usize).map(|(start, end)| (end - start) as i32)
+            })
+            .unwrap_or(0)
+    })
 }
 
 /// Get the number of candidates for the focused segment.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_candidate_count(ctx: *mut BonolithContext) -> i32 {
-    let ctx = unsafe { &*ctx };
-    ctx.engine.conversion_state()
-        .map(|s| s.segments[s.focus].candidates.len() as i32)
-        .unwrap_or(0)
+    ffi_boundary(0, || {
+        let ctx = unsafe { &*ctx };
+        ctx.engine.conversion_state()
+            .map(|s| s.segments[s.focus].candidates.len() as i32)
+            .unwrap_or(0)
+    })
 }
 
 /// Get a candidate text by index (for the focused segment).
 /// The returned pointer is valid until the next call to any bonolith_* function.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_candidate_text(ctx: *mut BonolithContext, index: i32) -> *const c_char {
-    let ctx = unsafe { &mut *ctx };
-    let text = ctx.engine.conversion_state()
-        .and_then(|s| {
-            let seg = &s.segments[s.focus];
-            seg.candidates.get(index as usize).map(|c| c.as_str())
-        })
-        .unwrap_or("");
-    ctx.cache_candidate = CString::new(text).unwrap_or_default();
-    ctx.cache_candidate.as_ptr()
+    ffi_boundary(ptr::null(), || {
+        let ctx = unsafe { &mut *ctx };
+        let text = ctx.engine.conversion_state()
+            .and_then(|s| {
+                let seg = &s.segments[s.focus];
+                seg.candidates.get(index as usize).map(|c| c.as_str())
+            })
+            .unwrap_or("");
+        ctx.cache_candidate = CString::new(text).unwrap_or_default();
+        ctx.cache_candidate.as_ptr()
+    })
 }
 
 /// Get the selected candidate index for the focused segment.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_selected_index(ctx: *mut BonolithContext) -> i32 {
-    let ctx = unsafe { &*ctx };
-    ctx.engine.conversion_state()
-        .map(|s| s.segments[s.focus].selected as i32)
-        .unwrap_or(0)
+    ffi_boundary(0, || {
+        let ctx = unsafe { &*ctx };
+        ctx.engine.conversion_state()
+            .map(|s| s.segments[s.focus].selected as i32)
+            .unwrap_or(0)
+    })
 }
 
 /// Reset the engine state (called on focus change, deactivation, etc.)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_reset(ctx: *mut BonolithContext) {
-    let ctx = unsafe { &mut *ctx };
-    ctx.engine.reset();
-    ctx.engine.clear_conversion();
-    ctx.converting = false;
-    ctx.pending_commit = None;
+    ffi_boundary((), || {
+        let ctx = unsafe { &mut *ctx };
+        ctx.engine.reset();
+        ctx.engine.clear_conversion();
+        ctx.converting = false;
+        ctx.pending_commit = None;
+    })
 }
 
 /// Commit any in-progress composition (conversion candidate or raw preedit)
@@ -336,19 +368,21 @@ pub unsafe extern "C" fn bonolith_reset(ctx: *mut BonolithContext) {
 /// bonolith_poll_commit(). No-op when nothing is composing.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_commit_input(ctx: *mut BonolithContext) {
-    let ctx = unsafe { &mut *ctx };
-    if ctx.converting {
-        if let Some(text) = ctx.engine.commit_conversion() {
-            ctx.pending_commit = Some(text);
+    ffi_boundary((), || {
+        let ctx = unsafe { &mut *ctx };
+        if ctx.converting {
+            if let Some(text) = ctx.engine.commit_conversion() {
+                ctx.pending_commit = Some(text);
+            }
+            ctx.converting = false;
+        } else {
+            let preedit = ctx.engine.preedit();
+            if !preedit.is_empty() {
+                ctx.engine.commit(&preedit);
+                ctx.pending_commit = Some(preedit);
+            }
         }
-        ctx.converting = false;
-    } else {
-        let preedit = ctx.engine.preedit();
-        if !preedit.is_empty() {
-            ctx.engine.commit(&preedit);
-            ctx.pending_commit = Some(preedit);
-        }
-    }
+    })
 }
 
 // ── Batch UI state query ────────────────────────────────────────────────────
@@ -358,91 +392,93 @@ pub unsafe extern "C" fn bonolith_commit_input(ctx: *mut BonolithContext) {
 /// bonolith_handle_key() or bonolith_get_ui_state().
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_get_ui_state(ctx: *mut BonolithContext, out: *mut BonolithUiState) {
-    let ctx = unsafe { &mut *ctx };
-    let out = unsafe { &mut *out };
+    ffi_boundary((), || {
+        let ctx = unsafe { &mut *ctx };
+        let out = unsafe { &mut *out };
 
-    // Zero-init segments and candidates
-    for i in 0..MAX_SEGMENTS {
-        out.segments[i] = BonolithSegmentInfo { start_chars: 0, char_len: 0 };
-    }
-    for i in 0..MAX_CANDIDATES {
-        out.candidates[i] = ptr::null();
-    }
-
-    // 1) Committed text
-    match ctx.pending_commit.take() {
-        Some(text) => {
-            ctx.cache_commit = CString::new(text).unwrap_or_default();
-            out.committed = ctx.cache_commit.as_ptr();
+        // Zero-init segments and candidates
+        for i in 0..MAX_SEGMENTS {
+            out.segments[i] = BonolithSegmentInfo { start_chars: 0, char_len: 0 };
         }
-        None => {
-            out.committed = ptr::null();
+        for i in 0..MAX_CANDIDATES {
+            out.candidates[i] = ptr::null();
         }
-    }
 
-    // 2) Conversion state
-    out.converting = ctx.converting;
-
-    if ctx.converting {
-        if let Some(state) = ctx.engine.conversion_state() {
-            let composed = state.composed_text();
-            let ranges = state.segment_char_ranges();
-            let seg_count = state.segments.len().min(MAX_SEGMENTS);
-            let focus = state.focus;
-
-            out.segment_count = seg_count as i32;
-            out.focus_index = focus as i32;
-
-            for i in 0..seg_count {
-                let (start, end) = ranges[i];
-                out.segments[i] = BonolithSegmentInfo {
-                    start_chars: start as i32,
-                    char_len: (end - start) as i32,
-                };
+        // 1) Committed text
+        match ctx.pending_commit.take() {
+            Some(text) => {
+                ctx.cache_commit = CString::new(text).unwrap_or_default();
+                out.committed = ctx.cache_commit.as_ptr();
             }
-
-            // Candidates for focused segment
-            let seg = &state.segments[focus];
-            let cand_count = seg.candidates.len().min(MAX_CANDIDATES);
-            out.candidate_count = cand_count as i32;
-            out.selected_index = seg.selected as i32;
-
-            ctx.cache_candidates.clear();
-            for j in 0..cand_count {
-                ctx.cache_candidates.push(
-                    CString::new(seg.candidates[j].as_str()).unwrap_or_default()
-                );
+            None => {
+                out.committed = ptr::null();
             }
-            for (j, cs) in ctx.cache_candidates.iter().enumerate() {
-                out.candidates[j] = cs.as_ptr();
-            }
+        }
 
-            ctx.cache_composed = CString::new(composed).unwrap_or_default();
-            out.preedit = ctx.cache_composed.as_ptr();
-            out.has_preedit = true;
+        // 2) Conversion state
+        out.converting = ctx.converting;
+
+        if ctx.converting {
+            if let Some(state) = ctx.engine.conversion_state() {
+                let composed = state.composed_text();
+                let ranges = state.segment_char_ranges();
+                let seg_count = state.segments.len().min(MAX_SEGMENTS);
+                let focus = state.focus;
+
+                out.segment_count = seg_count as i32;
+                out.focus_index = focus as i32;
+
+                for i in 0..seg_count {
+                    let (start, end) = ranges[i];
+                    out.segments[i] = BonolithSegmentInfo {
+                        start_chars: start as i32,
+                        char_len: (end - start) as i32,
+                    };
+                }
+
+                // Candidates for focused segment
+                let seg = &state.segments[focus];
+                let cand_count = seg.candidates.len().min(MAX_CANDIDATES);
+                out.candidate_count = cand_count as i32;
+                out.selected_index = seg.selected as i32;
+
+                ctx.cache_candidates.clear();
+                for j in 0..cand_count {
+                    ctx.cache_candidates.push(
+                        CString::new(seg.candidates[j].as_str()).unwrap_or_default()
+                    );
+                }
+                for (j, cs) in ctx.cache_candidates.iter().enumerate() {
+                    out.candidates[j] = cs.as_ptr();
+                }
+
+                ctx.cache_composed = CString::new(composed).unwrap_or_default();
+                out.preedit = ctx.cache_composed.as_ptr();
+                out.has_preedit = true;
+            } else {
+                out.preedit = ptr::null();
+                out.has_preedit = false;
+                out.segment_count = 0;
+                out.focus_index = 0;
+                out.candidate_count = 0;
+                out.selected_index = 0;
+            }
         } else {
-            out.preedit = ptr::null();
-            out.has_preedit = false;
             out.segment_count = 0;
             out.focus_index = 0;
             out.candidate_count = 0;
             out.selected_index = 0;
-        }
-    } else {
-        out.segment_count = 0;
-        out.focus_index = 0;
-        out.candidate_count = 0;
-        out.selected_index = 0;
 
-        let preedit = ctx.engine.preedit();
-        out.has_preedit = !preedit.is_empty();
-        if out.has_preedit {
-            ctx.cache_preedit = CString::new(preedit).unwrap_or_default();
-            out.preedit = ctx.cache_preedit.as_ptr();
-        } else {
-            out.preedit = ptr::null();
+            let preedit = ctx.engine.preedit();
+            out.has_preedit = !preedit.is_empty();
+            if out.has_preedit {
+                ctx.cache_preedit = CString::new(preedit).unwrap_or_default();
+                out.preedit = ctx.cache_preedit.as_ptr();
+            } else {
+                out.preedit = ptr::null();
+            }
         }
-    }
+    })
 }
 
 // ── Dictionary operations (global, not per-context) ─────────────────────────
