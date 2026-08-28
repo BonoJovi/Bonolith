@@ -858,6 +858,63 @@ mod tests {
         );
     }
 
+    /// Regression [16]: Space-triggered conversion of a mid-syllable
+    /// input like "vim" must not silently drop the trailing "m". The
+    /// pending buffer is snapshotted at start_conversion; a follow-up
+    /// commit (Enter) re-injects it as buffered input, and a cancel
+    /// (Esc / Backspace) restores it — mirroring the F-key path from
+    /// [15] and matching Mozc's continuation behaviour.
+    #[test]
+    fn space_conversion_preserves_pending_consonant_on_commit() {
+        let (mut e, mut c) = setup();
+        for k in b"vim" {
+            dispatch_key(&mut e, &mut c, ev(*k as u32));
+        }
+        assert_eq!(e.preedit(), "ゔぃm");
+        dispatch_key(&mut e, &mut c, ev(KEY_SPACE));
+        assert!(c, "Space should enter conversion");
+        let out = dispatch_key(&mut e, &mut c, ev(KEY_RETURN));
+        assert!(out.consumed);
+        assert!(!c);
+        assert!(out.commit.is_some(), "Enter should commit");
+        // After commit the pending "m" returns to the buffer so the
+        // next keystroke continues the syllable ("m" + "a" → "ま").
+        assert_eq!(
+            e.preedit(),
+            "m",
+            "commit did not preserve trailing 'm' as pending",
+        );
+        dispatch_key(&mut e, &mut c, ev(b'a' as u32));
+        assert!(
+            e.preedit().ends_with('ま'),
+            "'m' + 'a' should continue as 'ま', got {:?}",
+            e.preedit(),
+        );
+    }
+
+    /// Regression [16] symmetric: cancel from a Space-triggered
+    /// conversion must restore the pending consonant too, just like
+    /// the F-key cancel path from [15].
+    #[test]
+    fn space_conversion_cancel_restores_pending_consonant() {
+        for cancel_key in [KEY_ESCAPE, KEY_BACKSPACE] {
+            let (mut e, mut c) = setup();
+            for k in b"vim" {
+                dispatch_key(&mut e, &mut c, ev(*k as u32));
+            }
+            dispatch_key(&mut e, &mut c, ev(KEY_SPACE));
+            assert!(c);
+            let out = dispatch_key(&mut e, &mut c, ev(cancel_key));
+            assert!(out.consumed);
+            assert!(!c);
+            assert_eq!(
+                e.preedit(),
+                "ゔぃm",
+                "cancel via 0x{cancel_key:04X} lost pending 'm' from Space path",
+            );
+        }
+    }
+
     /// Regression [15]: cancelling an F-key conversion (Escape /
     /// Backspace) must restore the trailing romaji buffer that
     /// start_kana_conversion snapshotted into the segment state.

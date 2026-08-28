@@ -434,6 +434,18 @@ impl ConversionEngine {
         if self.romaji.output().is_empty() && !flush_would_produce_kana {
             return None;
         }
+        // Snapshot the pending buffer BEFORE flush drops it, so
+        // cancel_conversion can restore "m" (from "vim → Space → Esc")
+        // and commit_conversion can re-inject it as buffered input for
+        // the user's next syllable (Mozc parity — bug [16] symmetric
+        // to [15]'s F-key path). "n" flushes to "ん" so nothing
+        // survives; every other non-empty buffer is a real mid-syllable
+        // that would otherwise vanish.
+        let pending_from_romaji = if self.romaji.buffer() == "n" {
+            String::new()
+        } else {
+            self.romaji.buffer().to_string()
+        };
         self.romaji.flush();
         let kana = self.romaji.output().to_string();
         if kana.is_empty() {
@@ -507,9 +519,7 @@ impl ConversionEngine {
             focus: 0,
             raw_input,
             initial_boundaries,
-            // Space path: flush already dropped any non-"n" pending
-            // consonant, so nothing to restore on cancel. See bug [16].
-            pending_from_romaji: String::new(),
+            pending_from_romaji,
         });
 
         // Trigger LLM reranking in background — results applied on next interaction
@@ -894,6 +904,12 @@ impl ConversionEngine {
             Err(_) => log::debug!("LLM lock busy during commit, skipping context update"),
         }
         self.romaji.reset();
+        // Re-inject any pending romaji buffer that was live at
+        // start_conversion time (e.g. "m" from "vim → Space → Enter")
+        // so the user's next keystroke continues building that syllable
+        // instead of dropping the character. Mirrors cancel_conversion
+        // and matches Mozc — bug [16]. No-op when nothing was pending.
+        self.romaji.restore_buffer(&state.pending_from_romaji);
         // Retire any in-flight rerank pass so a late-arriving worker cannot
         // repaint over the just-committed (hidden) preedit — a mode=1
         // ghost that would auto-commit on focus loss = duplicate insertion.
