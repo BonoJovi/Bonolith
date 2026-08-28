@@ -1027,20 +1027,49 @@ impl ConversionEngine {
                         let rerank_count = candidates.len().min(LLM_RERANK_TOP_N);
                         // Context = committed text + preceding segments' chosen candidates
                         let context = format!("{}{}", committed_context, preceding_text);
-                        let mut top_with_scores: Vec<(usize, f64)> = (0..rerank_count)
-                            .map(|i| {
-                                let (surface, user) = &candidates[i];
-                                let llm_score = Self::rerank_llm_score(reading, surface, || {
-                                    llm.score_with_context(&context, surface)
-                                });
-                                let rank_base =
-                                    1.0 - (i as f64 / rerank_count as f64) * 0.3;
-                                let combined = rank_base * 0.4
-                                    + llm_score * 0.6
-                                    + user * USER_LEARNING_WEIGHT;
-                                (i, combined)
-                            })
-                            .collect();
+                        // Score each candidate imperatively so we can break on
+                        // the wall-clock deadline. Without an inner check, a
+                        // hung llama-server let one segment run all 5
+                        // top-N HTTP calls (each up to 1.5 s per-request
+                        // timeout) — ~7.5 s while holding shared.llm.
+                        // The top-of-loop deadline only fires at segment
+                        // boundaries, so it was useless for a single-segment
+                        // conversion. Check between candidates so the pass
+                        // exits at most one 1.5 s HTTP hang past the deadline.
+                        let mut top_with_scores: Vec<(usize, f64)> =
+                            Vec::with_capacity(rerank_count);
+                        let mut budget_hit = false;
+                        for i in 0..rerank_count {
+                            if Instant::now() >= deadline {
+                                budget_hit = true;
+                                break;
+                            }
+                            let (surface, user) = &candidates[i];
+                            let llm_score = Self::rerank_llm_score(reading, surface, || {
+                                llm.score_with_context(&context, surface)
+                            });
+                            let rank_base = 1.0 - (i as f64 / rerank_count as f64) * 0.3;
+                            let combined =
+                                rank_base * 0.4 + llm_score * 0.6 + user * USER_LEARNING_WEIGHT;
+                            top_with_scores.push((i, combined));
+                        }
+                        if budget_hit {
+                            // Partial scores would order this segment
+                            // against candidates that were never scored.
+                            // Keep the original dictionary order and let
+                            // subsequent segments fall through the
+                            // top-of-loop deadline check.
+                            log::debug!(
+                                "LLM rerank budget spent mid-segment '{}' — keeping original order",
+                                reading,
+                            );
+                            preceding_text.push_str(&candidates[0].0);
+                            reranked_segments.push((
+                                reading.clone(),
+                                candidates.iter().map(|(s, _)| s.clone()).collect(),
+                            ));
+                            continue;
+                        }
                         top_with_scores.sort_by(|a, b| {
                             b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
                         });
@@ -2652,5 +2681,58 @@ mod tests {
         for (i, (reading, _)) in segments.iter().enumerate() {
             assert_eq!(reading, &live_segs[i]);
         }
+    }
+
+    /// Regression [9]: the wall-clock budget must fire mid-segment, not only
+    /// between segments. Without an in-candidate deadline check, a slow
+    /// llama-server let a 1-segment (or first-segment) conversion burn its
+    /// per-request timeout (up to 1.5 s) across all 5 top-N candidates —
+    /// ~7.5 s while holding `shared.llm`, defeating the budget entirely for
+    /// the pathological single-segment case.
+    #[test]
+    fn rerank_budget_fires_between_candidates() {
+        use crate::core::llm::LlmScorer;
+        use std::time::{Duration, Instant};
+
+        struct VerySlowScorer;
+        impl LlmScorer for VerySlowScorer {
+            fn score(&self, _context: &str, _candidate: &str) -> f64 {
+                std::thread::sleep(Duration::from_millis(700));
+                0.5
+            }
+            fn warm_cache(&self, _context: &str) {}
+        }
+
+        let mut engine =
+            ConversionEngine::with_shared(SharedCore::new_eval(Box::new(VerySlowScorer)));
+        // A short reading likely to segment as a single bunsetsu with many
+        // homophone candidates (橋 / 端 / 箸 …). Even if it splits, the
+        // FIRST segment will still exercise the inner-loop deadline path
+        // the same way — the bug is about not checking between candidates.
+        for ch in "hashi".chars() {
+            engine.process_key(ch);
+        }
+        let start = Instant::now();
+        engine.start_conversion();
+
+        let poll_deadline = start + Duration::from_secs(6);
+        while !engine.has_llm_rerank_result() && Instant::now() < poll_deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            engine.has_llm_rerank_result(),
+            "rerank never completed within 6 s (elapsed {}ms)",
+            elapsed.as_millis(),
+        );
+        // Without the inner-loop check, 5 candidates × 700 ms = 3500 ms of
+        // sequential score() calls per segment. With it, we break as soon
+        // as the 1800 ms budget passes, so worst case is one in-flight
+        // slop past the deadline (~2500 ms).
+        assert!(
+            elapsed < Duration::from_millis(3300),
+            "single-segment rerank blew inner-loop budget: {}ms",
+            elapsed.as_millis(),
+        );
     }
 }
