@@ -551,6 +551,11 @@ impl ConversionEngine {
         // already passes non-kana chars through unchanged, so appending
         // the buffer to the source string flows through cleanly.
         let pending = self.romaji.buffer().to_string();
+        // Snapshot the case-preserved raw input before flush for F9/F10.
+        // When available, F9/F10 uses it directly so "VIM" round-trips
+        // as "ＶＩＭ"/"VIM" and "shi" as "shi" (not "si") — deriving
+        // from kana would lose both case and spelling.
+        let raw_input = self.romaji.raw_input().map(str::to_string);
         self.romaji.flush();
         let mut kana = self.romaji.output().to_string();
         kana.push_str(&pending);
@@ -560,8 +565,19 @@ impl ConversionEngine {
 
         let katakana = crate::core::romaji::hiragana_to_katakana(&kana);
         let half_katakana = crate::core::romaji::hiragana_to_halfwidth_katakana(&kana);
-        let romaji = crate::core::romaji::hiragana_to_romaji(&kana);
-        let fw_romaji = crate::core::romaji::hiragana_to_fullwidth_romaji(&kana);
+        let (romaji, fw_romaji) = match raw_input.as_deref() {
+            Some(raw) if !raw.is_empty() => {
+                let fw: String = raw
+                    .chars()
+                    .map(|c| crate::core::romaji::to_fullwidth_char(c).unwrap_or(c))
+                    .collect();
+                (raw.to_string(), fw)
+            }
+            _ => (
+                crate::core::romaji::hiragana_to_romaji(&kana),
+                crate::core::romaji::hiragana_to_fullwidth_romaji(&kana),
+            ),
+        };
 
         // Look up the requested form BEFORE deduping. The old code deduped
         // the vec first and then indexed by `form`, so on strings whose
@@ -2045,5 +2061,78 @@ mod tests {
                 "F-key form {form} composition wrong",
             );
         }
+    }
+
+    /// F9/F10 round-trip preserves original case ("VIM" → "ＶＩＭ"/"VIM")
+    /// via raw_input tracking. Without it the dispatcher-side lowercase
+    /// or the kana→romaji derivation would flatten the case.
+    #[test]
+    fn f_key_preserves_uppercase() {
+        for (form, expected) in [(3, "VIM"), (4, "ＶＩＭ")] {
+            let mut engine = ConversionEngine::new();
+            for ch in "VIM".chars() {
+                engine.process_key(ch);
+            }
+            let state = engine.start_kana_conversion(form)
+                .expect("start_kana_conversion returned None");
+            assert_eq!(
+                state.composed_text(),
+                expected,
+                "F-key form {form} did not preserve uppercase",
+            );
+        }
+    }
+
+    /// F9/F10 preserves the original spelling — "shi" stays "shi" rather
+    /// than being normalised to "si" via the reverse kana→romaji table.
+    #[test]
+    fn f_key_preserves_spelling() {
+        let mut engine = ConversionEngine::new();
+        for ch in "shi".chars() {
+            engine.process_key(ch);
+        }
+        assert_eq!(engine.preedit(), "し");
+        let state = engine.start_kana_conversion(3)
+            .expect("start_kana_conversion returned None");
+        assert_eq!(
+            state.composed_text(),
+            "shi",
+            "F10 lost original spelling (would have returned 'si' via kana derivation)",
+        );
+    }
+
+    /// Mixed case ("Vim") preserves per-char case in F9/F10.
+    #[test]
+    fn f_key_preserves_mixed_case() {
+        let mut engine = ConversionEngine::new();
+        for ch in "Vim".chars() {
+            engine.process_key(ch);
+        }
+        let state = engine.start_kana_conversion(3)
+            .expect("start_kana_conversion returned None");
+        assert_eq!(state.composed_text(), "Vim");
+    }
+
+    /// When raw_input is invalidated (e.g. Backspace popped from the
+    /// committed output), F9/F10 falls back to the kana-derived romaji.
+    /// Case/spelling can no longer be recovered — best-effort only.
+    #[test]
+    fn f_key_falls_back_when_raw_input_invalidated() {
+        let mut engine = ConversionEngine::new();
+        for ch in "VIM".chars() {
+            engine.process_key(ch);
+        }
+        // Delete the pending "m", then also delete a kana from output —
+        // this invalidates raw_input tracking.
+        assert!(engine.delete_last(), "delete pending m");
+        assert!(engine.delete_last(), "delete kana from output");
+        // Retype 'i' — buffer has 'i', but raw_input stays None.
+        engine.process_key('i');
+        // Now F10 should fall back to kana-derived romaji (lowercase).
+        let state = engine.start_kana_conversion(3)
+            .expect("start_kana_conversion returned None");
+        // The fallback path uses the kana + lowercase pending buffer.
+        // Just verify it doesn't panic and returns something non-empty.
+        assert!(!state.composed_text().is_empty());
     }
 }

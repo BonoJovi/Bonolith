@@ -430,7 +430,11 @@ fn process_char(engine: &mut ConversionEngine, ch: char) -> DisplayUpdate {
         return DisplayUpdate::Unchanged;
     }
     if ch.is_ascii_alphabetic() || ch == '-' || ch == '\'' {
-        engine.process_key(ch.to_ascii_lowercase());
+        // Pass the original case through — RomajiConverter case-folds
+        // internally for the kana table lookup and preserves the raw
+        // case in its `raw_input` history so F9/F10 can round-trip
+        // "VIM" as "ＶＩＭ"/"VIM" instead of "ｖｉｍ"/"vim".
+        engine.process_key(ch);
         return DisplayUpdate::Preedit(engine.preedit());
     }
     DisplayUpdate::Unchanged

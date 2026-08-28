@@ -11,6 +11,14 @@ use romaji_table::ROMAJI_TABLE;
 pub struct RomajiConverter {
     buffer: String,
     output: String,
+    /// Case-preserved raw input history, parallel to `output + buffer`
+    /// but recording exactly what the user typed. Used by F9/F10 to
+    /// round-trip "VIM"/"shi" as typed instead of deriving from kana
+    /// ("ＶＩＭ"/"ＶＩＭ" vs "ｖｉｍ", "shi" vs "si"). `None` when
+    /// tracking has been invalidated by `append_raw` or a `delete_last`
+    /// that popped from `output` (we don't know how many raw chars
+    /// produced the removed kana).
+    raw_input: Option<String>,
 }
 
 impl RomajiConverter {
@@ -18,12 +26,19 @@ impl RomajiConverter {
         Self {
             buffer: String::new(),
             output: String::new(),
+            raw_input: Some(String::new()),
         }
     }
 
-    /// Process a single key input and return converted kana (if any)
+    /// Process a single key input and return converted kana (if any).
+    /// Case-folds the key for kana-table lookups so uppercase input
+    /// ("VIM") still produces "ゔぃ"+"m"; the original case is kept in
+    /// `raw_input` so F9/F10 can return "ＶＩＭ"/"VIM".
     pub fn process_key(&mut self, key: char) -> Option<String> {
-        self.buffer.push(key);
+        if let Some(raw) = self.raw_input.as_mut() {
+            raw.push(key);
+        }
+        self.buffer.push(key.to_ascii_lowercase());
         self.try_convert()
     }
 
@@ -116,6 +131,7 @@ impl RomajiConverter {
     pub fn reset(&mut self) {
         self.buffer.clear();
         self.output.clear();
+        self.raw_input = Some(String::new());
     }
 
     /// Get current romaji buffer (incomplete input)
@@ -123,14 +139,29 @@ impl RomajiConverter {
         &self.buffer
     }
 
+    /// Case-preserved raw input history, or `None` if invalidated. See
+    /// the `raw_input` field docs.
+    pub fn raw_input(&self) -> Option<&str> {
+        self.raw_input.as_deref()
+    }
+
     /// Delete the last character from the buffer or output.
     /// Returns true if something was deleted, false if empty.
     pub fn delete_last(&mut self) -> bool {
         if !self.buffer.is_empty() {
             self.buffer.pop();
+            if let Some(raw) = self.raw_input.as_mut() {
+                raw.pop();
+            }
             true
         } else if !self.output.is_empty() {
             self.output.pop();
+            // Popping from output loses the raw→kana boundary info
+            // (one kana may have been produced by 1-3 raw chars). We
+            // can't accurately pop from raw_input, so invalidate it —
+            // F9/F10 falls back to deriving romaji from the remaining
+            // kana.
+            self.raw_input = None;
             true
         } else {
             false
@@ -140,6 +171,8 @@ impl RomajiConverter {
     /// Append a raw string directly to the output (bypassing romaji conversion).
     pub fn append_raw(&mut self, s: &str) {
         self.output.push_str(s);
+        // Bypass mode — the output no longer has a 1:1 raw-input record.
+        self.raw_input = None;
     }
 
     /// Get accumulated kana output
