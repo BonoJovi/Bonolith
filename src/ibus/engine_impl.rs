@@ -3,6 +3,7 @@
 /// Implements org.freedesktop.IBus.Engine via zbus #[interface].
 /// Bridges IBus key events to Bonolith's ConversionEngine and sends
 /// preedit/commit/candidates back via D-Bus signals.
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use log::{debug, info, warn};
@@ -35,6 +36,14 @@ pub struct BonolithEngine {
     /// Object path this engine is registered at — used by `destroy` to remove
     /// itself from the connection's `ObjectServer` so old engines don't leak.
     object_path: String,
+    /// Keyvals whose press we consumed and are still awaiting a release for.
+    /// The release-consume gate checks membership here BEFORE `enabled` so a
+    /// toggle-off (which flips enabled=false on the press) or Muhenkan-off
+    /// still consumes its own release — otherwise the orphan release lets
+    /// some XIM/IBus clients synthesise a phantom press+release pair,
+    /// injecting the raw char (grave `, Enter, …) into the app. Bounded
+    /// implicitly by the number of physical keys the user can hold.
+    pending_release: Mutex<HashSet<u32>>,
 }
 
 impl BonolithEngine {
@@ -52,6 +61,7 @@ impl BonolithEngine {
             toggle_keys,
             force,
             object_path,
+            pending_release: Mutex::new(HashSet::new()),
         }
     }
 
@@ -227,7 +237,23 @@ impl BonolithEngine {
         // some XIM/IBus clients reconstruct a phantom press+release pair from
         // the orphan release. Text-carrying apps derive input from press
         // events, so consuming releases is safe.
+        //
+        // Reading `enabled` here alone is wrong for the toggle-off / Muhenkan-
+        // off case: the *press* consumed those and flipped enabled=false, and
+        // then this arm would let the matching release through — the client
+        // synthesises a phantom press+release for the toggle key (grave `,
+        // Enter, …) and injects the raw char. So consult `pending_release`
+        // first: any key whose press we consumed must have its release
+        // consumed too, regardless of the current enabled state.
         if is_release(state) {
+            let owed = self
+                .pending_release
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&keyval);
+            if owed {
+                return Ok(true);
+            }
             let enabled = *self.enabled.lock().unwrap_or_else(|e| e.into_inner());
             if enabled {
                 return Ok(true);
@@ -262,6 +288,12 @@ impl BonolithEngine {
                 let _ = self.cancel_input(&emitter).await;
                 *self.enabled.lock().unwrap_or_else(|e| e.into_inner()) = false;
                 info!("Bonolith: Muhenkan → enabled=false (absolute OFF)");
+                // Record so the matching release is consumed even though
+                // enabled just flipped to false.
+                self.pending_release
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(keyval);
                 return Ok(true);
             }
         }
@@ -277,6 +309,14 @@ impl BonolithEngine {
             }
             let now = *self.enabled.lock().unwrap_or_else(|e| e.into_inner());
             info!("Bonolith: Toggle → enabled={}", now);
+            // The toggle-off press leaves us with enabled=false; without
+            // this the matching release would slip through the release-
+            // consume gate and let XIM clients synthesise a phantom press
+            // for the toggle key (e.g. a raw ` on grave-based bindings).
+            self.pending_release
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(keyval);
             return Ok(true);
         }
 
@@ -580,11 +620,23 @@ impl BonolithEngine {
                 let _ = Self::hide_auxiliary_text(emitter).await;
             }
             DisplayUpdate::Preedit(text) => {
-                self.send_preedit(emitter, &text).await?;
+                // Best-effort: engine state has already been mutated by the
+                // dispatcher (buffer advanced, romaji flushed, etc.). If
+                // the D-Bus emit fails we still need to return
+                // outcome.consumed — propagating the error via `?` used to
+                // make ProcessKeyEvent return Err, which ibus-daemon
+                // treated as "unprocessed" and forwarded the raw keysym
+                // to the app while the preedit already held the char.
+                // Same warn+continue policy as the commit arm above.
+                if let Err(e) = self.send_preedit(emitter, &text).await {
+                    warn!("Bonolith: send_preedit emission failed: {}", e);
+                }
             }
             DisplayUpdate::Conversion => {
                 if let Some(state) = conversion {
-                    self.show_conversion_state(emitter, &state).await?;
+                    if let Err(e) = self.show_conversion_state(emitter, &state).await {
+                        warn!("Bonolith: show_conversion_state emission failed: {}", e);
+                    }
                 }
             }
         }
