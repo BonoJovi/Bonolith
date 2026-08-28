@@ -60,6 +60,56 @@ pub struct ConversionState {
     /// multi-segment conversions — we don't track per-segment raw→kana
     /// boundaries, so `convert_focused_to` falls back to `KanaForm::apply`.
     pub raw_input: Option<String>,
+    /// Segment boundaries at the moment start_conversion (or
+    /// start_kana_conversion) built this state, expressed as segment
+    /// start positions in char offsets and excluding 0. On commit,
+    /// `commit_conversion` compares the final boundaries against this
+    /// snapshot — if the user resized (`resize_segment`) into a
+    /// different layout, the new segmentation is recorded via
+    /// `UserScorer::record_segmentation` so the next time the same
+    /// kana is typed the learned layout is applied up front.
+    pub initial_boundaries: Vec<usize>,
+}
+
+/// Extract segment start positions (excluding 0) from a segment list.
+/// Mirrors [`DictStore::record_segmentation`]'s wire format.
+fn boundaries_of(segments: &[SegmentState]) -> Vec<usize> {
+    segments.iter().skip(1).map(|s| s.start).collect()
+}
+
+/// Rebuild a segment list from a learned boundary layout. Returns
+/// `None` if the boundaries don't line up with the kana char count
+/// (defensive against corrupt DB rows). The reading for each slice is
+/// looked up via [`Dictionary::candidates_for_unit`] so kanji
+/// candidates still surface for the learned bunsetsu.
+fn segments_from_boundaries(
+    kana: &str,
+    boundaries: &[usize],
+    dict: &Dictionary,
+) -> Option<Vec<Segment>> {
+    let chars: Vec<char> = kana.chars().collect();
+    let mut cuts = Vec::with_capacity(boundaries.len() + 2);
+    cuts.push(0);
+    cuts.extend_from_slice(boundaries);
+    cuts.push(chars.len());
+
+    let mut segments = Vec::with_capacity(cuts.len().saturating_sub(1));
+    for w in cuts.windows(2) {
+        let start = w[0];
+        let end = w[1];
+        if start >= end {
+            return None;
+        }
+        let reading: String = chars[start..end].iter().collect();
+        let candidates = dict.candidates_for_unit(&reading);
+        segments.push(Segment {
+            reading,
+            start,
+            len: end - start,
+            candidates,
+        });
+    }
+    Some(segments)
 }
 
 /// The five kana display forms Bonolith cycles through with F6-F10.
@@ -377,9 +427,35 @@ impl ConversionEngine {
 
         // Apply AI segmentation filter: try alternative segmentations and pick the best
         let segments = self.filter_segmentation(segments, &kana, &dict);
+
+        let mut segment_states = self.build_segment_states(&segments);
+
+        // If the user has previously re-segmented this exact kana into a
+        // different layout, override the DP output with their learned
+        // preference. Guarded by exact-match on the whole kana (see
+        // A案 in the design discussion) so a mistake on "ものがきになる"
+        // doesn't leak into unrelated inputs like "ものがきになった".
+        // Boundaries beyond kana length are validated defensively;
+        // corrupt DB rows fall back to the DP result.
+        let kana_char_len = kana.chars().count();
+        let learned = {
+            let scorer = self.shared.user_scorer.lock().unwrap_or_else(|e| e.into_inner());
+            scorer.lookup_segmentation(&kana).map(|v| v.to_vec())
+        };
+        if let Some(learned) = learned {
+            let valid = learned
+                .iter()
+                .all(|&b| b > 0 && b < kana_char_len)
+                && learned.windows(2).all(|w| w[0] < w[1]);
+            if valid && boundaries_of(&segment_states) != learned {
+                if let Some(rebuilt) = segments_from_boundaries(&kana, &learned, &dict) {
+                    segment_states = self.build_segment_states(&rebuilt);
+                }
+            }
+        }
         drop(dict);
 
-        let segment_states = self.build_segment_states(&segments);
+        let initial_boundaries = boundaries_of(&segment_states);
         // Only snapshot raw_input for a single-segment conversion — that's
         // the one case where the whole raw input maps unambiguously to
         // the segment's reading. Multi-segment conversions would need
@@ -394,6 +470,7 @@ impl ConversionEngine {
             segments: segment_states,
             focus: 0,
             raw_input,
+            initial_boundaries,
         });
 
         // Trigger LLM reranking in background — results applied on next interaction
@@ -655,6 +732,8 @@ impl ConversionEngine {
             // via convert_focused_to picks up the case-preserved spelling
             // instead of deriving from kana (which would flatten "shi"→"si").
             raw_input,
+            // Single-segment F-key conversion has no boundaries to record.
+            initial_boundaries: Vec::new(),
         });
         self.conversion.as_ref()
     }
@@ -706,7 +785,11 @@ impl ConversionEngine {
 
         // Record only segments where the user explicitly chose a candidate.
         // record() persists immediately when the scorer is store-attached,
-        // so no separate save step is needed.
+        // so no separate save step is needed. When the final segmentation
+        // differs from what the DP segmenter produced (user resized via
+        // Shift+←/→), also record the layout so the same kana next time
+        // starts pre-split the way the user wants — see
+        // [`UserScorer::record_segmentation`].
         {
             let mut user_scorer = self.shared.user_scorer.lock().unwrap_or_else(|e| e.into_inner());
             for seg in &state.segments {
@@ -714,6 +797,10 @@ impl ConversionEngine {
                     let surface = &seg.candidates[seg.selected];
                     user_scorer.record(&seg.reading, surface);
                 }
+            }
+            let final_boundaries = boundaries_of(&state.segments);
+            if final_boundaries != state.initial_boundaries {
+                user_scorer.record_segmentation(&state.kana, final_boundaries);
             }
         }
 
@@ -2118,6 +2205,79 @@ mod tests {
         // The fallback path uses the kana + lowercase pending buffer.
         // Just verify it doesn't panic and returns something non-empty.
         assert!(!state.composed_text().is_empty());
+    }
+
+    /// A user resize that changes segmentation is recorded, and the
+    /// same kana next time comes back pre-split the way the user last
+    /// left it. Uses the hermetic core so learning + start_conversion
+    /// go through the full pipeline without a live LLM.
+    #[test]
+    fn resegmentation_is_learned_and_reapplied() {
+        let mut engine = ConversionEngine::with_shared(SharedCore::new_hermetic());
+        for ch in "amegafuru".chars() {
+            engine.process_key(ch);
+        }
+        // First conversion: capture whatever DP gave us.
+        let dp_boundaries = {
+            let state = engine.start_conversion().expect("start_conversion returned None");
+            boundaries_of(&state.segments)
+        };
+        // Force a resize so the final layout differs from the DP one.
+        // Extending the focused (leftmost) segment by one char is enough
+        // to shift every downstream boundary.
+        engine.resize_segment(1).expect("resize_segment returned None");
+        let resized_boundaries = boundaries_of(
+            &engine.conversion_state().expect("conversion cleared").segments,
+        );
+        assert_ne!(
+            dp_boundaries, resized_boundaries,
+            "resize should have changed boundaries; test setup broken",
+        );
+        engine.commit_conversion().expect("commit_conversion returned None");
+
+        // Re-type the same kana. The learned segmentation should now
+        // come back before the user needs to resize again.
+        for ch in "amegafuru".chars() {
+            engine.process_key(ch);
+        }
+        let replayed = {
+            let state = engine.start_conversion().expect("start_conversion returned None");
+            boundaries_of(&state.segments)
+        };
+        assert_eq!(
+            replayed, resized_boundaries,
+            "learned segmentation should be re-applied on the same kana",
+        );
+        // initial_boundaries snapshot is the learned layout, so a subsequent
+        // commit without further resizing does NOT re-record (idempotent).
+        let state = engine.conversion_state().unwrap();
+        assert_eq!(state.initial_boundaries, replayed);
+    }
+
+    /// Learning is exact-match by design (A案): a slightly different
+    /// kana ("amegafutta" vs the learned "amegafuru") must fall back to
+    /// the DP segmenter, not inherit the learned boundaries.
+    #[test]
+    fn resegmentation_learning_is_exact_match_only() {
+        let mut engine = ConversionEngine::with_shared(SharedCore::new_hermetic());
+        for ch in "amegafuru".chars() {
+            engine.process_key(ch);
+        }
+        engine.start_conversion();
+        engine.resize_segment(1);
+        let resized = boundaries_of(&engine.conversion_state().unwrap().segments);
+        engine.commit_conversion();
+
+        // Different kana — the DP result stands.
+        for ch in "amegafutta".chars() {
+            engine.process_key(ch);
+        }
+        let other = engine.start_conversion().expect("start_conversion returned None");
+        assert_ne!(
+            boundaries_of(&other.segments),
+            resized,
+            "learning must not bleed across kanas — only exact matches",
+        );
     }
 
     /// Background rerank must honour the wall-clock budget so a slow LLM

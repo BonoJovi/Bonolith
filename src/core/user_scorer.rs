@@ -14,6 +14,10 @@ use crate::core::store::DictStore;
 pub struct UserScorer {
     /// Map of "reading|surface" -> selection count
     counts: HashMap<String, u32>,
+    /// Learned per-kana segmentation preferences. Stored as the boundary
+    /// list (segment start positions, excluding 0). See
+    /// [`DictStore::record_segmentation`] for the format.
+    segmentations: HashMap<String, Vec<usize>>,
     /// Optional persistent store. When attached, every record() also
     /// writes through to the store.
     store: Option<Arc<DictStore>>,
@@ -23,6 +27,7 @@ impl UserScorer {
     pub fn new() -> Self {
         Self {
             counts: HashMap::new(),
+            segmentations: HashMap::new(),
             store: None,
         }
     }
@@ -32,8 +37,10 @@ impl UserScorer {
     /// per-row updates immediately (cheap with SQLite).
     pub fn from_store(store: Arc<DictStore>) -> io::Result<Self> {
         let counts = store.load_user_scores()?;
+        let segmentations = store.load_user_segmentations()?;
         Ok(Self {
             counts,
+            segmentations,
             store: Some(store),
         })
     }
@@ -52,14 +59,44 @@ impl UserScorer {
     }
 
     /// Clear all learning history from memory and the persistent store.
-    /// Returns the number of rows deleted from the store.
+    /// Returns the number of rows deleted from the store (score + segmentation
+    /// rows combined).
     pub fn clear_scores(&mut self) -> io::Result<usize> {
         self.counts.clear();
+        self.segmentations.clear();
         if let Some(store) = &self.store {
-            store.clear_user_scores()
+            let scores = store.clear_user_scores()?;
+            let segs = store.clear_user_segmentations()?;
+            Ok(scores + segs)
         } else {
             Ok(0)
         }
+    }
+
+    /// Record a user-preferred segmentation for `kana`. `boundaries` is
+    /// the segment start positions (char offsets), excluding 0. See
+    /// [`DictStore::record_segmentation`] for the format. Called by the
+    /// engine on commit when the final segmentation differs from what
+    /// the DP segmenter originally produced.
+    pub fn record_segmentation(&mut self, kana: &str, boundaries: Vec<usize>) {
+        if let Some(store) = &self.store {
+            if let Err(e) = store.record_segmentation(kana, &boundaries) {
+                log::warn!(
+                    "failed to persist segmentation for {}: {}",
+                    kana,
+                    e
+                );
+            }
+        }
+        self.segmentations.insert(kana.to_string(), boundaries);
+    }
+
+    /// Look up a learned segmentation for `kana`. Returns the boundary
+    /// list (see [`record_segmentation`](Self::record_segmentation)) if
+    /// the user has previously committed a non-default segmentation for
+    /// exactly this kana string.
+    pub fn lookup_segmentation(&self, kana: &str) -> Option<&[usize]> {
+        self.segmentations.get(kana).map(|v| v.as_slice())
     }
 
     /// Score a (reading, surface) pair based on user history.

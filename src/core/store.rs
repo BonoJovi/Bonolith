@@ -136,6 +136,11 @@ impl DictStore {
                count INTEGER NOT NULL DEFAULT 0,
                PRIMARY KEY (reading, surface)
              );
+             CREATE TABLE IF NOT EXISTS user_segmentations (
+               kana TEXT PRIMARY KEY,
+               boundaries TEXT NOT NULL,
+               count INTEGER NOT NULL DEFAULT 1
+             );
              COMMIT;",
         )
         .map_err(sqlite_to_io)?;
@@ -471,6 +476,74 @@ impl DictStore {
         .map_err(sqlite_to_io)?;
         Ok(())
     }
+
+    /// Record a user-preferred segmentation. `boundaries` is the list of
+    /// segment start positions (char offsets into `kana`) *excluding* 0 —
+    /// so "きょう/は/いい/てんき" segmented over "きょうはいいてんき" is
+    /// stored as `[3, 4, 6]`. An empty list means "single segment" (user
+    /// dragged everything into one bunsetsu). The count is incremented on
+    /// each re-record so repeated confirmations reinforce the entry;
+    /// changing the segmentation for the same kana replaces `boundaries`.
+    pub fn record_segmentation(&self, kana: &str, boundaries: &[usize]) -> io::Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let serialised = encode_boundaries(boundaries);
+        conn.execute(
+            "INSERT INTO user_segmentations (kana, boundaries, count)
+                 VALUES (?1, ?2, 1)
+             ON CONFLICT(kana) DO UPDATE SET
+                 boundaries = excluded.boundaries,
+                 count = count + 1",
+            params![kana, serialised],
+        )
+        .map_err(sqlite_to_io)?;
+        Ok(())
+    }
+
+    /// Load all learned segmentations into an in-memory map. Called once
+    /// at UserScorer startup; subsequent updates go through
+    /// `record_segmentation`.
+    pub fn load_user_segmentations(&self) -> io::Result<HashMap<String, Vec<usize>>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn
+            .prepare("SELECT kana, boundaries FROM user_segmentations")
+            .map_err(sqlite_to_io)?;
+        let rows = stmt
+            .query_map([], |row| {
+                let kana: String = row.get(0)?;
+                let boundaries: String = row.get(1)?;
+                Ok((kana, boundaries))
+            })
+            .map_err(sqlite_to_io)?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (kana, boundaries) = row.map_err(sqlite_to_io)?;
+            out.insert(kana, decode_boundaries(&boundaries));
+        }
+        Ok(out)
+    }
+
+    pub fn clear_user_segmentations(&self) -> io::Result<usize> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let n = conn
+            .execute("DELETE FROM user_segmentations", [])
+            .map_err(sqlite_to_io)?;
+        Ok(n)
+    }
+}
+
+fn encode_boundaries(boundaries: &[usize]) -> String {
+    boundaries
+        .iter()
+        .map(|b| b.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn decode_boundaries(s: &str) -> Vec<usize> {
+    if s.is_empty() {
+        return Vec::new();
+    }
+    s.split(',').filter_map(|p| p.parse().ok()).collect()
 }
 
 fn read_legacy_dict_json(path: &Path) -> io::Result<Vec<DictionaryEntry>> {
