@@ -148,6 +148,18 @@ impl RomajiConverter {
         self.raw_input = Some(String::new());
     }
 
+    /// Restore a previously-captured pending buffer — used when cancelling
+    /// an F-key conversion that snapshotted the trailing consonant into
+    /// the segment state at `start_kana_conversion` time. Rewriting it
+    /// here lets the follow-up `preedit()` show kana+"m" as it did before
+    /// F-key (bug [15]). No-op if the buffer already holds content — a
+    /// concurrent keystroke would have already advanced past the cancel.
+    pub fn restore_buffer(&mut self, pending: &str) {
+        if !pending.is_empty() && self.buffer.is_empty() {
+            self.buffer.push_str(pending);
+        }
+    }
+
     /// Get current romaji buffer (incomplete input)
     pub fn buffer(&self) -> &str {
         &self.buffer

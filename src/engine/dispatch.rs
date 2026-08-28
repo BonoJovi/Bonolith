@@ -488,12 +488,14 @@ fn conversion_key(
             })
         }
         // Escape or Backspace → cancel back to preedit (Mozc parity).
-        // `clear_conversion` drops only the segmented state; the romaji
-        // reading in `engine.preedit()` survives, so the user can keep
-        // editing without retyping. Fable 5 flagged the missing IBus
-        // Backspace arm as [6]; this shared path now covers both.
+        // `cancel_conversion` drops the segmented state and, unlike the
+        // global `clear_conversion`, restores any F-key-captured pending
+        // consonant (e.g. the "m" in "vim → F7 → Esc") so the resulting
+        // preedit reads "ゔぃm", not "ゔぃ". Fable 5 flagged the missing
+        // IBus Backspace arm as [6] and the pending-loss as [15]; this
+        // shared path covers both.
         KEY_ESCAPE | KEY_BACKSPACE => {
-            engine.clear_conversion();
+            engine.cancel_conversion();
             *converting = false;
             Some(KeyOutcome::preedit_or_cleared(engine.preedit()))
         }
@@ -844,6 +846,35 @@ mod tests {
             "preedit did not receive KP_2: {:?}",
             e.preedit(),
         );
+    }
+
+    /// Regression [15]: cancelling an F-key conversion (Escape /
+    /// Backspace) must restore the trailing romaji buffer that
+    /// start_kana_conversion snapshotted into the segment state.
+    /// Without cancel_conversion writing the pending back to the
+    /// converter, "vim → F7 → Esc" left preedit as "ゔぃ" — the "m"
+    /// was silently lost, breaking Mozc / ATOK parity.
+    #[test]
+    fn f_key_cancel_restores_pending_consonant() {
+        for cancel_key in [KEY_ESCAPE, KEY_BACKSPACE] {
+            let (mut e, mut c) = setup();
+            for k in b"vim" {
+                dispatch_key(&mut e, &mut c, ev(*k as u32));
+            }
+            assert_eq!(e.preedit(), "ゔぃm", "pre-F7 preedit should show pending m");
+            // F7 → katakana form; enters conversion.
+            dispatch_key(&mut e, &mut c, ev(KEY_F7));
+            assert!(c, "F7 should enter conversion");
+            // Cancel back to preedit.
+            let out = dispatch_key(&mut e, &mut c, ev(cancel_key));
+            assert!(out.consumed);
+            assert!(!c, "cancel should end conversion");
+            assert_eq!(
+                e.preedit(),
+                "ゔぃm",
+                "cancel via 0x{cancel_key:04X} lost pending 'm'",
+            );
+        }
     }
 
     /// Release events are the frontend's job — the dispatcher must not

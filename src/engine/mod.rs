@@ -69,6 +69,16 @@ pub struct ConversionState {
     /// `UserScorer::record_segmentation` so the next time the same
     /// kana is typed the learned layout is applied up front.
     pub initial_boundaries: Vec<usize>,
+    /// Pending romaji-buffer text (e.g. the "m" in "vim") that was
+    /// captured from the converter into this conversion's kana at
+    /// `start_kana_conversion` time. `cancel_conversion` writes it back
+    /// to the romaji buffer so Escape / Backspace from an F-key
+    /// conversion restores the exact preedit the user had before F-key
+    /// (Mozc / ATOK parity — otherwise "vim → F7 → Esc" leaves preedit
+    /// as "ゔぃ" and the "m" is silently lost). Empty when the
+    /// conversion was entered via Space (that path's flush drops the
+    /// trailing consonant by design — see bug [16]).
+    pub pending_from_romaji: String,
 }
 
 /// Extract segment start positions (excluding 0) from a segment list.
@@ -497,6 +507,9 @@ impl ConversionEngine {
             focus: 0,
             raw_input,
             initial_boundaries,
+            // Space path: flush already dropped any non-"n" pending
+            // consonant, so nothing to restore on cancel. See bug [16].
+            pending_from_romaji: String::new(),
         });
 
         // Trigger LLM reranking in background — results applied on next interaction
@@ -776,6 +789,10 @@ impl ConversionEngine {
             raw_input,
             // Single-segment F-key conversion has no boundaries to record.
             initial_boundaries: Vec::new(),
+            // Preserve the trailing consonant flush would otherwise drop
+            // so cancel_conversion can restore it to the romaji buffer
+            // (bug [15]: "vim → F7 → Esc" left the "m" behind).
+            pending_from_romaji: pending,
         });
         self.conversion.as_ref()
     }
@@ -785,13 +802,32 @@ impl ConversionEngine {
         self.convert_focused_to(KanaForm::Katakana)
     }
 
-    /// Clear conversion state (on commit or cancel).
+    /// Clear conversion state (on commit or global cancel — Muhenkan /
+    /// toggle-off / IBus reset / disable). Drops the segments outright,
+    /// which is the correct behaviour for a global cancel: the user is
+    /// walking away from composition entirely. In-conversion Escape /
+    /// Backspace, where the user wants to fall back to the preedit and
+    /// keep editing, use [`cancel_conversion`] instead so the F-key-
+    /// captured pending consonant survives.
     pub fn clear_conversion(&mut self) {
         self.conversion = None;
         // Any in-flight rerank now belongs to a conversation the user has
         // walked away from. Bump the epoch so its result / panic path can't
         // touch the slot or clear inflight for a *later* pass, and clear the
         // slot + inflight so a follow-up refresh task exits its poll loop.
+        self.invalidate_rerank_state();
+    }
+
+    /// Cancel an in-flight conversion back to the raw preedit (Escape /
+    /// Backspace during conversion — Mozc parity). Same rerank-state
+    /// invalidation as [`clear_conversion`], but additionally restores the
+    /// F-key-captured trailing romaji buffer (e.g. the "m" in "vim") to
+    /// the converter so the follow-up `preedit()` reads "ゔぃm" rather
+    /// than dropping the "m" as a silent loss (bug [15]).
+    pub fn cancel_conversion(&mut self) {
+        if let Some(state) = self.conversion.take() {
+            self.romaji.restore_buffer(&state.pending_from_romaji);
+        }
         self.invalidate_rerank_state();
     }
 
