@@ -785,6 +785,26 @@ impl Dictionary {
                     (Some(PartOfSpeech::Prefix), Some(PartOfSpeech::Suffix)) => {
                         (Some(PartOfSpeech::Prefix), Some(PartOfSpeech::Suffix))
                     }
+                    // Noun+Particle: filter the right side to Particle POS
+                    // only. Without this, take_top's top-5 pulls in the
+                    // homograph Noun candidates for common trailing
+                    // particles (は→刃/歯/覇/葉, の→之/野/盧) and the
+                    // Cartesian product ships nonsense compounds like
+                    // 後刃 / 私之 / 跡刃 as visible candidates. Left stays
+                    // unfiltered so the dictionary's kana entry for the
+                    // stem (わたし, あと …) keeps surfacing alongside the
+                    // kanji form. Verb+Aux and Noun+Conj get the same
+                    // treatment for the same reason (auxiliary / conjunction
+                    // homographs would otherwise leak through).
+                    (Some(PartOfSpeech::Noun), Some(PartOfSpeech::Particle)) => {
+                        (None, Some(PartOfSpeech::Particle))
+                    }
+                    (Some(PartOfSpeech::Verb), Some(PartOfSpeech::Auxiliary)) => {
+                        (None, Some(PartOfSpeech::Auxiliary))
+                    }
+                    (Some(PartOfSpeech::Noun), Some(PartOfSpeech::Conjunction)) => {
+                        (None, Some(PartOfSpeech::Conjunction))
+                    }
                     _ => (None, None),
                 };
                 let merged_candidates = {
@@ -826,10 +846,29 @@ impl Dictionary {
                             role: Option<PartOfSpeech>,
                         ) -> Vec<&'a DictionaryEntry> {
                             if let Some(p) = role {
+                                // Functional POS are near-closed classes
+                                // where the top-frequency entry is the
+                                // modern-Japanese default and the long
+                                // tail is archaic/rare (の's Particle
+                                // homograph 之, は's Particle homograph
+                                // 巴, だ's Auxiliary homograph 抱 …).
+                                // Enumerating those on the Cartesian
+                                // product produces "後之" / "私之" style
+                                // nonsense candidates. Cap to top-1 for
+                                // Particle / Auxiliary / Conjunction; the
+                                // open-class Suffix / Noun / Prefix roles
+                                // still enumerate the top-5 so long-tail
+                                // homographs (家 for か) stay reachable.
+                                let cap = match p {
+                                    PartOfSpeech::Particle
+                                    | PartOfSpeech::Auxiliary
+                                    | PartOfSpeech::Conjunction => 1,
+                                    _ => 5,
+                                };
                                 let filtered: Vec<&DictionaryEntry> = cands
                                     .iter()
                                     .filter(|e| e.pos == p)
-                                    .take(5)
+                                    .take(cap)
                                     .collect();
                                 if !filtered.is_empty() {
                                     return filtered;
@@ -2878,6 +2917,55 @@ mod tests {
             }
         }
         assert_eq!(failures, 0, "{failures} supplement entries missing from candidates");
+    }
+
+    /// The Noun+Particle merge in merge_affix_compounds used to pull the
+    /// homograph Noun / archaic-Particle candidates for common trailing
+    /// particles into the compound Cartesian product — visible symptom:
+    /// "後は" showing "後刃" / "跡刃" as sibling candidates, "後の"
+    /// showing "後之" / "跡之". The role filter now restricts the right
+    /// side to Particle POS with a top-1 cap, so only the modern default
+    /// "は" / "の" propagates.
+    #[test]
+    fn noun_particle_merge_hides_homograph_kanji() {
+        let dict = Dictionary::new();
+        // Nonsense surfaces that must NOT appear in the compound candidates.
+        let cases: &[(&str, &[&str])] = &[
+            ("あとは", &["後刃", "跡刃", "蹟刃", "痕刃"]),
+            ("あとの", &["後之", "跡之", "蹟之", "痕之"]),
+            ("わたしは", &["私刃", "わたし刃", "渡し刃"]),
+            ("わたしの", &["私之", "わたし之", "渡し之"]),
+        ];
+        for &(reading, forbidden) in cases {
+            let segs = dict.segment(reading);
+            let all_surfaces: Vec<&str> = segs
+                .iter()
+                .flat_map(|s| s.candidates.iter().map(|c| c.surface.as_str()))
+                .collect();
+            for bad in forbidden {
+                assert!(
+                    !all_surfaces.contains(bad),
+                    "{reading}: nonsense surface {bad:?} leaked into candidates {all_surfaces:?}",
+                );
+            }
+            // Sanity: the modern-particle form must still be present.
+            let modern = match reading.chars().last().unwrap() {
+                'は' => format!("{}は", &reading[..reading.len() - "は".len()]),
+                'の' => format!("{}の", &reading[..reading.len() - "の".len()]),
+                _ => unreachable!(),
+            };
+            // At least one surface should end with the modern particle
+            // over a kanji stem (e.g. "後は" / "私の").
+            let has_kanji_particle = all_surfaces.iter().any(|s| {
+                s.ends_with(modern.chars().last().unwrap())
+                    && s.chars().count() >= 2
+                    && !s.starts_with(reading.chars().next().unwrap())
+            });
+            assert!(
+                has_kanji_particle,
+                "{reading}: expected at least one kanji-stem+particle candidate in {all_surfaces:?}",
+            );
+        }
     }
 }
 
