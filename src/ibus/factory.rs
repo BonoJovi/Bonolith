@@ -147,14 +147,21 @@ fn get_ibus_address() -> Option<String> {
     let mut newest: Option<(std::time::SystemTime, String)> = None;
     let entries = std::fs::read_dir(&bus_dir).ok()?;
     for entry in entries.flatten() {
-        let mtime = entry.metadata().ok()?.modified().ok()?;
+        // A single unreadable entry (permission race, file vanished mid-
+        // scan, unsupported filesystem) used to `?`-return from the whole
+        // function, silently discarding valid addresses already collected
+        // and dropping us into the session-bus fallback where the IBus
+        // Factory then failed to register — the engine appeared absent
+        // with no visible error. Skip the bad entry and keep scanning.
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(mtime) = meta.modified() else { continue };
         if let Ok(contents) = std::fs::read_to_string(entry.path()) {
             for line in contents.lines() {
                 if let Some(addr) = line.strip_prefix("IBUS_ADDRESS=") {
-                    if !addr.is_empty() {
-                        if newest.as_ref().is_none_or(|(t, _)| mtime > *t) {
-                            newest = Some((mtime, addr.to_string()));
-                        }
+                    if !addr.is_empty()
+                        && newest.as_ref().is_none_or(|(t, _)| mtime > *t)
+                    {
+                        newest = Some((mtime, addr.to_string()));
                     }
                 }
             }
