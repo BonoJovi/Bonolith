@@ -428,8 +428,14 @@ void BonolithEngine::runManageDict() {
     if (action == "削除") {
         // zenity --question returns exit code 0 for OK, non-0 for cancel.
         // Use system() since runZenity() treats non-zero exit as failure (empty string).
-        std::string cmd = "zenity --question '--title=Bonolith: 削除の確認' "
-                          "'--text=「" + selReading + "」→「" + selSurface + "」を削除しますか？'";
+        // shellQuote the --text arg so a registered word containing '
+        // (English contractions like "it's") does not break the quoting —
+        // an unquoted ' used to make zenity fail with non-zero exit, which
+        // system() then read as "user cancelled" so the delete silently
+        // no-op'd. A malicious registered word could also inject shell
+        // commands the fcitx5 process would then execute.
+        std::string textArg = "--text=「" + selReading + "」→「" + selSurface + "」を削除しますか？";
+        std::string cmd = "zenity --question '--title=Bonolith: 削除の確認' " + shellQuote(textArg);
         if (system(cmd.c_str()) == 0) {
             if (bonolith_dict_delete_entry(idx)) {
                 runZenity({"--info", "--title=Bonolith", "--text=削除しました"});
