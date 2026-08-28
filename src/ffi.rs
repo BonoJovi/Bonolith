@@ -546,55 +546,99 @@ pub unsafe extern "C" fn bonolith_dict_add_entry(
     })
 }
 
-/// Delete a user dictionary entry by index. Returns true on success.
+/// Delete a user dictionary entry by (reading, surface) identity. Returns
+/// true if a matching row was found and removed. The frontends capture
+/// the pair from the row the user picks and pass it here at apply time
+/// — the intervening `bonolith_dict_get_user_entries` snapshot is used
+/// only for display, so a concurrent register between "show list" and
+/// "confirm delete" doesn't clobber the newly-added row (bug [17]:
+/// the old index-based delete + replace_all rebuilt the store from a
+/// stale snapshot and lost the concurrent add).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn bonolith_dict_delete_entry(index: i32) -> bool {
+pub unsafe extern "C" fn bonolith_dict_delete_entry_by_identity(
+    reading: *const c_char,
+    surface: *const c_char,
+) -> bool {
     ffi_boundary(false, || {
+        let reading = match unsafe { std::ffi::CStr::from_ptr(reading) }.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return false,
+        };
+        let surface = match unsafe { std::ffi::CStr::from_ptr(surface) }.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return false,
+        };
+
         let shared = SharedCore::global();
         let mut dict = write_lock_recover(&shared.dictionary);
-        let mut entries = dict.user_entries().to_vec();
-        let idx = index as usize;
-        if idx >= entries.len() {
+        // Re-fetch under the write lock so any concurrent add is
+        // included in `live` and only the identified row is dropped.
+        let mut live: Vec<DictionaryEntry> = dict.user_entries().to_vec();
+        let before = live.len();
+        live.retain(|e| !(e.reading == reading && e.surface == surface));
+        if live.len() == before {
+            // Row already gone (double-click / concurrent delete).
+            // Callers treat false as "nothing to do" not an error.
             return false;
         }
-        entries.remove(idx);
-        dict.replace_user_entries(entries);
+        dict.replace_user_entries(live);
         dict.sync_user_entries_to_store().is_ok()
     })
 }
 
-/// Update a user dictionary entry by index. Empty strings mean "no change".
-/// Returns true on success.
+/// Update a user dictionary entry identified by (old_reading, old_surface)
+/// to a new (reading, surface) pair. Returns true on success. Same
+/// snapshot-safety story as `bonolith_dict_delete_entry_by_identity`:
+/// re-fetches live entries under the write lock so a concurrent register
+/// between dialog open and apply survives (bug [17]).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn bonolith_dict_update_entry(
-    index: i32,
+pub unsafe extern "C" fn bonolith_dict_update_entry_by_identity(
+    old_reading: *const c_char,
+    old_surface: *const c_char,
     new_reading: *const c_char,
     new_surface: *const c_char,
 ) -> bool {
     ffi_boundary(false, || {
-        let new_reading = match unsafe { std::ffi::CStr::from_ptr(new_reading) }.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return false,
+        let parse = |p: *const c_char| unsafe { std::ffi::CStr::from_ptr(p) }
+            .to_str()
+            .map(str::to_string)
+            .ok();
+        let old_reading = match parse(old_reading) {
+            Some(s) => s,
+            None => return false,
         };
-        let new_surface = match unsafe { std::ffi::CStr::from_ptr(new_surface) }.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return false,
+        let old_surface = match parse(old_surface) {
+            Some(s) => s,
+            None => return false,
         };
+        let new_reading = match parse(new_reading) {
+            Some(s) => s,
+            None => return false,
+        };
+        let new_surface = match parse(new_surface) {
+            Some(s) => s,
+            None => return false,
+        };
+        if new_reading.is_empty() || new_surface.is_empty() {
+            return false;
+        }
 
         let shared = SharedCore::global();
         let mut dict = write_lock_recover(&shared.dictionary);
-        let mut entries = dict.user_entries().to_vec();
-        let idx = index as usize;
-        if idx >= entries.len() {
+        let mut live: Vec<DictionaryEntry> = dict.user_entries().to_vec();
+        let mut hit = false;
+        for e in live.iter_mut() {
+            if e.reading == old_reading && e.surface == old_surface {
+                e.reading = new_reading.clone();
+                e.surface = new_surface.clone();
+                hit = true;
+                break;
+            }
+        }
+        if !hit {
             return false;
         }
-        if !new_reading.is_empty() {
-            entries[idx].reading = new_reading;
-        }
-        if !new_surface.is_empty() {
-            entries[idx].surface = new_surface;
-        }
-        dict.replace_user_entries(entries);
+        dict.replace_user_entries(live);
         dict.sync_user_entries_to_store().is_ok()
     })
 }

@@ -97,12 +97,21 @@ typedef struct {
 /// Add a word to the user dictionary and save. Returns true on success.
 bool bonolith_dict_add_entry(const char *reading, const char *surface);
 
-/// Delete a user dictionary entry by index. Returns true on success.
-bool bonolith_dict_delete_entry(int32_t index);
+/// Delete a user dictionary entry by (reading, surface) identity.
+/// Returns true if a matching row was found and removed. Callers
+/// (the manage-dict dialog) capture the pair from the row the user
+/// picks so a concurrent register between "show list" and "confirm
+/// delete" doesn't clobber the newly-added row.
+bool bonolith_dict_delete_entry_by_identity(const char *reading,
+                                            const char *surface);
 
-/// Update a user dictionary entry by index. Empty strings mean "no change".
-bool bonolith_dict_update_entry(int32_t index, const char *new_reading,
-                            const char *new_surface);
+/// Update a user dictionary entry identified by (old_reading, old_surface)
+/// to a new (reading, surface) pair. Returns true on success. Same
+/// snapshot-safety story as bonolith_dict_delete_entry_by_identity.
+bool bonolith_dict_update_entry_by_identity(const char *old_reading,
+                                            const char *old_surface,
+                                            const char *new_reading,
+                                            const char *new_surface);
 
 /// Get all user dictionary entries. Caller must free with bonolith_dict_free_entries().
 BonolithDictEntries bonolith_dict_get_user_entries(void);
