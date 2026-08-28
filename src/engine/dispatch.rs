@@ -72,6 +72,13 @@ const KEY_DELETE: u32 = 0xFFFF;
 pub const SHIFT_MASK: u32 = 1 << 0;
 pub const CONTROL_MASK: u32 = 1 << 2;
 pub const MOD1_MASK: u32 = 1 << 3;
+// Super / Hyper / Meta: usually grabbed by the compositor, but any press
+// that leaks through must be treated as a passthrough — otherwise
+// Super+e romaji-ifies into "え" and hijacks the user's shortcut.
+// Both IBus and Fcitx5 use these bit positions.
+pub const MOD4_MASK: u32 = 1 << 6; // Super
+pub const HYPER_MASK: u32 = 1 << 5; // Hyper
+pub const META_MASK: u32 = 1 << 28; // Meta
 pub const RELEASE_MASK: u32 = 1 << 30;
 
 #[derive(Copy, Clone, Debug)]
@@ -87,8 +94,11 @@ impl KeyEvent {
     pub fn has_shift(&self) -> bool {
         self.state & SHIFT_MASK != 0
     }
+    /// Any non-Shift modifier — Ctrl, Alt, Super, Hyper, Meta. A press
+    /// with any of these bits is a shortcut the app owns; the dispatcher
+    /// returns passthrough so the char never becomes preedit.
     pub fn has_ctrl_alt(&self) -> bool {
-        self.state & (CONTROL_MASK | MOD1_MASK) != 0
+        self.state & (CONTROL_MASK | MOD1_MASK | MOD4_MASK | HYPER_MASK | META_MASK) != 0
     }
 }
 
@@ -874,6 +884,27 @@ mod tests {
                 "ゔぃm",
                 "cancel via 0x{cancel_key:04X} lost pending 'm'",
             );
+        }
+    }
+
+    /// Regression [12]: Super/Hyper/Meta+letter must pass through, not
+    /// romaji-ify into preedit. Compositors usually grab Super+e, but
+    /// X11 apps with their own bindings receive it and had it silently
+    /// consumed as "え".
+    #[test]
+    fn super_plus_letter_passes_through() {
+        for mask in [MOD4_MASK, HYPER_MASK, META_MASK] {
+            let (mut e, mut c) = setup();
+            let out = dispatch_key(
+                &mut e,
+                &mut c,
+                KeyEvent {
+                    keyval: b'e' as u32,
+                    state: mask,
+                },
+            );
+            assert!(!out.consumed, "modifier 0x{mask:08X}+e should passthrough");
+            assert_eq!(e.preedit(), "", "modifier 0x{mask:08X}+e leaked into preedit");
         }
     }
 
