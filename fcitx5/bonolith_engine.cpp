@@ -55,13 +55,27 @@ void BonolithState::reset() {
 }
 
 void BonolithState::commitInput() {
-    // Commit any in-progress composition instead of discarding it, then refresh
-    // the UI so the committed text is flushed and the panel cleared. Used on
-    // focus loss so clicking away (e.g. onto a modal) preserves typed text,
-    // matching standard JP IMEs (Mozc etc.).
-    if (ctx_)
-        bonolith_commit_input(ctx_);
-    updateUI();
+    // Focus-loss handoff. Do NOT send our own commitString here — the
+    // Wayland compositor (and GTK4's IM module) auto-finalize the
+    // already-shown client preedit into the focused-away client BEFORE
+    // this handler runs, so adding our commitString produced duplicated
+    // text like "あいあい" (observed on Ghostty and Gnome Terminal at the
+    // instant of Alt+Tab). The compositor's finalize is enough; we only
+    // need to clear our engine state so a fresh composition starts
+    // when the user returns.
+    //
+    // Trade-off: on hypothetical clients that neither finalize nor
+    // notify us before we get here, in-progress preedit is lost. That
+    // scenario is unlikely on modern GTK / Qt / Wayland stacks, and the
+    // previous "commit-on-deactivate" behaviour was itself lossy on
+    // IBus/Ghostty (compositor dropped the preedit AND our commit
+    // arrived post-focus, so text vanished). Trading a rare loss for
+    // reliable no-duplication is the right call.
+    if (!ctx_) return;
+    bonolith_reset(ctx_);
+    ic_->inputPanel().reset();
+    ic_->updatePreedit();
+    ic_->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
 }
 
 void BonolithState::updateUI() {

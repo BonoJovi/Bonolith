@@ -373,29 +373,19 @@ impl BonolithEngine {
         &self,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) {
-        // With mode=0 (PREEDIT_CLEAR) IBus drops the preedit on focus loss, so
-        // we must commit manually to preserve the "click-away keeps typed text"
-        // contract (Mozc/Google IME parity).
-        let commit_str = {
-            let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
-            let converting = *self.converting.lock().unwrap_or_else(|e| e.into_inner());
-            let preedit = engine.preedit().to_string();
-            if converting {
-                engine.commit_conversion().unwrap_or_default()
-            } else if !preedit.is_empty() {
-                engine.commit(&preedit);
-                preedit
-            } else {
-                String::new()
-            }
-        };
-
-        if !commit_str.is_empty() {
-            if let Err(e) = Self::commit_text(&emitter, ibus_text(&commit_str)).await {
-                warn!("Bonolith: focus_out commit_text failed: {e}");
-            }
-        }
-        // Hide any stale UI, clear internal state.
+        // Preedit is set with mode=1 (PREEDIT_COMMIT), so hiding it here
+        // lets IBus auto-commit the current text into the focused-away
+        // client. That is the same "click-away keeps text" contract as
+        // before, but delivered by the framework instead of by our own
+        // commit_text — the old explicit commit raced with IBus's own
+        // focus-loss dispatch and ended up dropped by some clients
+        // (Ghostty / Gnome Terminal), silently losing the composition.
+        //
+        // Symmetric with the Fcitx5 addon, which relies on the Wayland
+        // compositor to auto-finalize its client preedit on the same
+        // event. User-scorer learning is skipped for focus-loss commits
+        // (record() only runs on explicit commit_conversion in the key
+        // handler); rare edge case, Enter/Space commits still learn.
         let _ = Self::hide_preedit_text(&emitter).await;
         let _ = Self::hide_lookup_table(&emitter).await;
         let _ = Self::hide_auxiliary_text(&emitter).await;
@@ -554,6 +544,27 @@ impl BonolithEngine {
         outcome: KeyOutcome,
         conversion: Option<ConversionState>,
     ) -> zbus::fdo::Result<bool> {
+        // Preedit is set with mode=1 (PREEDIT_COMMIT), so a subsequent
+        // hide would auto-commit the last-shown preedit text ("きょう")
+        // even when we're about to commit our own converted text
+        // ("京都") explicitly — that would double-insert as "京都きょう".
+        // Neutralise by pushing an empty preedit with mode=0 first;
+        // then commit_text + hide_preedit_text combine cleanly. Needed
+        // whenever we commit or clear the display; safe (no-op-ish) at
+        // other times.
+        let needs_neutralise = outcome.commit.is_some()
+            || matches!(outcome.display, DisplayUpdate::Cleared);
+        if needs_neutralise {
+            if let Err(e) = Self::update_preedit_text(
+                emitter,
+                ibus_text(""),
+                0,
+                false,
+                0,
+            ).await {
+                warn!("Bonolith: preedit neutralise failed: {}", e);
+            }
+        }
         if let Some(text) = outcome.commit {
             if let Err(e) = Self::commit_text(emitter, ibus_text(&text)).await {
                 warn!("Bonolith: commit_text emission failed: {}", e);
@@ -602,15 +613,17 @@ impl BonolithEngine {
         let focus = state.focus;
 
         // Preedit with segment highlighting.
-        // mode=0 (PREEDIT_CLEAR): drop preedit when hidden; focus_out commits
-        // manually so the click-away-keeps-text contract still holds.
+        // mode=1 (PREEDIT_COMMIT): IBus auto-commits the current preedit
+        // text (the composed candidate text) into the client on hide /
+        // focus loss. Escape / Enter / Space paths neutralise this in
+        // apply_outcome by pre-clearing the preedit with mode=0.
         let cursor = text.chars().count() as u32;
         Self::update_preedit_text(
             emitter,
             ibus_text_with_segments(&text, &ranges, focus),
             cursor,
             true,
-            0,
+            1,
         ).await.map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
         // Lookup table for the focused segment's candidates
@@ -711,9 +724,12 @@ impl BonolithEngine {
         } else {
             ibus_text(text)
         };
-        // mode=0 (PREEDIT_CLEAR): drop preedit when hidden; focus_out commits
-        // manually to preserve the click-away-keeps-text contract.
-        Self::update_preedit_text(emitter, preedit_text, cursor, visible, 0).await
+        // mode=1 (PREEDIT_COMMIT): IBus auto-commits the current preedit
+        // text on hide / focus loss (Ghostty / Gnome Terminal used to
+        // silently lose focus-loss text with mode=0). Escape / Enter
+        // paths pre-clear with mode=0 in apply_outcome to prevent
+        // double-commit against our own commit_text.
+        Self::update_preedit_text(emitter, preedit_text, cursor, visible, 1).await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         // Keep lookup and auxiliary explicitly cleared during romaji buildup
         // so no stale state accumulates in the client (Mozc parity).
