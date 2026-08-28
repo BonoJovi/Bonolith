@@ -154,9 +154,21 @@ impl RomajiConverter {
     /// here lets the follow-up `preedit()` show kana+"m" as it did before
     /// F-key (bug [15]). No-op if the buffer already holds content — a
     /// concurrent keystroke would have already advanced past the cancel.
+    ///
+    /// Also mirrors the pending into `raw_input` when it is currently
+    /// Some, keeping F9/F10 parity: without this, `commit_conversion`'s
+    /// preceding `reset()` sets raw_input=Some("") and the follow-up
+    /// buffer restore of "m" left them desynced — a subsequent 'a'
+    /// would yield "ま" with raw_input="a", so F10 emitted "a" instead
+    /// of "ma" (bug [26]). The cancel path had raw_input=None already
+    /// (F-key start_kana_conversion's flush cleared it), so this is a
+    /// no-op there and doesn't reintroduce ghost input.
     pub fn restore_buffer(&mut self, pending: &str) {
         if !pending.is_empty() && self.buffer.is_empty() {
             self.buffer.push_str(pending);
+            if let Some(raw) = self.raw_input.as_mut() {
+                raw.push_str(pending);
+            }
         }
     }
 

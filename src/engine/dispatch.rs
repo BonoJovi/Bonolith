@@ -240,7 +240,20 @@ pub fn dispatch_key(
         if *converting {
             if let Some(text) = engine.commit_conversion() {
                 *converting = false;
-                return KeyOutcome::commit(text);
+                // Same as KEY_RETURN: keep the preedit visible when a
+                // Space-path pending buffer ("m") is still live so IBus
+                // doesn't leave it as an invisible ghost (bug [27]).
+                let preedit = engine.preedit();
+                return KeyOutcome {
+                    consumed: true,
+                    commit: Some(text),
+                    display: if preedit.is_empty() {
+                        DisplayUpdate::Cleared
+                    } else {
+                        DisplayUpdate::Preedit(preedit)
+                    },
+                    ..KeyOutcome::default()
+                };
             }
             *converting = false;
             return KeyOutcome::cleared();
@@ -490,10 +503,22 @@ fn conversion_key(
         KEY_RETURN => {
             let text = engine.commit_conversion();
             *converting = false;
+            // commit_conversion restores the Space-path pending buffer
+            // (e.g. "m" from "vim → Space → Enter") back into the
+            // romaji converter. Reflect that in the display so IBus's
+            // preedit stays in sync with `engine.preedit()`; otherwise
+            // the "m" lingers invisibly and the next Enter commits it
+            // as a phantom keystroke (bug [27]). apply_outcome handles
+            // commit+preedit combined. F-key path's kana already
+            // included the pending buffer, so preedit will be empty.
             Some(KeyOutcome {
                 consumed: true,
                 commit: text,
-                display: DisplayUpdate::Cleared,
+                display: if engine.preedit().is_empty() {
+                    DisplayUpdate::Cleared
+                } else {
+                    DisplayUpdate::Preedit(engine.preedit())
+                },
                 ..KeyOutcome::default()
             })
         }
@@ -884,12 +909,60 @@ mod tests {
             "m",
             "commit did not preserve trailing 'm' as pending",
         );
+        // Bug [27]: display must reflect the restored preedit so IBus
+        // paints the "m" instead of clearing it into an invisible ghost
+        // that Enter later "commits" as a phantom keystroke.
+        assert!(
+            matches!(&out.display, DisplayUpdate::Preedit(t) if t == "m"),
+            "commit-with-pending must emit Preedit(\"m\"), got {:?}",
+            out.display,
+        );
         dispatch_key(&mut e, &mut c, ev(b'a' as u32));
         assert!(
             e.preedit().ends_with('ま'),
             "'m' + 'a' should continue as 'ま', got {:?}",
             e.preedit(),
         );
+    }
+
+    /// Regression [25]: F-key commit's pending buffer is already part of
+    /// the committed text (start_kana_conversion appended it to kana), so
+    /// commit must NOT restore it to the romaji buffer. Otherwise
+    /// "vim → F7 → Enter → a" produces "ヴィムま" — the "m" gets
+    /// committed inside "ヴィム" AND lingers as buffered input.
+    #[test]
+    fn f_key_conversion_commit_does_not_double_count_pending() {
+        for commit_key in [KEY_RETURN, KEY_TAB] {
+            let (mut e, mut c) = setup();
+            for k in b"vim" {
+                dispatch_key(&mut e, &mut c, ev(*k as u32));
+            }
+            assert_eq!(e.preedit(), "ゔぃm");
+            dispatch_key(&mut e, &mut c, ev(KEY_F7));
+            assert!(c, "F7 should enter conversion");
+            let out = dispatch_key(&mut e, &mut c, ev(commit_key));
+            assert!(out.consumed);
+            assert!(!c);
+            assert!(out.commit.is_some(), "commit key 0x{commit_key:04X} should commit");
+            assert_eq!(
+                e.preedit(),
+                "",
+                "F-key commit via 0x{commit_key:04X} left preedit \"{}\" — pending 'm' double-counted",
+                e.preedit(),
+            );
+            assert!(
+                matches!(out.display, DisplayUpdate::Cleared),
+                "F-key commit display should be Cleared (no leftover preedit), got {:?}",
+                out.display,
+            );
+            dispatch_key(&mut e, &mut c, ev(b'a' as u32));
+            assert_eq!(
+                e.preedit(),
+                "あ",
+                "next keystroke after F-key commit should build fresh 'あ', got {:?}",
+                e.preedit(),
+            );
+        }
     }
 
     /// Regression [16] symmetric: cancel from a Space-triggered
