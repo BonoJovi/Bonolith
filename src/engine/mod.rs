@@ -22,6 +22,10 @@ use crate::core::{
     user_scorer::UserScorer,
 };
 
+/// Frontend-agnostic key dispatcher shared by the Fcitx5 FFI and IBus
+/// engine. See the module docs for the KeyEvent → KeyOutcome contract.
+pub mod dispatch;
+
 /// Per-segment state during conversion
 #[derive(Debug, Clone)]
 pub struct SegmentState {

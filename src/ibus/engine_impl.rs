@@ -10,6 +10,7 @@ use zbus::object_server::SignalEmitter;
 use zbus::{interface, zvariant, Connection};
 
 use bonolith::core::dictionary::{Dictionary, DictionaryEntry, PartOfSpeech};
+use bonolith::engine::dispatch::{dispatch_key, DisplayUpdate, KeyEvent, KeyOutcome};
 use bonolith::engine::{ConversionEngine, ConversionState, SharedCore};
 
 use super::config::{CompiledToggleKey, BonolithConfig};
@@ -279,7 +280,9 @@ impl BonolithEngine {
             return Ok(true);
         }
 
-        // Pass through modifier combos (Ctrl+C, Alt+Tab, etc.)
+        // Pass through modifier combos (Ctrl+C, Alt+Tab, etc.) — checked
+        // both here and inside `dispatch_key`, but returning early avoids
+        // the engine lock and stays symmetric with the older code path.
         if has_modifier(state) {
             return Ok(false);
         }
@@ -289,200 +292,27 @@ impl BonolithEngine {
             return Ok(false);
         }
 
-        let converting = *self.converting.lock().unwrap_or_else(|e| e.into_inner());
-
-        // Tab while a preedit/conversion is active → commit current text and
-        // consume the key (Ok(true)). Focus does NOT move: this matches the
-        // standard Japanese IME convention (Mozc / Google IME / ATOK), where
-        // Tab during composition is an IME key, not a focus-navigation key.
-        // When nothing is composing we fall through to Ok(false) so Tab works
-        // normally. Both engines consume Tab here, so IBus and Fcitx5 stay
-        // consistent instead of diverging on framework preedit defaults.
-        if keyval == IBUS_KEY_TAB {
-            let text = {
-                let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
-                if converting {
-                    engine.commit_conversion()
-                } else {
-                    let p = engine.preedit().to_string();
-                    if p.is_empty() {
-                        None
-                    } else {
-                        engine.commit(&p);
-                        Some(p)
-                    }
-                }
-            };
-            if let Some(text) = text {
-                // Best-effort emit. Engine state has already been mutated
-                // (commit_conversion / engine.commit take internal state),
-                // so a `?` here used to leave `converting=true` latched when
-                // a hide-signal failed, jamming further input. Log and
-                // finish the state cleanup instead — a broken D-Bus means
-                // the daemon is already gone and text loss is unavoidable,
-                // but the residual `converting=true` was.
-                if let Err(e) = Self::commit_text(&emitter, ibus_text(&text)).await {
-                    warn!("Bonolith: commit_text emission failed: {}", e);
-                }
-                let _ = Self::hide_preedit_text(&emitter).await;
-                let _ = Self::hide_lookup_table(&emitter).await;
-                let _ = Self::hide_auxiliary_text(&emitter).await;
-                *self.converting.lock().unwrap_or_else(|e| e.into_inner()) = false;
-                return Ok(true);
-            }
-            return Ok(false);
-        }
-
-        // F6-F10 → kana form selection.
-        //
-        // Bonolith always owns F6-F10 while the engine is enabled (we get
-        // here only after the `!enabled` gate above). start_kana_conversion
-        // returns Ok(false) for an empty preedit — propagating that let
-        // IBus pass the raw keysym to the app, where a terminal expanded
-        // F7 into `\e[18~` and printed the trailing tilde. Discard the
-        // "did we actually enter conversion mode" bool and always report
-        // the key as consumed; the empty-preedit case is a no-op instead
-        // of a passthrough.
-        if keyval == IBUS_KEY_F6 {
-            if converting {
-                let conv = {
-                    let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
-                    engine.convert_focused_to_hiragana().cloned()
-                };
-                if let Some(conv) = conv {
-                    self.show_conversion_state(&emitter, &conv).await?;
-                }
+        // Everything past this point (Tab, F6-F10, Space, arrows, Enter,
+        // Escape, Backspace, romaji buildup, fullwidth symbols) is shared
+        // with the Fcitx5 FFI via `dispatch_key`. See [10c] in
+        // `work/bug_fix_progress_*.md` for the unification rationale.
+        let event = KeyEvent { keyval, state };
+        let (outcome, conversion_snapshot) = {
+            let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
+            let mut converting_flag = *self.converting.lock().unwrap_or_else(|e| e.into_inner());
+            let outcome = dispatch_key(&mut engine, &mut converting_flag, event);
+            // Snapshot the conversion state under the same lock so the D-Bus
+            // emission below sees the version the dispatcher just mutated.
+            let snapshot = if matches!(outcome.display, DisplayUpdate::Conversion) {
+                engine.conversion_state().cloned()
             } else {
-                let _ = self.start_kana_conversion(&emitter, 0).await?;
-            }
-            return Ok(true);
-        }
-
-        // F7 → full-width katakana, F8 → half-width katakana, F9 → full-width romaji, F10 → half-width romaji
-        if keyval == IBUS_KEY_F7 || keyval == IBUS_KEY_F8 || keyval == IBUS_KEY_F9 || keyval == IBUS_KEY_F10 {
-            info!("Bonolith: F-key 0x{:04X} converting={}", keyval, converting);
-            let form = match keyval {
-                IBUS_KEY_F8 => 2,
-                IBUS_KEY_F9 => 4,
-                IBUS_KEY_F10 => 3,
-                _ => 1,
-            };
-            if converting {
-                match keyval {
-                    IBUS_KEY_F9 => return self.convert_focused_to_fullwidth_romaji(&emitter).await,
-                    IBUS_KEY_F10 => return self.convert_focused_to_romaji(&emitter).await,
-                    _ => {
-                        let half = keyval == IBUS_KEY_F8;
-                        return self.convert_focused_to_kana(&emitter, half).await;
-                    }
-                }
-            } else {
-                let _ = self.start_kana_conversion(&emitter, form).await?;
-                return Ok(true);
-            }
-        }
-
-        // Handle keys during conversion mode
-        if converting {
-            let result = self.handle_conversion_key(&emitter, keyval, state).await?;
-            if result {
-                return Ok(true);
-            }
-            // Non-printable keys (modifiers, function keys, etc.) — consume without committing
-            if keyval_to_char(keyval).is_none() {
-                return Ok(true);
-            }
-            // Printable key not handled by conversion — commit conversion first,
-            // then fall through to process the key as new input
-            let text = {
-                let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
-                engine.commit_conversion()
-            };
-            if let Some(text) = text {
-                // Same best-effort emission pattern — see the Tab arm above.
-                if let Err(e) = Self::commit_text(&emitter, ibus_text(&text)).await {
-                    warn!("Bonolith: commit_text emission failed: {}", e);
-                }
-                let _ = Self::hide_preedit_text(&emitter).await;
-                let _ = Self::hide_lookup_table(&emitter).await;
-                let _ = Self::hide_auxiliary_text(&emitter).await;
-                *self.converting.lock().unwrap_or_else(|e| e.into_inner()) = false;
-            }
-            // Fall through to process the key as new input
-        }
-
-        // Space → trigger conversion
-        if keyval == IBUS_KEY_SPACE {
-            return self.start_conversion(&emitter).await;
-        }
-
-        // Enter → commit current preedit as-is (hiragana)
-        if keyval == IBUS_KEY_RETURN {
-            return self.commit_preedit(&emitter).await;
-        }
-
-        // Escape → cancel input
-        if keyval == IBUS_KEY_ESCAPE {
-            return self.cancel_input(&emitter).await;
-        }
-
-        // Backspace → delete last character from buffer
-        if keyval == IBUS_KEY_BACKSPACE {
-            return self.handle_backspace(&emitter).await;
-        }
-
-        // Arrow keys / navigation keys → consume if preedit is active to prevent
-        // interference (e.g. Shift+Arrow inserting stray characters), pass through otherwise
-        if matches!(keyval, IBUS_KEY_LEFT | IBUS_KEY_RIGHT | IBUS_KEY_UP | IBUS_KEY_DOWN
-                          | IBUS_KEY_PAGE_UP | IBUS_KEY_PAGE_DOWN) {
-            let has_preedit = !self.engine.lock().unwrap_or_else(|e| e.into_inner()).preedit().is_empty();
-            return Ok(has_preedit);
-        }
-
-        // Symbol/punctuation/digit → full-width equivalent in preedit.
-        // Alphabetics / -/'/' ' fall through to the romaji-input branch
-        // below — to_fullwidth_char maps them too, but Bonolith wants
-        // a-z routed through process_key (so 「ka」→ か), and reserves
-        // `'` for n'-disambiguation and `-` for long-vowel input.
-        if let Some(ch) = keyval_to_char(keyval) {
-            let fw = if ch.is_ascii_alphabetic() || matches!(ch, '\'' | '-' | ' ') {
                 None
-            } else {
-                bonolith::core::romaji::to_fullwidth_char(ch)
             };
-            if let Some(sym) = fw {
-                let preedit = {
-                    let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
-                    engine.append_raw(&sym.to_string());
-                    engine.preedit().to_string()
-                };
-                self.send_preedit(&emitter, &preedit).await?;
-                return Ok(true);
-            }
-        }
-
-        // Printable ASCII → feed to romaji converter
-        if let Some(ch) = keyval_to_char(keyval) {
-            if ch.is_ascii_alphabetic() || ch == '-' || ch == '\'' {
-                let preedit = {
-                    let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
-                    engine.process_key(ch.to_ascii_lowercase());
-                    engine.preedit().to_string()
-                };
-
-                self.send_preedit(&emitter, &preedit).await?;
-                return Ok(true);
-            }
-        }
-
-        // Consume unhandled keys while preedit is active to prevent stray characters
-        let has_preedit = !self.engine.lock().unwrap_or_else(|e| e.into_inner()).preedit().is_empty();
-        if has_preedit {
-            return Ok(true);
-        }
-
-        // Unhandled key
-        Ok(false)
+            drop(engine);
+            *self.converting.lock().unwrap_or_else(|e| e.into_inner()) = converting_flag;
+            (outcome, snapshot)
+        };
+        self.apply_outcome(&emitter, outcome, conversion_snapshot).await
     }
 
     /// Called when the engine gains focus.
@@ -713,150 +543,42 @@ impl BonolithEngine {
             .any(|tk| keyval == tk.keyval && active_modifiers == tk.modifier_mask)
     }
 
-    /// Start a kana-form conversion (F6/F7/F8 outside conversion mode).
-    /// form: 0 = hiragana, 1 = katakana, 2 = half-width katakana
-    async fn start_kana_conversion(
+    /// Translate a [`KeyOutcome`] from the shared dispatcher into IBus
+    /// D-Bus signals. Best-effort emission: engine state has already been
+    /// mutated by the dispatcher, so a broken signal here (D-Bus dying,
+    /// XIM proxy hiccup) is logged rather than propagated — a `?` used to
+    /// leave `converting=true` latched and jam further input.
+    async fn apply_outcome(
         &self,
         emitter: &SignalEmitter<'_>,
-        form: usize,
+        outcome: KeyOutcome,
+        conversion: Option<ConversionState>,
     ) -> zbus::fdo::Result<bool> {
-        let state = {
-            let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
-            engine.start_kana_conversion(form).cloned()
-        };
-        let Some(state) = state else {
-            return Ok(false);
-        };
-        self.show_conversion_state(emitter, &state).await?;
-        *self.converting.lock().unwrap_or_else(|e| e.into_inner()) = true;
-        Ok(true)
-    }
-
-    async fn start_conversion(
-        &self,
-        emitter: &SignalEmitter<'_>,
-    ) -> zbus::fdo::Result<bool> {
-        let state = {
-            let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
-            engine.start_conversion().cloned()
-        };
-
-        let Some(state) = state else {
-            return Ok(false);
-        };
-
-        self.show_conversion_state(emitter, &state).await?;
-        *self.converting.lock().unwrap_or_else(|e| e.into_inner()) = true;
-        // Surface LLM context reranking once the background pass finishes.
-        self.spawn_rerank_refresh(emitter);
-
-        Ok(true)
-    }
-
-    async fn handle_conversion_key(
-        &self,
-        emitter: &SignalEmitter<'_>,
-        keyval: u32,
-        state: u32,
-    ) -> zbus::fdo::Result<bool> {
-        let has_shift = state & IBUS_SHIFT_MASK != 0;
-
-        match keyval {
-            // Space / Down → next candidate for focused segment
-            IBUS_KEY_SPACE | IBUS_KEY_DOWN => {
-                let conv = {
-                    let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
-                    engine.cycle_candidate(1).cloned()
-                };
-                if let Some(conv) = conv {
-                    self.show_conversion_state(emitter, &conv).await?;
-                }
-                Ok(true)
+        if let Some(text) = outcome.commit {
+            if let Err(e) = Self::commit_text(emitter, ibus_text(&text)).await {
+                warn!("Bonolith: commit_text emission failed: {}", e);
             }
-            // Up → previous candidate for focused segment
-            IBUS_KEY_UP => {
-                let conv = {
-                    let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
-                    engine.cycle_candidate(-1).cloned()
-                };
-                if let Some(conv) = conv {
-                    self.show_conversion_state(emitter, &conv).await?;
-                }
-                Ok(true)
-            }
-            // Right → move focus to next segment (or Shift+Right → extend segment)
-            IBUS_KEY_RIGHT => {
-                let conv = {
-                    let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
-                    if has_shift {
-                        engine.resize_segment(1).cloned()
-                    } else {
-                        engine.move_focus(1).cloned()
-                    }
-                };
-                if let Some(conv) = conv {
-                    self.show_conversion_state(emitter, &conv).await?;
-                }
-                // A resize re-triggers the background rerank; refresh when ready.
-                if has_shift {
-                    self.spawn_rerank_refresh(emitter);
-                }
-                Ok(true)
-            }
-            // Left → move focus to previous segment (or Shift+Left → shrink segment)
-            IBUS_KEY_LEFT => {
-                let conv = {
-                    let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
-                    if has_shift {
-                        engine.resize_segment(-1).cloned()
-                    } else {
-                        engine.move_focus(-1).cloned()
-                    }
-                };
-                if let Some(conv) = conv {
-                    self.show_conversion_state(emitter, &conv).await?;
-                }
-                // A resize re-triggers the background rerank; refresh when ready.
-                if has_shift {
-                    self.spawn_rerank_refresh(emitter);
-                }
-                Ok(true)
-            }
-            // Enter → commit composed text (with learning)
-            IBUS_KEY_RETURN => {
-                let text = {
-                    let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
-                    engine.commit_conversion()
-                };
-                if let Some(text) = text {
-                    // Same best-effort emission pattern — see the Tab arm.
-                    if let Err(e) = Self::commit_text(emitter, ibus_text(&text)).await {
-                        warn!("Bonolith: commit_text emission failed: {}", e);
-                    }
-                    let _ = Self::hide_preedit_text(emitter).await;
-                    let _ = Self::hide_lookup_table(emitter).await;
-                    let _ = Self::hide_auxiliary_text(emitter).await;
-                    *self.converting.lock().unwrap_or_else(|e| e.into_inner()) = false;
-                }
-                Ok(true)
-            }
-            // Escape → cancel conversion, return to preedit
-            IBUS_KEY_ESCAPE => {
-                self.cancel_conversion(emitter).await?;
-                Ok(true)
-            }
-            // Backspace → cancel conversion, return to preedit (Mozc parity).
-            // Without this arm, Backspace fell through to the outer function
-            // key handler as a "non-printable, consumed silently" key —
-            // conversion mode stayed active and the user had to press
-            // Escape to actually cancel. Fable 5 tagged [6] as Fcitx5-only,
-            // but IBus had the equivalent silently-eaten variant.
-            IBUS_KEY_BACKSPACE => {
-                self.cancel_conversion(emitter).await?;
-                Ok(true)
-            }
-            _ => Ok(false),
         }
+        match outcome.display {
+            DisplayUpdate::Unchanged => {}
+            DisplayUpdate::Cleared => {
+                let _ = Self::hide_preedit_text(emitter).await;
+                let _ = Self::hide_lookup_table(emitter).await;
+                let _ = Self::hide_auxiliary_text(emitter).await;
+            }
+            DisplayUpdate::Preedit(text) => {
+                self.send_preedit(emitter, &text).await?;
+            }
+            DisplayUpdate::Conversion => {
+                if let Some(state) = conversion {
+                    self.show_conversion_state(emitter, &state).await?;
+                }
+            }
+        }
+        if outcome.schedule_rerank_refresh {
+            self.spawn_rerank_refresh(emitter);
+        }
+        Ok(outcome.consumed)
     }
 
     /// Show the conversion state: segmented preedit + lookup table for focused segment.
@@ -956,82 +678,6 @@ impl BonolithEngine {
         });
     }
 
-    /// Convert the focused segment to katakana (F7/F8 during conversion mode).
-    async fn convert_focused_to_kana(
-        &self,
-        emitter: &SignalEmitter<'_>,
-        half: bool,
-    ) -> zbus::fdo::Result<bool> {
-        let conv = {
-            let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
-            if half {
-                engine.convert_focused_to_halfwidth_katakana().cloned()
-            } else {
-                engine.convert_focused_to_katakana().cloned()
-            }
-        };
-        if let Some(conv) = conv {
-            self.show_conversion_state(emitter, &conv).await?;
-        }
-        Ok(true)
-    }
-
-    /// Convert the focused segment to romaji (F9 during conversion mode).
-    async fn convert_focused_to_romaji(
-        &self,
-        emitter: &SignalEmitter<'_>,
-    ) -> zbus::fdo::Result<bool> {
-        let conv = {
-            let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
-            engine.convert_focused_to_romaji().cloned()
-        };
-        if let Some(conv) = conv {
-            self.show_conversion_state(emitter, &conv).await?;
-        }
-        Ok(true)
-    }
-
-    /// Convert the focused segment to full-width romaji (F10 during conversion mode).
-    async fn convert_focused_to_fullwidth_romaji(
-        &self,
-        emitter: &SignalEmitter<'_>,
-    ) -> zbus::fdo::Result<bool> {
-        let conv = {
-            let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
-            engine.convert_focused_to_fullwidth_romaji().cloned()
-        };
-        if let Some(conv) = conv {
-            self.show_conversion_state(emitter, &conv).await?;
-        }
-        Ok(true)
-    }
-
-    async fn commit_preedit(
-        &self,
-        emitter: &SignalEmitter<'_>,
-    ) -> zbus::fdo::Result<bool> {
-        let preedit = {
-            let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
-            let p = engine.preedit().to_string();
-            if p.is_empty() {
-                return Ok(false);
-            }
-            engine.commit(&p);
-            p
-        };
-
-        Self::commit_text(emitter, ibus_text(&preedit)).await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        Self::hide_preedit_text(emitter).await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        Self::hide_lookup_table(emitter).await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        Self::hide_auxiliary_text(emitter).await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-
-        Ok(true)
-    }
-
     async fn cancel_input(
         &self,
         emitter: &SignalEmitter<'_>,
@@ -1049,28 +695,6 @@ impl BonolithEngine {
         Self::hide_auxiliary_text(emitter).await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Ok(true)
-    }
-
-    async fn cancel_conversion(
-        &self,
-        emitter: &SignalEmitter<'_>,
-    ) -> zbus::fdo::Result<()> {
-        {
-            let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
-            engine.clear_conversion();
-        }
-        *self.converting.lock().unwrap_or_else(|e| e.into_inner()) = false;
-        let preedit = {
-            let engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
-            engine.preedit().to_string()
-        };
-        self.send_preedit(emitter, &preedit).await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        Self::hide_lookup_table(emitter).await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        Self::hide_auxiliary_text(emitter).await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        Ok(())
     }
 
     async fn send_preedit(
@@ -1508,28 +1132,4 @@ impl BonolithEngine {
             .spawn();
     }
 
-    async fn handle_backspace(
-        &self,
-        emitter: &SignalEmitter<'_>,
-    ) -> zbus::fdo::Result<bool> {
-        let new_preedit = {
-            let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
-            if !engine.delete_last() {
-                return Ok(false);
-            }
-            engine.preedit().to_string()
-        };
-
-        if new_preedit.is_empty() {
-            Self::hide_preedit_text(emitter).await
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-            Self::hide_lookup_table(emitter).await
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-            Self::hide_auxiliary_text(emitter).await
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        } else {
-            self.send_preedit(emitter, &new_preedit).await?;
-        }
-        Ok(true)
-    }
 }

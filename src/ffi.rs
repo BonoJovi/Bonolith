@@ -13,6 +13,9 @@ use std::ptr;
 use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::core::dictionary::{DictionaryEntry, PartOfSpeech};
+use crate::engine::dispatch::{
+    self, dispatch_key, KeyEvent, KEY_F10, KEY_F6, KEY_F7, KEY_F8, KEY_F9,
+};
 use crate::engine::{ConversionEngine, SharedCore};
 
 /// Acquire a write lock, unpoisoning on the fly. Poisoning happens when a
@@ -48,29 +51,6 @@ where
         }
     }
 }
-
-// X11 keysym values (shared by IBus and Fcitx5)
-const KEY_SPACE: u32 = 0x0020;
-const KEY_TAB: u32 = 0xFF09;
-const KEY_RETURN: u32 = 0xFF0D;
-const KEY_ESCAPE: u32 = 0xFF1B;
-const KEY_BACKSPACE: u32 = 0xFF08;
-const KEY_UP: u32 = 0xFF52;
-const KEY_DOWN: u32 = 0xFF54;
-const KEY_LEFT: u32 = 0xFF51;
-const KEY_RIGHT: u32 = 0xFF53;
-const KEY_PAGE_UP: u32 = 0xFF55;
-const KEY_PAGE_DOWN: u32 = 0xFF56;
-const KEY_F6: u32 = 0xFFC3;
-const KEY_F7: u32 = 0xFFC4;
-const KEY_F8: u32 = 0xFFC5;
-const KEY_F9: u32 = 0xFFC6;
-const KEY_F10: u32 = 0xFFC7;
-
-const SHIFT_MASK: u32 = 1 << 0;
-const CONTROL_MASK: u32 = 1 << 2;
-const MOD1_MASK: u32 = 1 << 3; // Alt
-const RELEASE_MASK: u32 = 1 << 30;
 
 /// Maximum number of segments in a conversion.
 const MAX_SEGMENTS: usize = 32;
@@ -128,25 +108,6 @@ pub struct BonolithContext {
     cache_candidates: Vec<CString>,
 }
 
-/// Full-width punctuation/digit mapping. Delegates to the shared table in
-/// `core::romaji::to_fullwidth_char` so the Fcitx5, IBus, and F9 paths all
-/// agree on which characters convert (previously three drifting copies).
-///
-/// Excludes characters the romaji converter owns (a-z, A-Z, `'` for the
-/// n'-disambiguation trick, `-` for long-vowel input, ` ` as a bunsetsu
-/// delimiter) — those go through `ctx.engine.process_key(ch)` instead of
-/// landing in the preedit as full-width symbols.
-fn to_fullwidth(ch: char) -> Option<String> {
-    if ch.is_ascii_alphabetic() || matches!(ch, '\'' | '-' | ' ') {
-        return None;
-    }
-    crate::core::romaji::to_fullwidth_char(ch).map(|c| c.to_string())
-}
-
-fn is_printable_ascii(keyval: u32) -> bool {
-    (0x0020..=0x007E).contains(&keyval)
-}
-
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
@@ -175,8 +136,14 @@ pub unsafe extern "C" fn bonolith_context_free(ctx: *mut BonolithContext) {
 
 /// Process a key event. Returns true if the key was consumed.
 ///
-/// After calling this, use bonolith_poll_commit() to check for committed text,
-/// and bonolith_get_preedit() / bonolith_is_converting() / bonolith_*() for UI state.
+/// All key ladder logic (Tab, F6-F10, Space, arrows, printables, etc.)
+/// lives in [`crate::engine::dispatch::dispatch_key`] and is shared with
+/// the IBus frontend. This function handles only the Fcitx5-specific
+/// release policy (consume F6-F10 releases so GTK doesn't open menus)
+/// then delegates.
+///
+/// After calling this, use bonolith_poll_commit() / bonolith_get_ui_state()
+/// to read the fresh state — the dispatcher already mutated the engine.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_handle_key(
     ctx: *mut BonolithContext,
@@ -185,14 +152,10 @@ pub unsafe extern "C" fn bonolith_handle_key(
 ) -> bool {
     let ctx = unsafe { &mut *ctx };
 
-    // Consume releases for function keys (F6–F10) when preedit is active,
-    // to prevent GTK apps from opening menus on F10 release.
-    if state & RELEASE_MASK != 0 {
-        if (keyval == KEY_F6
-            || keyval == KEY_F7
-            || keyval == KEY_F8
-            || keyval == KEY_F9
-            || keyval == KEY_F10)
+    // Consume releases for F6–F10 while composing so GTK apps don't open
+    // menus on F10-release. All other releases pass through.
+    if state & dispatch::RELEASE_MASK != 0 {
+        if matches!(keyval, KEY_F6 | KEY_F7 | KEY_F8 | KEY_F9 | KEY_F10)
             && (!ctx.engine.preedit().is_empty() || ctx.converting)
         {
             return true;
@@ -200,210 +163,14 @@ pub unsafe extern "C" fn bonolith_handle_key(
         return false;
     }
 
-    // Pass through Ctrl/Alt combos
-    if state & (CONTROL_MASK | MOD1_MASK) != 0 {
-        return false;
+    let event = KeyEvent { keyval, state };
+    let outcome = dispatch_key(&mut ctx.engine, &mut ctx.converting, event);
+    if let Some(text) = outcome.commit {
+        ctx.pending_commit = Some(text);
     }
-
-    let has_shift = state & SHIFT_MASK != 0;
-
-    // Tab while a preedit/conversion is active → commit current text and
-    // consume the key (return true). Focus does NOT move: this matches the
-    // standard Japanese IME convention (Mozc / Google IME / ATOK), where Tab
-    // during composition is an IME key, not a focus-navigation key. When
-    // nothing is composing we return false so Tab works normally. Both engines
-    // consume Tab here, so IBus and Fcitx5 stay consistent instead of diverging
-    // on framework preedit defaults.
-    if keyval == KEY_TAB {
-        if ctx.converting {
-            if let Some(text) = ctx.engine.commit_conversion() {
-                ctx.pending_commit = Some(text);
-            }
-            ctx.converting = false;
-            return true;
-        }
-        let preedit = ctx.engine.preedit();
-        if !preedit.is_empty() {
-            ctx.engine.commit(&preedit);
-            ctx.pending_commit = Some(preedit);
-            return true;
-        }
-        return false;
-    }
-
-    // F6 → hiragana
-    //
-    // F6-F10 are always consumed while Bonolith is the active IM
-    // (bonolith_handle_key is only entered in that case). Returning false
-    // for an empty-preedit F-key leaked the raw keysym to the host, where
-    // a terminal turned e.g. F7 into `\e[18~` and the trailing tilde
-    // appeared as input. Only the `converting=true` latch is gated —
-    // that flag must not go on when there is no reading to convert,
-    // otherwise a subsequent Space is silently swallowed by
-    // cycle_candidate's no-op.
-    if keyval == KEY_F6 {
-        if ctx.converting {
-            ctx.engine.convert_focused_to_hiragana();
-        } else if ctx.engine.start_kana_conversion(0).is_some() {
-            ctx.converting = true;
-        }
-        return true;
-    }
-
-    // F7 → katakana, F8 → half-width katakana, F9 → full-width romaji, F10 → half-width romaji
-    if keyval == KEY_F7 || keyval == KEY_F8 || keyval == KEY_F9 || keyval == KEY_F10 {
-        let form = match keyval {
-            KEY_F8 => 2,
-            KEY_F9 => 4,
-            KEY_F10 => 3,
-            _ => 1,
-        };
-        if ctx.converting {
-            match keyval {
-                KEY_F8 => { ctx.engine.convert_focused_to_halfwidth_katakana(); }
-                KEY_F9 => { ctx.engine.convert_focused_to_fullwidth_romaji(); }
-                KEY_F10 => { ctx.engine.convert_focused_to_romaji(); }
-                _ => { ctx.engine.convert_focused_to_katakana(); }
-            }
-        } else if ctx.engine.start_kana_conversion(form).is_some() {
-            ctx.converting = true;
-        }
-        return true;
-    }
-
-    // Conversion mode key handling
-    if ctx.converting {
-        return handle_conversion_key(ctx, keyval, has_shift);
-    }
-
-    // Space → start conversion
-    if keyval == KEY_SPACE {
-        if ctx.engine.start_conversion().is_some() {
-            ctx.converting = true;
-            return true;
-        }
-        return false;
-    }
-
-    // Enter → commit preedit as-is
-    if keyval == KEY_RETURN {
-        let preedit = ctx.engine.preedit();
-        if preedit.is_empty() {
-            return false;
-        }
-        ctx.engine.commit(&preedit);
-        ctx.pending_commit = Some(preedit);
-        return true;
-    }
-
-    // Escape → cancel input, but only consume if there was actually something
-    // to cancel. Swallowing Esc unconditionally would eat vim's mode exit and
-    // dialog-close Esc while Bonolith is active (IBus side already checks
-    // similarly on Tab/Enter).
-    if keyval == KEY_ESCAPE {
-        if ctx.converting || !ctx.engine.preedit().is_empty() {
-            ctx.engine.reset();
-            ctx.engine.clear_conversion();
-            ctx.converting = false;
-            return true;
-        }
-        return false;
-    }
-
-    // Backspace — consume if there was anything to delete
-    if keyval == KEY_BACKSPACE {
-        return ctx.engine.delete_last();
-    }
-
-    // Arrow/navigation keys → consume if preedit active, pass through otherwise
-    if matches!(keyval, KEY_LEFT | KEY_RIGHT | KEY_UP | KEY_DOWN | KEY_PAGE_UP | KEY_PAGE_DOWN) {
-        return !ctx.engine.preedit().is_empty();
-    }
-
-    // Symbol/punctuation → full-width
-    if is_printable_ascii(keyval) {
-        if let Some(ch) = char::from_u32(keyval) {
-            if let Some(fw) = to_fullwidth(ch) {
-                ctx.engine.append_raw(&fw);
-                return true;
-            }
-            // Alphabetic → romaji input
-            if ch.is_ascii_alphabetic() || ch == '-' || ch == '\'' {
-                ctx.engine.process_key(ch.to_ascii_lowercase());
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
-/// Handle keys during conversion mode. Returns true if consumed.
-fn handle_conversion_key(ctx: &mut BonolithContext, keyval: u32, has_shift: bool) -> bool {
-    match keyval {
-        KEY_SPACE | KEY_DOWN => {
-            ctx.engine.cycle_candidate(1);
-            true
-        }
-        KEY_UP => {
-            ctx.engine.cycle_candidate(-1);
-            true
-        }
-        KEY_RIGHT => {
-            if has_shift {
-                ctx.engine.resize_segment(1);
-            } else {
-                ctx.engine.move_focus(1);
-            }
-            true
-        }
-        KEY_LEFT => {
-            if has_shift {
-                ctx.engine.resize_segment(-1);
-            } else {
-                ctx.engine.move_focus(-1);
-            }
-            true
-        }
-        KEY_RETURN => {
-            if let Some(text) = ctx.engine.commit_conversion() {
-                ctx.pending_commit = Some(text);
-            }
-            ctx.converting = false;
-            true
-        }
-        KEY_ESCAPE => {
-            ctx.engine.clear_conversion();
-            ctx.converting = false;
-            true
-        }
-        // Backspace during conversion → cancel back to preedit (Mozc parity).
-        // Without this arm the key falls through `_ => false`, so the host
-        // app receives the Backspace and deletes a character of already-
-        // committed text. The IBus side already consumes it.
-        KEY_BACKSPACE => {
-            ctx.engine.clear_conversion();
-            ctx.converting = false;
-            true
-        }
-        _ if is_printable_ascii(keyval) => {
-            // Commit conversion first, then process the new character
-            if let Some(text) = ctx.engine.commit_conversion() {
-                ctx.pending_commit = Some(text);
-            }
-            ctx.converting = false;
-            // Process the incoming character (punctuation, letter, etc.)
-            if let Some(ch) = char::from_u32(keyval) {
-                if let Some(fw) = to_fullwidth(ch) {
-                    ctx.engine.append_raw(&fw);
-                } else if ch.is_ascii_alphabetic() || ch == '-' || ch == '\'' {
-                    ctx.engine.process_key(ch.to_ascii_lowercase());
-                }
-            }
-            true
-        }
-        _ => false,
-    }
+    // DisplayUpdate / schedule_rerank_refresh are consumed by IBus only;
+    // the Fcitx5 client polls bonolith_get_ui_state / _poll_apply_rerank.
+    outcome.consumed
 }
 
 // ── State queries ────────────────────────────────────────────────────────────
