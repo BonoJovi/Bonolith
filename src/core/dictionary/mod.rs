@@ -1223,14 +1223,18 @@ impl Dictionary {
             ("ひだり", &["←", "⇐"]),
             ("うえ", &["↑", "⇑"]),
             ("した", &["↓", "⇓"]),
-            ("まる", &["○", "◎", "●", "◯"]),
             ("さんかく", &["△", "▲", "▽", "▼"]),
             ("しかく", &["□", "■", "◇", "◆"]),
             ("ほし", &["☆", "★"]),
             ("こめ", &["※"]),
             ("から", &["〜", "～"]),
             ("てん", &["・", "…", "‥", "、"]),
-            ("まる", &["。", "○", "◎", "●"]),
+            // "まる" used to appear twice — one row for the shape group
+            // (○◎●◯), one adding 。 to the front — so lookup returned
+            // ○/◎/● at two frequency tiers each. Merge into one row with
+            // 。 first (the sentence terminator is the more common intent
+            // in Japanese text) followed by the shape variants.
+            ("まる", &["。", "○", "◎", "●", "◯"]),
             ("かっこ", &["「」", "「", "」", "『』", "『", "』", "【】", "【", "】", "（）", "（", "）", "〔〕", "［］", "｛｝", "〈〉", "《》"]),
             ("かぎかっこ", &["「」", "「", "」", "『』", "『", "』"]),
             ("すみかっこ", &["【】", "【", "】"]),
