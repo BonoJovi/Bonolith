@@ -492,11 +492,29 @@ impl Dictionary {
     ///
     /// Applied only to segments the DP judged as one word (via a single
     /// dict entry) — segments the DP already split remain untouched.
+    ///
+    /// The dominant-POS gate is critical. Without it, everyday 2-char
+    /// content words that happen to start with a strong Particle kana
+    /// (にく 肉 / はし 橋 / とき 時 / とち 土地 / のど 喉 / にわ 庭 /
+    /// とし 年 …) get shredded into 助詞+単漢字 pairs — にく→に+苦,
+    /// はし→は+市, とき→と+気, とち→と+血 — and the subsequent
+    /// Noun+Particle merge with the next segment fuses the orphaned tail
+    /// (く/し/き/ち) with the following particle so the original content
+    /// word can no longer be recovered from ANY parse. The DP only keeps
+    /// a 2-char reading whole via a tail-Suffix win when the segment's
+    /// dominant candidate is a Suffix (がき: 書き Suffix 4400 tops 餓鬼
+    /// Noun 4353 through PRIORITY_OVERRIDES); everyday Noun-dominant
+    /// segments were kept whole for the right reason and must not be
+    /// touched here.
     fn split_particle_head_segments(&self, segs: Vec<Segment>) -> Vec<Segment> {
         let mut out: Vec<Segment> = Vec::with_capacity(segs.len());
         for seg in segs {
             let chars: Vec<char> = seg.reading.chars().collect();
             if chars.len() != 2 {
+                out.push(seg);
+                continue;
+            }
+            if !matches!(Self::dominant_pos(&seg), Some(PartOfSpeech::Suffix)) {
                 out.push(seg);
                 continue;
             }
@@ -2003,6 +2021,48 @@ mod tests {
             assert!(
                 joined.contains(&"ものが") && joined.contains(&"きに"),
                 "{reading}: expected ものが/きに bunsetsu, got {joined:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn everyday_two_char_nouns_survive_particle_head_split() {
+        // Regression (bug_list_fable_5_review_2026-08-28 #1): the
+        // Particle-head gate over-fired on any 2-char reading whose
+        // first kana was a strong Particle (と/に/は/の …), shredding
+        // にく→に+苦, はし→は+市, とき→と+気, とち→と+血 and — once
+        // the orphaned tail fused with the next Particle via Noun+
+        // Particle merge — dropping 肉/橋/時/土地 from every parse.
+        // The dominant-POS gate keeps these Noun-dominant segments
+        // intact; only tail-Suffix-dominant readings (がき) still split.
+        let dict = Dictionary::new();
+        for (reading, want_substring) in [
+            ("にくをたべる", "肉"),
+            ("はしをわたる", "橋"),
+            ("ときがきた", "時"),
+            ("とちをかう", "土地"),
+            ("のどがいたい", "喉"),
+            ("にわをみる", "庭"),
+        ] {
+            let segs = dict.segment(reading);
+            let joined: Vec<&str> =
+                segs.iter().map(|s| s.reading.as_str()).collect();
+            // The critical property is *reachability*: the correct
+            // content-word kanji must live somewhere in some segment's
+            // candidate list. Before the fix the wrong segmentation
+            // dropped 肉/橋/時/土地/喉/庭 from every parse. Which slot
+            // it occupies is a separate ranking concern.
+            let mut reachable = false;
+            for s in &segs {
+                if s.candidates.iter().any(|e| e.surface.contains(want_substring)) {
+                    reachable = true;
+                    break;
+                }
+            }
+            assert!(
+                reachable,
+                "{reading}: expected {want_substring:?} to be reachable \
+                 in some segment's candidates, got segments {joined:?}",
             );
         }
     }
