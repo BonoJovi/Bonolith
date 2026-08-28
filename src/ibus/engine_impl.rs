@@ -701,6 +701,23 @@ impl BonolithEngine {
             engine.clear_conversion();
         }
         *self.converting.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        // Every preedit we display is mode=1 (PREEDIT_COMMIT), so calling
+        // hide_preedit_text directly triggers the client's auto-commit of
+        // whatever preedit text was last shown — the exact opposite of
+        // "cancel". Neutralise with an empty mode=0 preedit first, mirroring
+        // apply_outcome's DisplayUpdate::Cleared / commit branch. Without
+        // this, Muhenkan / toggle-off / reset / disable while a preedit
+        // ("きょう") or conversion ("京都") is on screen silently inserts
+        // it into the client.
+        if let Err(e) = Self::update_preedit_text(
+            emitter,
+            ibus_text(""),
+            0,
+            false,
+            0,
+        ).await {
+            warn!("Bonolith: cancel_input preedit neutralise failed: {}", e);
+        }
         Self::hide_preedit_text(emitter).await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Self::hide_lookup_table(emitter).await
