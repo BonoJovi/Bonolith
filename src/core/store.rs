@@ -517,7 +517,21 @@ impl DictStore {
         let mut out = HashMap::new();
         for row in rows {
             let (kana, boundaries) = row.map_err(sqlite_to_io)?;
-            out.insert(kana, decode_boundaries(&boundaries));
+            // Silently drop rows whose boundaries don't parse cleanly.
+            // Without this the old `filter_map` turned "3,x,6" into [3,6],
+            // which then passed engine-side monotonicity checks and got
+            // applied as a plausible-but-wrong learned layout. Falling
+            // back to no entry means the DP segmenter runs — the safe
+            // default when persisted state is corrupt.
+            if let Some(bs) = decode_boundaries(&boundaries) {
+                out.insert(kana, bs);
+            } else {
+                log::warn!(
+                    "Discarding corrupt learned segmentation for '{}': {:?}",
+                    kana,
+                    boundaries,
+                );
+            }
         }
         Ok(out)
     }
@@ -539,11 +553,17 @@ fn encode_boundaries(boundaries: &[usize]) -> String {
         .join(",")
 }
 
-fn decode_boundaries(s: &str) -> Vec<usize> {
+/// Decode a comma-separated boundary list, all-or-nothing. Returns
+/// `None` if any token fails to parse — the caller must then treat the
+/// row as absent rather than salvaging the parseable tokens. Salvage
+/// would produce a *plausible* boundary list ("3,x,6" → [3,6]) that
+/// passes engine-side range / monotonicity checks and gets applied as
+/// if it were correct, silently corrupting the user's learned layout.
+fn decode_boundaries(s: &str) -> Option<Vec<usize>> {
     if s.is_empty() {
-        return Vec::new();
+        return Some(Vec::new());
     }
-    s.split(',').filter_map(|p| p.parse().ok()).collect()
+    s.split(',').map(|p| p.parse().ok()).collect()
 }
 
 fn read_legacy_dict_json(path: &Path) -> io::Result<Vec<DictionaryEntry>> {
@@ -620,6 +640,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("dict.sqlite")
+    }
+
+    /// Regression [24]: a corrupt row in user_segmentations must be
+    /// dropped whole rather than salvaged into a plausible-but-wrong
+    /// boundary list. Before the fix, "3,x,6" collapsed to [3,6] via
+    /// filter_map — engine-side monotonicity / range checks then passed
+    /// and the wrong layout got re-applied every time the user typed
+    /// that kana.
+    #[test]
+    fn decode_boundaries_is_all_or_nothing() {
+        assert_eq!(decode_boundaries(""), Some(Vec::<usize>::new()));
+        assert_eq!(decode_boundaries("2,5"), Some(vec![2, 5]));
+        // Any unparseable token invalidates the whole list.
+        assert_eq!(decode_boundaries("3,x,6"), None);
+        assert_eq!(decode_boundaries("x"), None);
+        assert_eq!(decode_boundaries("2,,5"), None);
     }
 
     #[test]
