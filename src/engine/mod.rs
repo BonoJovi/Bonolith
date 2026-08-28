@@ -12,6 +12,7 @@ use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::core::{
     dictionary::{connection_cost, Dictionary, DictionaryEntry, PartOfSpeech, Segment},
@@ -847,9 +848,36 @@ impl ConversionEngine {
                 // has deliberately reinforced a reading, while a single
                 // selection only nudges near-ties.
                 const USER_LEARNING_WEIGHT: f64 = 0.5;
+                // Wall-clock cap on the whole rerank pass. Per-request
+                // timeouts already bound each HTTP call at 1.5 s, but a
+                // multi-segment conversion (say 5 segments × 5 candidates)
+                // would amplify that to 37.5 s of a bg thread holding
+                // the LLM lock — long enough that the *next* keystroke's
+                // rerank waits behind it. Match the frontend's own poll
+                // budget (~2 s in IBus spawn_rerank_refresh / Fcitx5
+                // scheduleRerankRefresh) so we never linger past what
+                // the UI is willing to wait for. When the deadline
+                // passes we keep remaining segments in original
+                // candidate order (partial rerank) rather than dropping
+                // them — dictionary-derived candidates are still valid.
+                const RERANK_TOTAL_BUDGET: Duration = Duration::from_millis(1800);
+                let deadline = Instant::now() + RERANK_TOTAL_BUDGET;
                 let mut reranked_segments: Vec<(String, Vec<String>)> = Vec::new();
 
                 for (reading, candidates) in &seg_info {
+                    if Instant::now() >= deadline {
+                        log::debug!(
+                            "LLM rerank budget spent ({}ms) — segment '{}' and remaining kept in original order",
+                            RERANK_TOTAL_BUDGET.as_millis(),
+                            reading,
+                        );
+                        preceding_text.push_str(&candidates[0].0);
+                        reranked_segments.push((
+                            reading.clone(),
+                            candidates.iter().map(|(s, _)| s.clone()).collect(),
+                        ));
+                        continue;
+                    }
                     if candidates.len() > 1 && reading.chars().count() >= 2 {
                         let rerank_count = candidates.len().min(LLM_RERANK_TOP_N);
                         // Context = committed text + preceding segments' chosen candidates
@@ -2090,5 +2118,80 @@ mod tests {
         // The fallback path uses the kana + lowercase pending buffer.
         // Just verify it doesn't panic and returns something non-empty.
         assert!(!state.composed_text().is_empty());
+    }
+
+    /// Background rerank must honour the wall-clock budget so a slow LLM
+    /// server can't amplify per-request timeouts across N segments into
+    /// a multi-second bg thread holding the LLM lock. With a mock scorer
+    /// that sleeps 400 ms per call, a multi-segment reading of
+    /// "amegafuru" would (5 candidates × 3 segments × 400 ms = 6 s)
+    /// blow past the 1800 ms budget; the pass must finish by ~2 s and
+    /// still deliver a usable (possibly partial) result.
+    #[test]
+    fn rerank_respects_wall_clock_budget() {
+        use crate::core::llm::LlmScorer;
+        use std::time::{Duration, Instant};
+
+        struct SlowScorer;
+        impl LlmScorer for SlowScorer {
+            fn score(&self, _context: &str, _candidate: &str) -> f64 {
+                std::thread::sleep(Duration::from_millis(400));
+                0.5
+            }
+            fn warm_cache(&self, _context: &str) {}
+        }
+
+        let mut engine =
+            ConversionEngine::with_shared(SharedCore::new_eval(Box::new(SlowScorer)));
+        for ch in "amegafuru".chars() {
+            engine.process_key(ch);
+        }
+        let start = Instant::now();
+        engine.start_conversion();
+
+        // Poll for the rerank to land. Budget is 1800 ms + one in-flight
+        // segment's slop (up to ~5 * 400 ms = 2 s). Give the poll loop
+        // 5 s of headroom before we call it a hang.
+        let deadline = start + Duration::from_secs(5);
+        while !engine.has_llm_rerank_result() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            engine.has_llm_rerank_result(),
+            "rerank never completed within 5 s (elapsed {}ms)",
+            elapsed.as_millis(),
+        );
+        // Wall-clock cap is 1800 ms + one segment slop; 4 s is a very
+        // loose upper bound that still catches the "amplification with
+        // no budget at all" regression (would be ~6 s here).
+        assert!(
+            elapsed < Duration::from_millis(4000),
+            "rerank exceeded budget: {}ms",
+            elapsed.as_millis(),
+        );
+
+        // Partial result is still fully-shaped (every segment present,
+        // in the same order) so `apply_llm_rerank` will accept it.
+        let live_segs: Vec<String> = engine
+            .conversion_state()
+            .unwrap()
+            .segments
+            .iter()
+            .map(|s| s.reading.clone())
+            .collect();
+        let result = engine
+            .llm_rerank_result
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let result = result.as_ref().expect("result should be populated");
+        assert_eq!(
+            result.len(),
+            live_segs.len(),
+            "partial result must still cover every segment",
+        );
+        for (i, (reading, _)) in result.iter().enumerate() {
+            assert_eq!(reading, &live_segs[i]);
+        }
     }
 }
