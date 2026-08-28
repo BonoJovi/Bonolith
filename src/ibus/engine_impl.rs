@@ -667,7 +667,9 @@ impl BonolithEngine {
             }
 
             // Apply and snapshot the refreshed state under one lock. Skip if the
-            // user already left conversion mode (committed / cancelled).
+            // user already left conversion mode (committed / cancelled). Also
+            // capture the rerank generation so we can bail before the emit if
+            // a commit / cancel bumps it between locks.
             let refreshed = {
                 if !*converting.lock().unwrap_or_else(|e| e.into_inner()) {
                     return;
@@ -676,16 +678,29 @@ impl BonolithEngine {
                 if !engine.apply_llm_rerank() {
                     return;
                 }
-                engine.conversion_state().cloned()
+                let state = engine.conversion_state().cloned();
+                let epoch = engine.rerank_generation();
+                state.map(|s| (s, epoch))
             };
 
-            if let Some(state) = refreshed {
-                // Re-check converting after the await-free section; harmless race
-                // at worst repaints a still-valid panel.
-                if *converting.lock().unwrap_or_else(|e| e.into_inner()) {
-                    if let Err(e) = Self::emit_conversion_state(&emitter, &state).await {
-                        debug!("Bonolith: rerank refresh emit failed: {e}");
+            if let Some((state, emit_gen)) = refreshed {
+                // Between the lock drop above and the D-Bus emit below, the
+                // key handler may commit or cancel the conversion. Emitting
+                // afterwards leaves a mode=1 ghost preedit that IBus auto-
+                // commits on focus loss (duplicate insertion). Re-check
+                // converting AND the rerank generation as a single guard —
+                // any invalidation bumps the generation, so a mismatch means
+                // the snapshot above is already stale.
+                {
+                    let engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                    if !*converting.lock().unwrap_or_else(|e| e.into_inner())
+                        || engine.rerank_generation() != emit_gen
+                    {
+                        return;
                     }
+                }
+                if let Err(e) = Self::emit_conversion_state(&emitter, &state).await {
+                    debug!("Bonolith: rerank refresh emit failed: {e}");
                 }
             }
         });

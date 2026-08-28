@@ -9,7 +9,7 @@
 ///       → LLM rerank → candidate list → user selects → commit
 
 use std::io::Write as _;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -341,8 +341,19 @@ pub struct ConversionEngine {
     shared: Arc<SharedCore>,
     /// Active conversion state (None when not converting)
     conversion: Option<ConversionState>,
-    /// Background LLM reranking result (populated asynchronously)
-    llm_rerank_result: Arc<Mutex<Option<LlmRerankResult>>>,
+    /// Background LLM reranking result (populated asynchronously), tagged
+    /// with the rerank generation of the pass that produced it. `apply_llm_rerank`
+    /// drops the result if the tag doesn't match the current generation
+    /// (a newer trigger / commit / cancel has invalidated it).
+    llm_rerank_result: Arc<Mutex<Option<(u64, LlmRerankResult)>>>,
+    /// Monotonically increasing "rerank epoch". Bumped on every event that
+    /// invalidates an in-flight rerank pass (trigger, commit, cancel/clear).
+    /// Workers capture the generation at spawn and gate their result-store /
+    /// panic-recovery on it still matching, so a stale worker cannot poison
+    /// the slot or clear the inflight flag for a newer pass. Frontends can
+    /// snapshot it around the emit path to skip a repaint whose data no
+    /// longer represents the live conversion (see the ibus refresh task).
+    rerank_generation: Arc<AtomicU64>,
     /// True from when a background rerank is triggered until its result is
     /// applied. Frontends poll this to know whether to wait for a refresh.
     rerank_inflight: Arc<AtomicBool>,
@@ -365,6 +376,7 @@ impl ConversionEngine {
             shared,
             conversion: None,
             llm_rerank_result: Arc::new(Mutex::new(None)),
+            rerank_generation: Arc::new(AtomicU64::new(0)),
             rerank_inflight: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -776,6 +788,11 @@ impl ConversionEngine {
     /// Clear conversion state (on commit or cancel).
     pub fn clear_conversion(&mut self) {
         self.conversion = None;
+        // Any in-flight rerank now belongs to a conversation the user has
+        // walked away from. Bump the epoch so its result / panic path can't
+        // touch the slot or clear inflight for a *later* pass, and clear the
+        // slot + inflight so a follow-up refresh task exits its poll loop.
+        self.invalidate_rerank_state();
     }
 
     /// Convert the focused segment's reading to half-width romaji (F10 during conversion mode).
@@ -841,6 +858,10 @@ impl ConversionEngine {
             Err(_) => log::debug!("LLM lock busy during commit, skipping context update"),
         }
         self.romaji.reset();
+        // Retire any in-flight rerank pass so a late-arriving worker cannot
+        // repaint over the just-committed (hidden) preedit — a mode=1
+        // ghost that would auto-commit on focus loss = duplicate insertion.
+        self.invalidate_rerank_state();
         Some(text)
     }
 
@@ -943,6 +964,13 @@ impl ConversionEngine {
         // it — otherwise `rerank_inflight` stays latched and the frontend
         // wastes ~2 s polling for a result that will never arrive.
         let inflight = self.rerank_inflight.clone();
+        let generation = self.rerank_generation.clone();
+
+        // Bump the rerank epoch: this is a new pass, and any earlier pass's
+        // late-arriving result / panic must not touch our slot or inflight
+        // flag. Capture the fresh generation into the worker so it can gate
+        // its slot-store and panic path on the pass still being current.
+        let my_gen = generation.fetch_add(1, Ordering::AcqRel) + 1;
 
         // Clear previous result and mark a pass in flight (cleared when applied).
         *result_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -1044,10 +1072,39 @@ impl ConversionEngine {
                 reranked_segments
             }));
 
+            // Gate slot-store and panic-recovery on the pass still being
+            // current. Without this check, an old worker that outlived its
+            // trigger could either (a) overwrite a newer pass's result in
+            // the slot (later discarded by the alignment guard, leaving
+            // `rerank_inflight` latched at true), or (b) clear
+            // `rerank_inflight` on panic while a newer pass is still
+            // running — the frontend then stops polling and misses the
+            // valid result.
+            let current_gen = generation.load(Ordering::Acquire);
+            if current_gen != my_gen {
+                log::debug!(
+                    "LLM rerank pass {} superseded by {} — dropping result",
+                    my_gen,
+                    current_gen,
+                );
+                return;
+            }
             match result {
                 Ok(reranked) => {
-                    *result_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(reranked);
-                    log::info!("LLM background reranking complete");
+                    let mut slot = result_slot.lock().unwrap_or_else(|e| e.into_inner());
+                    // Re-check under the slot lock: a trigger could have fired
+                    // between the load above and here. Tagging the result with
+                    // `my_gen` lets `apply_llm_rerank` drop it silently if it
+                    // has been superseded before the frontend picks it up.
+                    if generation.load(Ordering::Acquire) == my_gen {
+                        *slot = Some((my_gen, reranked));
+                        log::info!("LLM background reranking complete");
+                    } else {
+                        log::debug!(
+                            "LLM rerank pass {} superseded before store — dropping result",
+                            my_gen,
+                        );
+                    }
                 }
                 Err(_) => {
                     log::warn!("LLM background reranking panicked, discarding results");
@@ -1069,12 +1126,26 @@ impl ConversionEngine {
             slot.take()
         };
 
-        let reranked = match reranked {
+        let (result_gen, reranked) = match reranked {
             // No result yet — leave `rerank_inflight` set so the frontend keeps
             // polling for the pass that is still running.
-            Some(r) => r,
+            Some(pair) => pair,
             None => return false,
         };
+
+        // Drop a result whose pass has been superseded by a newer trigger /
+        // commit / cancel. `rerank_inflight` here belongs to whichever pass is
+        // current — leave it alone so the frontend keeps polling for that one
+        // (or the invalidation already cleared it).
+        let current_gen = self.rerank_generation.load(Ordering::Acquire);
+        if result_gen != current_gen {
+            log::debug!(
+                "Discarding superseded LLM rerank result (gen {} vs current {})",
+                result_gen,
+                current_gen,
+            );
+            return false;
+        }
 
         let state = match self.conversion.as_mut() {
             Some(s) => s,
@@ -1085,20 +1156,18 @@ impl ConversionEngine {
             }
         };
 
-        // Reject a stale result whose segmentation no longer matches the live
-        // conversion. Background passes from before a resize / commit can finish
-        // late and be grabbed by a still-polling refresh task; applying their
-        // candidate lists positionally onto a changed bunsetsu layout corrupts
-        // the display (dropped or duplicated segments). Require a segment-for-
-        // segment reading match; on mismatch, drop it and leave the pass marked
-        // in flight so the frontend keeps waiting for the matching result.
+        // Defensive: with the generation gate above, a mismatched segmentation
+        // shouldn't reach here (any state change that alters bunsetsu
+        // boundaries bumps the generation). Keep the alignment check as a
+        // safety net; a mismatch now means an assumption above is wrong, not
+        // that the pass merely predates a resize.
         let aligned = reranked.len() == state.segments.len()
             && reranked
                 .iter()
                 .zip(state.segments.iter())
                 .all(|((reading, _), seg)| *reading == seg.reading);
         if !aligned {
-            log::debug!("Discarding stale LLM rerank result (segmentation changed)");
+            log::debug!("Discarding LLM rerank result with mismatched segmentation");
             return false;
         }
 
@@ -1133,6 +1202,26 @@ impl ConversionEngine {
     /// waiting for a display refresh.
     pub fn rerank_inflight(&self) -> bool {
         self.rerank_inflight.load(Ordering::Relaxed)
+    }
+
+    /// Current rerank epoch. Frontends can snapshot this before scheduling a
+    /// refresh emit and re-check it right before repainting — a bump between
+    /// the two (from a commit / cancel that fired while the refresh was
+    /// polling) means the conversion is gone and the pending emit would leave
+    /// a mode=1 ghost preedit on screen.
+    pub fn rerank_generation(&self) -> u64 {
+        self.rerank_generation.load(Ordering::Acquire)
+    }
+
+    /// Bump the rerank epoch and clear the pending-result slot / inflight
+    /// flag. Called from commit / cancel paths so any late-arriving worker
+    /// result is dropped and the frontend stops polling for a pass that is
+    /// no longer meaningful. `trigger_llm_rerank` does the equivalent inline
+    /// (bump + clear slot) but leaves `inflight=true` for the new pass.
+    fn invalidate_rerank_state(&self) {
+        self.rerank_generation.fetch_add(1, Ordering::AcqRel);
+        *self.llm_rerank_result.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.rerank_inflight.store(false, Ordering::Relaxed);
     }
 
     /// LLM score to use for a candidate during reranking.
@@ -1704,10 +1793,16 @@ mod tests {
             .collect();
 
         // Inject a stale result whose readings don't match the live layout.
-        *engine.llm_rerank_result.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![(
-            "ZZ-bogus-reading".to_string(),
-            vec!["☃".to_string(), "☔".to_string()],
-        )]);
+        // Tag it with the current generation so the epoch gate lets it
+        // through — the alignment guard is what's under test here.
+        let cur_gen = engine.rerank_generation();
+        *engine.llm_rerank_result.lock().unwrap_or_else(|e| e.into_inner()) = Some((
+            cur_gen,
+            vec![(
+                "ZZ-bogus-reading".to_string(),
+                vec!["☃".to_string(), "☔".to_string()],
+            )],
+        ));
         engine.rerank_inflight.store(true, Ordering::Relaxed);
 
         assert!(
@@ -1729,6 +1824,105 @@ mod tests {
         assert_eq!(
             before, after,
             "candidates must be untouched by a stale rerank result",
+        );
+    }
+
+    /// Regression: a worker whose pass has been superseded (by a newer trigger
+    /// or by commit / cancel) must not have its result applied. Without the
+    /// generation gate, a late worker could overwrite a newer pass's slot; the
+    /// alignment guard would then discard it silently but leave `rerank_inflight`
+    /// latched at true, and the frontend would poll for a result that will
+    /// never arrive.
+    #[test]
+    fn apply_rerank_drops_result_from_superseded_pass() {
+        let mut engine = ConversionEngine::with_shared(SharedCore::new_hermetic());
+        for ch in "amegafuru".chars() {
+            engine.process_key(ch);
+        }
+        engine.start_conversion();
+
+        // Snapshot the current generation, then simulate a follow-up trigger
+        // that bumps it (as commit / cancel / resize would). A worker still
+        // holding the earlier `stale_gen` must not be applied.
+        let stale_gen = engine.rerank_generation();
+        let live_segs: Vec<String> = engine
+            .conversion_state()
+            .unwrap()
+            .segments
+            .iter()
+            .map(|s| s.reading.clone())
+            .collect();
+        engine.rerank_generation.fetch_add(1, Ordering::AcqRel);
+
+        // Inject the stale worker's result: readings match the live layout so
+        // only the generation gate can catch it.
+        let fake_result: LlmRerankResult = live_segs
+            .iter()
+            .map(|r| (r.clone(), vec![r.clone()]))
+            .collect();
+        *engine.llm_rerank_result.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((stale_gen, fake_result));
+        engine.rerank_inflight.store(true, Ordering::Relaxed);
+
+        assert!(
+            !engine.apply_llm_rerank(),
+            "a result tagged with a superseded generation must be dropped",
+        );
+        assert!(
+            engine.rerank_inflight(),
+            "dropping a superseded result must not clear inflight for the newer pass",
+        );
+    }
+
+    /// Regression: commit_conversion must invalidate any in-flight rerank so a
+    /// late worker's result cannot be applied to the (now-hidden) conversion.
+    /// Without this, the IBus rerank-refresh task would see a fresh result,
+    /// call `apply_llm_rerank`, and re-emit a mode=1 preedit — a ghost that
+    /// auto-commits on focus loss (duplicate insertion).
+    #[test]
+    fn commit_conversion_invalidates_inflight_rerank() {
+        let mut engine = ConversionEngine::with_shared(SharedCore::new_hermetic());
+        for ch in "amegafuru".chars() {
+            engine.process_key(ch);
+        }
+        engine.start_conversion();
+        assert!(engine.rerank_inflight(), "start_conversion arms inflight");
+        let pre_commit_gen = engine.rerank_generation();
+
+        // Freeze a snapshot of the segment readings so we can inject a result
+        // that would pass the alignment guard — only the generation gate (via
+        // commit_conversion's invalidate) should keep it out.
+        let live_segs: Vec<String> = engine
+            .conversion_state()
+            .unwrap()
+            .segments
+            .iter()
+            .map(|s| s.reading.clone())
+            .collect();
+
+        engine.commit_conversion().expect("commit succeeds");
+
+        assert!(
+            !engine.rerank_inflight(),
+            "commit must clear inflight so refresh tasks stop polling",
+        );
+        assert!(
+            engine.rerank_generation() > pre_commit_gen,
+            "commit must bump the rerank epoch",
+        );
+
+        // A worker for the pre-commit pass finishes late and drops its result
+        // into the slot. Apply must not touch anything.
+        let stale: LlmRerankResult = live_segs
+            .iter()
+            .map(|r| (r.clone(), vec![r.clone()]))
+            .collect();
+        *engine.llm_rerank_result.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((pre_commit_gen, stale));
+
+        assert!(
+            !engine.apply_llm_rerank(),
+            "a late pre-commit result must not be applied post-commit",
         );
     }
 
@@ -2449,12 +2643,13 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let result = result.as_ref().expect("result should be populated");
+        let segments = &result.1;
         assert_eq!(
-            result.len(),
+            segments.len(),
             live_segs.len(),
             "partial result must still cover every segment",
         );
-        for (i, (reading, _)) in result.iter().enumerate() {
+        for (i, (reading, _)) in segments.iter().enumerate() {
             assert_eq!(reading, &live_segs[i]);
         }
     }
