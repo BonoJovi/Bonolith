@@ -542,8 +542,18 @@ impl ConversionEngine {
     /// half-width romaji, and full-width romaji as candidates, and selects the one matching the requested form.
     /// form: 0 = hiragana, 1 = katakana, 2 = half-width katakana, 3 = half-width romaji, 4 = full-width romaji
     pub fn start_kana_conversion(&mut self, form: usize) -> Option<&ConversionState> {
+        // Capture pending romaji buffer (e.g. lone "m" from "vim") BEFORE
+        // flush drops it. `preedit()` already shows kana+buffer ("ゔぃm"),
+        // so the user expects the buffer chars to survive into every
+        // F-key form — most obviously F9/F10 where "vim" should round-
+        // trip to "ｖｉｍ"/"vim" instead of "ｖｉ"/"vi". Each converter
+        // (hiragana_to_katakana/_halfwidth_katakana/_romaji/_fullwidth_romaji)
+        // already passes non-kana chars through unchanged, so appending
+        // the buffer to the source string flows through cleanly.
+        let pending = self.romaji.buffer().to_string();
         self.romaji.flush();
-        let kana = self.romaji.output().to_string();
+        let mut kana = self.romaji.output().to_string();
+        kana.push_str(&pending);
         if kana.is_empty() {
             return None;
         }
@@ -1993,5 +2003,47 @@ mod tests {
         let state = state.unwrap();
         let composed = state.composed_text();
         assert_eq!(composed, "tesuto", "F10 should produce half-width romaji, got: {}", composed);
+    }
+
+    /// F9/F10 must preserve a lone trailing consonant sitting in the
+    /// romaji buffer (e.g. the "m" in "vim") — flush drops it, so the
+    /// F-key path used to lose it and turn "vim" (preedit "ゔぃm") into
+    /// "ｖｉ"/"vi" instead of "ｖｉｍ"/"vim".
+    #[test]
+    fn f_key_preserves_pending_romaji_buffer() {
+        for (form, expected) in [(3, "vim"), (4, "ｖｉｍ")] {
+            let mut engine = ConversionEngine::new();
+            for ch in "vim".chars() {
+                engine.process_key(ch);
+            }
+            assert_eq!(engine.preedit(), "ゔぃm", "preedit should show kana+buffer");
+            let state = engine.start_kana_conversion(form)
+                .expect("start_kana_conversion returned None");
+            assert_eq!(
+                state.composed_text(),
+                expected,
+                "F-key form {form} lost pending 'm'",
+            );
+        }
+    }
+
+    /// Non-romaji forms (F6 hiragana, F7 katakana, F8 halfwidth katakana)
+    /// also carry the pending buffer through as-is — the converters pass
+    /// non-kana chars through unchanged, so "vim" → "ゔぃm"/"ヴィm"/"ｳﾞィm".
+    #[test]
+    fn f_key_pending_buffer_flows_through_kana_forms() {
+        for (form, expected) in [(0, "ゔぃm"), (1, "ヴィm"), (2, "ｳﾞｨm")] {
+            let mut engine = ConversionEngine::new();
+            for ch in "vim".chars() {
+                engine.process_key(ch);
+            }
+            let state = engine.start_kana_conversion(form)
+                .expect("start_kana_conversion returned None");
+            assert_eq!(
+                state.composed_text(),
+                expected,
+                "F-key form {form} composition wrong",
+            );
+        }
     }
 }
