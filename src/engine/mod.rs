@@ -50,6 +50,15 @@ pub struct ConversionState {
     pub segments: Vec<SegmentState>,
     /// Currently focused segment index
     pub focus: usize,
+    /// Case+spelling-preserved raw input snapshot for the whole
+    /// conversion. Set only for single-segment conversions (F-key
+    /// origin, or Space that yielded a single segment) so a follow-up
+    /// F9/F10 form swap can round-trip "VIM"→"ＶＩＭ" and "shi"→"shi"
+    /// via `convert_focused_to` instead of deriving from kana (which
+    /// would flatten case and normalise spelling to "si"). `None` for
+    /// multi-segment conversions — we don't track per-segment raw→kana
+    /// boundaries, so `convert_focused_to` falls back to `KanaForm::apply`.
+    pub raw_input: Option<String>,
 }
 
 /// The five kana display forms Bonolith cycles through with F6-F10.
@@ -370,10 +379,20 @@ impl ConversionEngine {
         drop(dict);
 
         let segment_states = self.build_segment_states(&segments);
+        // Only snapshot raw_input for a single-segment conversion — that's
+        // the one case where the whole raw input maps unambiguously to
+        // the segment's reading. Multi-segment conversions would need
+        // per-segment raw slices we don't track.
+        let raw_input = if segment_states.len() == 1 {
+            self.romaji.raw_input().map(str::to_string)
+        } else {
+            None
+        };
         self.conversion = Some(ConversionState {
             kana,
             segments: segment_states,
             focus: 0,
+            raw_input,
         });
 
         // Trigger LLM reranking in background — results applied on next interaction
@@ -524,8 +543,26 @@ impl ConversionEngine {
     /// five near-identical convert_focused_to_* helpers.
     pub fn convert_focused_to(&mut self, form: KanaForm) -> Option<&ConversionState> {
         let state = self.conversion.as_mut()?;
+        // For F9/F10 (romaji forms), prefer the case+spelling-preserved
+        // raw_input snapshot when it is available — otherwise the second
+        // F9/F10 press would re-derive "し" as "ｓｉ"/"si" and add a
+        // spurious candidate (the first press already put "shi" from
+        // start_kana_conversion into the list). Only meaningful for
+        // single-segment conversions where raw_input maps unambiguously
+        // to the whole reading — start_conversion sets raw_input=None
+        // for multi-segment cases, so no explicit guard needed here.
+        let text = match (form, state.raw_input.as_deref()) {
+            (KanaForm::Romaji, Some(raw)) if !raw.is_empty() => raw.to_string(),
+            (KanaForm::FullwidthRomaji, Some(raw)) if !raw.is_empty() => raw
+                .chars()
+                .map(|c| crate::core::romaji::to_fullwidth_char(c).unwrap_or(c))
+                .collect(),
+            _ => {
+                let seg = &state.segments[state.focus];
+                form.apply(&seg.reading)
+            }
+        };
         let seg = &mut state.segments[state.focus];
-        let text = form.apply(&seg.reading);
         seg.selected = match seg.candidates.iter().position(|c| c == &text) {
             Some(p) => p,
             None => {
@@ -613,6 +650,10 @@ impl ConversionEngine {
                 user_selected: form != 0,
             }],
             focus: 0,
+            // Snapshot the raw input so a subsequent F9/F10 form swap
+            // via convert_focused_to picks up the case-preserved spelling
+            // instead of deriving from kana (which would flatten "shi"→"si").
+            raw_input,
         });
         self.conversion.as_ref()
     }
@@ -2111,6 +2152,42 @@ mod tests {
         let state = engine.start_kana_conversion(3)
             .expect("start_kana_conversion returned None");
         assert_eq!(state.composed_text(), "Vim");
+    }
+
+    /// Pressing F9/F10 a second time in a row (which routes through
+    /// `convert_focused_to` instead of `start_kana_conversion`) must
+    /// keep the raw-input-based romaji, not derive a fresh "si"/"ｓｉ"
+    /// from the kana reading and append it as a new candidate.
+    #[test]
+    fn f_key_repeat_keeps_raw_input_romaji() {
+        for form in [3, 4] {
+            let mut engine = ConversionEngine::new();
+            for ch in "shi".chars() {
+                engine.process_key(ch);
+            }
+            // First press: start_kana_conversion path.
+            let first = engine.start_kana_conversion(form)
+                .expect("start_kana_conversion returned None")
+                .clone();
+            let first_text = first.composed_text();
+            let first_candidates = first.segments[0].candidates.clone();
+            // Second press: convert_focused_to path.
+            let second = engine.convert_focused_to(match form {
+                3 => KanaForm::Romaji,
+                4 => KanaForm::FullwidthRomaji,
+                _ => unreachable!(),
+            }).expect("convert_focused_to returned None");
+            assert_eq!(
+                second.composed_text(), first_text,
+                "second F{} press changed the composed text",
+                if form == 3 { 10 } else { 9 },
+            );
+            assert_eq!(
+                second.segments[0].candidates, first_candidates,
+                "second F{} press appended a spurious kana-derived candidate",
+                if form == 3 { 10 } else { 9 },
+            );
+        }
     }
 
     /// When raw_input is invalidated (e.g. Backspace popped from the
