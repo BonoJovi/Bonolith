@@ -1392,7 +1392,17 @@ impl ConversionEngine {
         // e.g. これ, それ, いる, する, いい
         if surface == reading {
             return match pos {
-                PartOfSpeech::Particle | PartOfSpeech::Auxiliary => 0.2,
+                PartOfSpeech::Particle | PartOfSpeech::Auxiliary => {
+                    // Bonus only for lone functional words (は, の, から,
+                    // まで, です …). Synthetic Noun+Particle compounds
+                    // inherit Particle POS via merge_affix_compounds, and
+                    // their kana Cartesian entry (そら+に=そらに 4288)
+                    // would otherwise outrank the kanji version (空+に=
+                    // 空に 5000) by +0.2, sending 「そらに」→「そらに」
+                    // instead of 「空に」. 3+ char readings are almost
+                    // always compound merges, never lone particles.
+                    if reading.chars().count() <= 2 { 0.2 } else { 0.0 }
+                }
                 PartOfSpeech::Verb | PartOfSpeech::Adjective | PartOfSpeech::Adverb => 0.15,
                 PartOfSpeech::Noun => 0.1,  // pronouns are Noun
                 _ => 0.0,

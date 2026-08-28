@@ -126,6 +126,9 @@ const PRIORITY_OVERRIDES: &[(&str, &str, u32)] = &[
     ("かわ", "川", 3900), // was 1150, below 皮 3755
     ("かみ", "髪", 4000), // was 3300, below 加味 3609
     ("かみ", "神", 3800), // was 3065, below 加味 3609 (髪 > 神 kept)
+    ("そら", "空", 5000), // was 2561, below そら Interjection 4288 — sky/blank
+    ("やま", "山", 4500), // was 938, below 止ま 2394 (a verb inflection) — mountain
+    ("みず", "水", 4200), // was 2615, below 瑞 3948 (rare "auspicious") — water
     ("りょうり", "料理", 4400), // was 3968, below 良吏 4296 (rare "good official")
     ("かぎ", "鍵", 4200),       // was 4119, below 鈎 4124 (rare "hook/gaff")
     ("ひと", "人", 4100), // was 2882, below 匪徒/費途 3982 (rare "bandit"/"expense")
@@ -192,6 +195,33 @@ const PRIORITY_OVERRIDES: &[(&str, &str, u32)] = &[
     ("しました", "しました", 9500),
     ("しません", "しません", 9000),
     ("しましょう", "しましょう", 9000),
+    // Stem+Particle homographs. IPADIC ships several 2/3-char Nouns whose
+    // reading is exactly `<content stem> + <strong particle>` (きょうは→
+    // 教派, かれは→枯れ葉, そらに→空似, …). The DP prefers those 1-word
+    // entries over the Noun+Particle split by a hair (segment_cost -32.5
+    // vs -31.8 for きょうは), so 「きょうは」 conversion resurfaces as
+    // "教派" instead of "今日は". Demote the archaic / niche readings
+    // below 3000 so the everyday N+P parse wins; the compound entry
+    // remains reachable if the user actually types towards it. Same
+    // shape as the existing つぎは→継歯 demotion (2026-05 fix).
+    ("きょうは", "教派", 2500),       // religious sect; 今日+は is the default
+    ("きょうが", "恭賀", 2500),       // formal congratulations; 今日+が default
+    ("かれは", "枯れ葉", 2500),       // dead-leaves noun; 彼+は default
+    ("かれは", "枯葉", 2500),         // alt surface for the same
+    // These are 3-char readings; the DP's char_len multiplier keeps the
+    // 1-seg entry ahead of そら+に / やま+が until freq < ~2260, so
+    // demote further than the 2-char cases above.
+    ("そらに", "空似", 1500),         // coincidental resemblance; 空+に default
+    ("そらに", "そら似", 1500),       // alt surface
+    ("そらで", "空手", 1500),         // からて reading (karate) is untouched
+    ("やまが", "山家", 1500),         // mountain-dweller archaic; 山+が default
+    // "これ" as 之 is a legitimate archaic reading, but Cartesian
+    // product for compounds like これが / これは pulled 之が / 之は
+    // into rank-2. Demoting 之 below the take_top cutoff keeps the
+    // compound clean while the standalone 之 candidate (which the user
+    // has to cycle to) stays intact through the Noun+Particle
+    // compound-candidate limit.
+    ("これ", "之", 2500),             // was 6273; archaic possessive form
 ];
 
 pub struct Dictionary {
@@ -507,6 +537,14 @@ impl Dictionary {
     /// segments were kept whole for the right reason and must not be
     /// touched here.
     fn split_particle_head_segments(&self, segs: Vec<Segment>) -> Vec<Segment> {
+        // A 2-char reading with a strong Noun/Verb/Adj runner-up alongside
+        // its Suffix leader is an everyday content word wearing a Suffix
+        // hat — 敵 (Noun 5474) alongside 的 (Suffix 7408) for てき,
+        // 戦 (Noun 5x) alongside 戦 Suffix for せん, etc. Splitting drops
+        // the content word from every reachable parse. がき's runner-up
+        // is 餓鬼 (Noun 4353), so the threshold stays above that to keep
+        // the がき→物書き Noun+Suffix rebuild firing.
+        const CONTENT_RUNNER_UP_MIN: u32 = 4500;
         let mut out: Vec<Segment> = Vec::with_capacity(segs.len());
         for seg in segs {
             let chars: Vec<char> = seg.reading.chars().collect();
@@ -515,6 +553,21 @@ impl Dictionary {
                 continue;
             }
             if !matches!(Self::dominant_pos(&seg), Some(PartOfSpeech::Suffix)) {
+                out.push(seg);
+                continue;
+            }
+            // Suffix wins on freq, but is there a strong content-word
+            // runner-up on the SAME 2-char reading? If so the split
+            // would strand it — bug [1] 残: てき split loses 敵 entirely
+            // because the ensuing き+を Noun+Particle merge fuses き's
+            // 気 with を into 気を, so no parse ever reaches 敵.
+            let has_strong_content = seg.candidates.iter().any(|e| {
+                matches!(
+                    e.pos,
+                    PartOfSpeech::Noun | PartOfSpeech::Verb | PartOfSpeech::Adjective
+                ) && e.frequency >= CONTENT_RUNNER_UP_MIN
+            });
+            if has_strong_content {
                 out.push(seg);
                 continue;
             }
@@ -552,8 +605,36 @@ impl Dictionary {
     }
 
     /// Return the dominant (highest-frequency) PartOfSpeech for a segment, if any.
+    ///
+    /// Tie-breaker: on equal frequency, prefer content POS (Noun / Verb /
+    /// Adjective) over affix POS (Suffix / Prefix). PRIORITY_OVERRIDES
+    /// keys on (reading, surface) and therefore hits every entry with the
+    /// same kanji regardless of POS — 山 Noun and 山 Suffix both land at
+    /// 4500 after the override, and `max_by_key`'s "last wins" default
+    /// picked the Suffix and vetoed the Noun+Particle merge that would
+    /// have turned やまは into 山は (bug: kana top1 for that reading).
     fn dominant_pos(seg: &Segment) -> Option<PartOfSpeech> {
-        seg.candidates.iter().max_by_key(|e| e.frequency).map(|e| e.pos)
+        seg.candidates
+            .iter()
+            .max_by(|a, b| {
+                a.frequency
+                    .cmp(&b.frequency)
+                    .then_with(|| Self::pos_tiebreaker(a.pos).cmp(&Self::pos_tiebreaker(b.pos)))
+            })
+            .map(|e| e.pos)
+    }
+
+    /// Higher = wins ties in `dominant_pos`. Content POS beats functional
+    /// POS, which beats affixes.
+    fn pos_tiebreaker(pos: PartOfSpeech) -> u8 {
+        match pos {
+            PartOfSpeech::Noun | PartOfSpeech::Verb | PartOfSpeech::Adjective => 3,
+            PartOfSpeech::Adverb | PartOfSpeech::Interjection => 2,
+            PartOfSpeech::Particle
+            | PartOfSpeech::Auxiliary
+            | PartOfSpeech::Conjunction => 1,
+            PartOfSpeech::Prefix | PartOfSpeech::Suffix | PartOfSpeech::Other => 0,
+        }
     }
 
     /// Merge adjacent compound pairs into single segments.
@@ -2917,6 +2998,92 @@ mod tests {
             }
         }
         assert_eq!(failures, 0, "{failures} supplement entries missing from candidates");
+    }
+
+    /// Regression: `てき` had 的 Suffix (7408) dominant over 敵 Noun (5474),
+    /// so `split_particle_head_segments` fired and shredded the reading
+    /// into て+き — 敵 then vanished from every reachable parse because
+    /// `てき+を+叩く` became `て+きを+叩く` after Noun+Particle merge.
+    /// The runner-up gate keeps 2-char readings whole when they carry a
+    /// strong Noun/Verb/Adj candidate (freq ≥ 4500) alongside the Suffix
+    /// leader, so 敵 stays reachable in the てき segment.
+    #[test]
+    fn split_particle_head_keeps_content_runnerup() {
+        let dict = Dictionary::new();
+        // 敵 (Noun 5474) alongside 的 (Suffix 7408) → keep てき whole.
+        let segs = dict.segment("てきをたたく");
+        let readings: Vec<&str> = segs.iter().map(|s| s.reading.as_str()).collect();
+        assert_eq!(
+            readings,
+            vec!["てき", "を", "たたく"],
+            "てき must stay whole so 敵 is reachable, got {:?}",
+            readings,
+        );
+        let teki_surfaces: Vec<&str> = segs[0]
+            .candidates
+            .iter()
+            .map(|e| e.surface.as_str())
+            .collect();
+        assert!(
+            teki_surfaces.contains(&"敵"),
+            "敵 must appear in てき candidates, got {:?}",
+            teki_surfaces,
+        );
+        // Sanity: がき's runner-up 餓鬼 (Noun 4353) sits BELOW the 4500
+        // gate on purpose, so the がき split still fires for がき+的
+        // reclass (previous behaviour preserved — not asserted per-parse
+        // here since surrounding-context segmentation is orthogonal).
+    }
+
+    /// Regression: several stem-particle readings had niche 1-word dict
+    /// entries (きょうは→教派, かれは→枯れ葉, そらに→空似, やまが→
+    /// 山家, これが→...→之が) winning by 1-seg cost advantage over the
+    /// everyday Noun+Particle split. The demotions in PRIORITY_OVERRIDES
+    /// plus the reading-length gate in surface_adjustment restore the
+    /// modern default. The dominant_pos tie-breaker keeps やま Noun 4500
+    /// ahead of やま Suffix 4500 so Noun+Particle merge fires for やまは.
+    #[test]
+    fn stem_particle_defaults_to_noun_plus_particle() {
+        use crate::engine::{ConversionEngine, SharedCore};
+        let shared = SharedCore::new_hermetic();
+        // Romaji key-streams are used directly so combined kana (きょ) don't
+        // get mistyped as ki+yo → 器用 by a naive kana→key converter.
+        let cases = [
+            ("kyouha", "今日は"),
+            ("kyouga", "今日が"),
+            ("kareha", "彼は"),
+            ("sorani", "空に"),
+            ("sorade", "空で"),
+            ("yamaga", "山が"),
+            ("yamaha", "山は"),
+            ("mizuwo", "水を"),
+        ];
+        for (input, want) in cases {
+            let mut e = ConversionEngine::with_shared(shared.clone());
+            for ch in input.chars() {
+                e.process_key(ch);
+            }
+            let state = e.start_conversion().expect("start_conversion");
+            let top: String = state
+                .segments
+                .iter()
+                .filter_map(|s| s.candidates.first().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join("");
+            assert_eq!(top, want, "{input}: expected {want}, got {top}");
+        }
+
+        // Lone particles must still get their +0.2 surface==reading bonus
+        // (the reading-length gate only fires at 3+ chars).
+        for (input, want) in [("ha", "は"), ("no", "の"), ("kara", "から"), ("made", "まで")] {
+            let mut e = ConversionEngine::with_shared(shared.clone());
+            for ch in input.chars() {
+                e.process_key(ch);
+            }
+            let state = e.start_conversion().expect("start_conversion");
+            let top = state.segments[0].candidates[0].as_str();
+            assert_eq!(top, want, "{input}: lone particle must top its candidate list");
+        }
     }
 
     /// The Noun+Particle merge in merge_affix_compounds used to pull the
