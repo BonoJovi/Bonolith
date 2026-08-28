@@ -342,11 +342,14 @@ pub fn hiragana_to_romaji(s: &str) -> String {
             if let Some(romaji) = kana_to_romaji_lookup(&slice) {
                 result.push_str(romaji);
                 i += len;
-                // ん + vowel / y-row / ん needs an explicit "n'" so a
-                // later kana→romaji reader can't re-parse "kani" as
-                // か+に instead of か+ん+い. `kana_to_romaji_lookup`
-                // returns bare "n" only for ん, so a bare "n" here
-                // means slice == "ん".
+                // ん + vowel / y-row needs an explicit "n'" so a later
+                // kana→romaji reader can't re-parse "kani" as か+に
+                // instead of か+ん+い. `kana_to_romaji_lookup` returns
+                // bare "n" only for ん, so a bare "n" here means
+                // slice == "ん". ん+ん stays "nn" — the Hepburn "nn"
+                // convention for ん would be ambiguous either way, and
+                // this branch is round-tripped via `hiragana_to_romaji`
+                // for F9/F10, not fed back into the segmenter.
                 if romaji == "n" && needs_n_apostrophe(chars.get(i).copied()) {
                     result.push('\'');
                 }
