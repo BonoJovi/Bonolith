@@ -10,7 +10,7 @@
 ## Essential Rules
 
 1. **All code changes on `dev` branch** — merge to `main` for releases only
-2. **Version files**: Update all 5 files simultaneously — `Cargo.toml`, `README.md`, `data/bonolith.xml`, `fcitx5/bonolith-addon.conf`, `fcitx5/CMakeLists.txt`
+2. **Version files**: Update all 6 files simultaneously — `Cargo.toml`, `README.md`, `data/bonolith.xml`, `fcitx5/bonolith-addon.conf`, `fcitx5/CMakeLists.txt`, `CLAUDE.md` (the `**Version**` line below). `cargo build --release` regenerates `Cargo.lock` — commit it too.
 3. **No `unwrap()` in production Rust** — always use `Result<T, E>`
 4. **Commit messages**: English, conventional format `type(scope): description`
 5. **Release**: Use `/release`
