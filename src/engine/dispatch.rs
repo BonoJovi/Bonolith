@@ -38,6 +38,37 @@ pub const KEY_F8: u32 = 0xFFC5;
 pub const KEY_F9: u32 = 0xFFC6;
 pub const KEY_F10: u32 = 0xFFC7;
 
+// Keypad keysyms — normalised to their main-keyboard equivalents in
+// [`normalise_keypad`] before the dispatch ladder runs. Without this,
+// preedit / conversion mode swallowed every keypad press as a silent
+// consume (KP_Enter matched neither KEY_RETURN nor `printable_char`,
+// so it couldn't commit the conversion — Mozc / ATOK both treat KP
+// keys as their main-keyboard twins).
+const KEY_KP_SPACE: u32 = 0xFF80;
+const KEY_KP_TAB: u32 = 0xFF89;
+const KEY_KP_ENTER: u32 = 0xFF8D;
+const KEY_KP_HOME: u32 = 0xFF95;
+const KEY_KP_LEFT: u32 = 0xFF96;
+const KEY_KP_UP: u32 = 0xFF97;
+const KEY_KP_RIGHT: u32 = 0xFF98;
+const KEY_KP_DOWN: u32 = 0xFF99;
+const KEY_KP_PAGE_UP: u32 = 0xFF9A;
+const KEY_KP_PAGE_DOWN: u32 = 0xFF9B;
+const KEY_KP_END: u32 = 0xFF9C;
+const KEY_KP_DELETE: u32 = 0xFF9F;
+const KEY_KP_MULTIPLY: u32 = 0xFFAA;
+const KEY_KP_ADD: u32 = 0xFFAB;
+const KEY_KP_SEPARATOR: u32 = 0xFFAC;
+const KEY_KP_SUBTRACT: u32 = 0xFFAD;
+const KEY_KP_DECIMAL: u32 = 0xFFAE;
+const KEY_KP_DIVIDE: u32 = 0xFFAF;
+const KEY_KP_0: u32 = 0xFFB0;
+const KEY_KP_9: u32 = 0xFFB9;
+const KEY_KP_EQUAL: u32 = 0xFFBD;
+const KEY_HOME: u32 = 0xFF50;
+const KEY_END: u32 = 0xFF57;
+const KEY_DELETE: u32 = 0xFFFF;
+
 pub const SHIFT_MASK: u32 = 1 << 0;
 pub const CONTROL_MASK: u32 = 1 << 2;
 pub const MOD1_MASK: u32 = 1 << 3;
@@ -166,7 +197,7 @@ pub fn dispatch_key(
         return KeyOutcome::default();
     }
 
-    let keyval = event.keyval;
+    let keyval = normalise_keypad(event.keyval);
     let has_shift = event.has_shift();
 
     // Shift+Space → full-width space (Mozc / Google IME / ATOK
@@ -331,6 +362,41 @@ pub fn dispatch_key(
     KeyOutcome {
         consumed: !engine.preedit().is_empty(),
         ..KeyOutcome::default()
+    }
+}
+
+/// Map a keypad keysym to its main-keyboard equivalent so the dispatch
+/// ladder — which only knows the main-keyboard values — treats KP_Enter
+/// as Enter, KP_5 as '5', KP_Down as ↓, etc. Non-keypad values pass
+/// through unchanged. Mozc / ATOK / Google IME all do this; without it,
+/// preedit / conversion mode consumed every keypad press as a silent
+/// no-op (KP_Enter couldn't commit, digits didn't fold into romaji).
+fn normalise_keypad(keyval: u32) -> u32 {
+    // Digits: KP_0..KP_9 → '0'..'9'.
+    if (KEY_KP_0..=KEY_KP_9).contains(&keyval) {
+        return b'0' as u32 + (keyval - KEY_KP_0);
+    }
+    match keyval {
+        KEY_KP_ENTER => KEY_RETURN,
+        KEY_KP_SPACE => KEY_SPACE,
+        KEY_KP_TAB => KEY_TAB,
+        KEY_KP_LEFT => KEY_LEFT,
+        KEY_KP_RIGHT => KEY_RIGHT,
+        KEY_KP_UP => KEY_UP,
+        KEY_KP_DOWN => KEY_DOWN,
+        KEY_KP_PAGE_UP => KEY_PAGE_UP,
+        KEY_KP_PAGE_DOWN => KEY_PAGE_DOWN,
+        KEY_KP_HOME => KEY_HOME,
+        KEY_KP_END => KEY_END,
+        KEY_KP_DELETE => KEY_DELETE,
+        KEY_KP_MULTIPLY => b'*' as u32,
+        KEY_KP_ADD => b'+' as u32,
+        KEY_KP_SEPARATOR => b',' as u32,
+        KEY_KP_SUBTRACT => b'-' as u32,
+        KEY_KP_DECIMAL => b'.' as u32,
+        KEY_KP_DIVIDE => b'/' as u32,
+        KEY_KP_EQUAL => b'=' as u32,
+        other => other,
     }
 }
 
@@ -737,6 +803,47 @@ mod tests {
         let out = dispatch_key(&mut e, &mut c, ev(KEY_SPACE));
         assert!(!out.consumed);
         assert_eq!(e.preedit(), "");
+    }
+
+    /// Regression [10]: KP_Enter (0xFF8D) must commit an in-flight
+    /// conversion the same way main-keyboard Enter (0xFF0D) does.
+    /// Without keypad normalisation, KP_Enter matched neither KEY_RETURN
+    /// nor `printable_char` and got silently consumed by the last-resort
+    /// `consumed_noop` arm — users on external keyboards / laptop
+    /// number pads couldn't confirm any candidate.
+    #[test]
+    fn kp_enter_commits_conversion() {
+        let (mut e, mut c) = setup();
+        for k in [b'k', b'a'] {
+            dispatch_key(&mut e, &mut c, ev(k as u32));
+        }
+        dispatch_key(&mut e, &mut c, ev(KEY_SPACE));
+        assert!(c, "Space should enter conversion");
+        let out = dispatch_key(&mut e, &mut c, ev(0xFF8D)); // KP_Enter
+        assert!(out.consumed);
+        assert!(!c, "KP_Enter should end conversion");
+        assert!(
+            out.commit.is_some(),
+            "KP_Enter must commit the conversion (Mozc parity)",
+        );
+    }
+
+    /// Regression [10]: KP digits (0xFFB0..0xFFB9) must fold into the
+    /// romaji buffer as their ASCII counterparts. Without normalisation
+    /// they were silently consumed once a preedit was up.
+    #[test]
+    fn kp_digit_feeds_romaji_when_preedit_active() {
+        let (mut e, mut c) = setup();
+        dispatch_key(&mut e, &mut c, ev(b'a' as u32));
+        let out = dispatch_key(&mut e, &mut c, ev(0xFFB2)); // KP_2
+        assert!(out.consumed);
+        // KP_2 should behave as '2' — engine turns it into ２ (fullwidth) via
+        // the same path as a top-row 2 press, appending to the preedit.
+        assert!(
+            e.preedit().contains('２') || e.preedit().ends_with('2'),
+            "preedit did not receive KP_2: {:?}",
+            e.preedit(),
+        );
     }
 
     /// Release events are the frontend's job — the dispatcher must not
