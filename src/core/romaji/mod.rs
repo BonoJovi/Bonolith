@@ -109,7 +109,15 @@ impl RomajiConverter {
             }
         }
 
-        // 6. No match — discard buffer
+        // 6. No match — discard buffer. Invalidate raw_input the same
+        // way delete_last does when it can no longer preserve parity:
+        // the discarded chars are already in raw_input but produced no
+        // output, so a later F9/F10 that reached back into raw_input
+        // would replay them as ghost text (kq + ka → preedit "か" but
+        // raw_input "kqka", F10 → "kqka").
+        if !self.buffer.is_empty() {
+            self.raw_input = None;
+        }
         self.buffer.clear();
         None
     }
@@ -122,6 +130,12 @@ impl RomajiConverter {
             return Some("ん".to_string());
         }
         if !self.buffer.is_empty() {
+            // Same story as rule-6 discard: the pending buffer never
+            // produced kana, so raw_input's trailing chars are ghost
+            // input that must not resurface via F9/F10. (saky + Space
+            // → converted "さ", raw_input drops "ky" instead of
+            // pasting "saky" back into F10.)
+            self.raw_input = None;
             self.buffer.clear();
         }
         None
@@ -754,5 +768,56 @@ mod tests {
         assert!(sha == "sya" || sha == "sha", "got: {}", sha);
         let cho = hiragana_to_romaji("ちょ");
         assert!(cho == "tyo" || cho == "cho", "got: {}", cho);
+    }
+
+    /// Regression (bug_list_fable_5_review_2026-08-28 #6a): a rule-6
+    /// discard of an unmatched buffer prefix ("kq") must invalidate
+    /// raw_input so a later F9/F10 does not replay the discarded chars
+    /// as ghost text. Before the fix, `kq` + `ka` left output "か" but
+    /// raw_input "kqka", so F10 rendered "kqka".
+    #[test]
+    fn rule6_discard_invalidates_raw_input() {
+        let mut conv = RomajiConverter::new();
+        conv.process_key('k');
+        conv.process_key('q'); // rule-6 discard: "kq" has no prefix
+        conv.process_key('k');
+        conv.process_key('a'); // → か
+        assert_eq!(conv.output(), "か");
+        assert!(
+            conv.raw_input().is_none(),
+            "rule-6 discard should have invalidated raw_input; got {:?}",
+            conv.raw_input(),
+        );
+    }
+
+    /// Regression (bug_list_fable_5_review_2026-08-28 #6b): flush with
+    /// a non-"n" pending buffer must invalidate raw_input the same way
+    /// rule-6 discard does. Before the fix, `saky` + flush left output
+    /// "さ" but raw_input "saky", so F10 rendered "saky".
+    #[test]
+    fn flush_non_n_discard_invalidates_raw_input() {
+        let mut conv = RomajiConverter::new();
+        for ch in "saky".chars() {
+            conv.process_key(ch);
+        }
+        assert_eq!(conv.output(), "さ");
+        assert_eq!(conv.buffer(), "ky");
+        conv.flush();
+        assert!(
+            conv.raw_input().is_none(),
+            "flush with non-n buffer should invalidate raw_input; got {:?}",
+            conv.raw_input(),
+        );
+    }
+
+    /// flush("n") is a legitimate produces-kana path — raw_input stays
+    /// valid so F9/F10 on the resulting ん still round-trips to "n".
+    #[test]
+    fn flush_lone_n_preserves_raw_input() {
+        let mut conv = RomajiConverter::new();
+        conv.process_key('n');
+        conv.flush();
+        assert_eq!(conv.output(), "ん");
+        assert_eq!(conv.raw_input(), Some("n"));
     }
 }
