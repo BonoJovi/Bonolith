@@ -605,6 +605,20 @@ impl ConversionEngine {
         // new bunsetsu instead of the stale pre-resize segmentation.
         self.trigger_llm_rerank();
 
+        // raw_input snapshots the romaji spelling of a single-segment
+        // conversion so F9/F10 can restore the exact keystrokes (`shi`
+        // rather than a re-derived `si`). Resize always breaks that
+        // invariant — the one segment that mapped to raw_input has just
+        // been split into two, and neither piece owns the whole spelling
+        // any more. If we left raw_input in place, F9/F10 on either
+        // piece would paste the entire pre-resize spelling into that
+        // single focused segment (kyou → shift-Left → F10 yields
+        // "kyouう" or "きょkyou"). Invalidate here so subsequent F9/F10
+        // fall back to per-segment kana derivation.
+        if let Some(state) = self.conversion.as_mut() {
+            state.raw_input = None;
+        }
+
         self.conversion.as_ref()
     }
 
@@ -628,7 +642,9 @@ impl ConversionEngine {
         // start_kana_conversion into the list). Only meaningful for
         // single-segment conversions where raw_input maps unambiguously
         // to the whole reading — start_conversion sets raw_input=None
-        // for multi-segment cases, so no explicit guard needed here.
+        // on multi-segment entry and resize_segment nulls it out on any
+        // subsequent split, so the invariant "raw_input is Some ⇒
+        // segments.len() == 1" holds without an explicit len guard.
         let text = match (form, state.raw_input.as_deref()) {
             (KanaForm::Romaji, Some(raw)) if !raw.is_empty() => raw.to_string(),
             (KanaForm::FullwidthRomaji, Some(raw)) if !raw.is_empty() => raw
@@ -2205,6 +2221,44 @@ mod tests {
         // The fallback path uses the kana + lowercase pending buffer.
         // Just verify it doesn't panic and returns something non-empty.
         assert!(!state.composed_text().is_empty());
+    }
+
+    /// Regression (bug_list_fable_5_review_2026-08-28 #2): a resize
+    /// that turns a single-segment conversion into multiple segments
+    /// must invalidate raw_input. Otherwise F9/F10 on any of the
+    /// resulting segments would paste the whole pre-resize romaji
+    /// spelling into that single focused segment (kyou → Shift+Left
+    /// → F10 used to yield "kyouう" or "きょkyou").
+    #[test]
+    fn resize_invalidates_raw_input_for_f_key_fallback() {
+        let mut engine = ConversionEngine::new();
+        for ch in "kyou".chars() {
+            engine.process_key(ch);
+        }
+        let state = engine.start_conversion().expect("start_conversion");
+        assert_eq!(state.segments.len(), 1, "test setup: expected 1 segment");
+        assert!(state.raw_input.is_some(), "raw_input should snapshot the single-segment romaji");
+        engine.resize_segment(-1).expect("resize_segment shrink");
+        let after = engine.conversion_state().expect("conversion cleared");
+        assert!(
+            after.segments.len() >= 2,
+            "resize should have produced multiple segments, got {}",
+            after.segments.len(),
+        );
+        assert!(
+            after.raw_input.is_none(),
+            "resize must null raw_input once it invalidates the single-segment invariant",
+        );
+        let focused = engine
+            .convert_focused_to(KanaForm::Romaji)
+            .expect("convert_focused_to Romaji");
+        let focused_seg = &focused.segments[focused.focus];
+        let selected = &focused_seg.candidates[focused_seg.selected];
+        assert!(
+            !selected.eq_ignore_ascii_case("kyou"),
+            "F10 on a resized segment must derive romaji from its own reading, \
+             not paste the whole pre-resize spelling; got {selected:?}",
+        );
     }
 
     /// A user resize that changes segmentation is recorded, and the
