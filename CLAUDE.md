@@ -4,7 +4,7 @@
 
 - **Type**: Japanese AI Input Method for Linux (IBus + Fcitx5)
 - **Purpose**: LLM-based intelligent Japanese input method
-- **Version**: v3.1.7
+- **Version**: v3.1.8
 - **Branch**: `dev` for development, `main` for releases
 
 ## Essential Rules

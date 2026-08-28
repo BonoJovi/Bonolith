@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "bonolith"
-version = "3.1.7"
+version = "3.1.8"
 dependencies = [
  "encoding_rs",
  "env_logger",
