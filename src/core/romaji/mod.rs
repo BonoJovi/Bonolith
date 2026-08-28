@@ -330,6 +330,14 @@ pub fn hiragana_to_romaji(s: &str) -> String {
             if let Some(romaji) = kana_to_romaji_lookup(&slice) {
                 result.push_str(romaji);
                 i += len;
+                // ん + vowel / y-row / ん needs an explicit "n'" so a
+                // later kana→romaji reader can't re-parse "kani" as
+                // か+に instead of か+ん+い. `kana_to_romaji_lookup`
+                // returns bare "n" only for ん, so a bare "n" here
+                // means slice == "ん".
+                if romaji == "n" && needs_n_apostrophe(chars.get(i).copied()) {
+                    result.push('\'');
+                }
                 matched = true;
                 break;
             }
@@ -446,6 +454,24 @@ pub fn hiragana_to_fullwidth_romaji(s: &str) -> String {
         .chars()
         .map(|c| to_fullwidth_char(c).unwrap_or(c))
         .collect()
+}
+
+/// True if a bare "n" (from ん) needs an apostrophe before `next` so a
+/// later kana→romaji reader can't merge it with the following mora.
+/// The ambiguous cases are a following vowel (a/i/u/e/o) or a y-row
+/// mora (や/ゆ/よ + small ゃ/ゅ/ょ) — "kani" would otherwise read as
+/// か+に instead of か+ん+い. Follows Mozc / Hepburn convention;
+/// deliberately does not cover ん+な行 (which the bug report and the
+/// convention both leave as bare "n"; anna reads unambiguously as ん+な).
+fn needs_n_apostrophe(next: Option<char>) -> bool {
+    match next {
+        Some(c) => matches!(
+            c,
+            'あ' | 'い' | 'う' | 'え' | 'お'
+            | 'や' | 'ゆ' | 'よ' | 'ゃ' | 'ゅ' | 'ょ'
+        ),
+        None => false,
+    }
 }
 
 /// Reverse lookup: kana string → romaji.
@@ -753,6 +779,23 @@ mod tests {
         assert_eq!(hiragana_to_romaji("。"), ".");
         assert_eq!(hiragana_to_romaji("、"), ",");
         assert_eq!(hiragana_to_romaji("！"), "!");
+    }
+
+    /// Regression [21]: bare "n" for ん is ambiguous before a vowel or
+    /// a y-row mora — "kani" could be か+に or か+ん+い. Emit "n'" so
+    /// the split is unambiguous, following the Mozc / Hepburn
+    /// convention. F9/F10 output is what the user actually sees.
+    #[test]
+    fn romaji_n_apostrophe_before_vowels_and_y() {
+        assert_eq!(hiragana_to_romaji("かんい"), "kan'i");
+        assert_eq!(hiragana_to_romaji("ほんや"), "hon'ya");
+        assert_eq!(hiragana_to_romaji("ぜんいん"), "zen'in");
+        // ん + な行 stays bare "n" — anna is unambiguously ん+な.
+        assert_eq!(hiragana_to_romaji("あんない"), "annai");
+        // ん before a non-n consonant is still bare "n".
+        assert_eq!(hiragana_to_romaji("かんじ"), "kanzi");
+        // Trailing ん stays bare "n".
+        assert_eq!(hiragana_to_romaji("ほん"), "hon");
     }
 
     #[test]
