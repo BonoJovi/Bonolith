@@ -525,12 +525,14 @@ impl BonolithEngine {
 // Private helper methods (not exposed via D-Bus)
 impl BonolithEngine {
     /// Check if the given key event matches any configured toggle binding.
+    /// The Shift+letter normalisation lives on `CompiledToggleKey::matches`
+    /// so it can be unit-tested without spinning up a whole engine.
     fn is_toggle_key(&self, keyval: u32, state: u32) -> bool {
         let relevant_mask = IBUS_CONTROL_MASK | IBUS_MOD1_MASK | IBUS_SHIFT_MASK;
         let active_modifiers = state & relevant_mask;
         self.toggle_keys
             .iter()
-            .any(|tk| keyval == tk.keyval && active_modifiers == tk.modifier_mask)
+            .any(|tk| tk.matches(keyval, active_modifiers))
     }
 
     /// Translate a [`KeyOutcome`] from the shared dispatcher into IBus
