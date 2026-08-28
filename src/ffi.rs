@@ -554,6 +554,17 @@ pub unsafe extern "C" fn bonolith_dict_add_entry(
 /// "confirm delete" doesn't clobber the newly-added row (bug [17]:
 /// the old index-based delete + replace_all rebuilt the store from a
 /// stale snapshot and lost the concurrent add).
+///
+/// **Scope**: guards the *same-process* race (two dialogs in one
+/// frontend). The final apply still goes through
+/// `sync_user_entries_to_store` (whole `user_entries` table
+/// replaced from this process's in-memory cache), so a row inserted
+/// by the *other* frontend (Fcitx5 vs IBus) since our engine started
+/// isn't in our cache and would still be dropped. That's the
+/// existing `DictStore` multi-process contract (memory loaded once
+/// at startup, restart to refresh — see `store.rs`); this fix
+/// tightens the intra-process case, which is where the bug actually
+/// bit.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_dict_delete_entry_by_identity(
     reading: *const c_char,

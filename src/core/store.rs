@@ -546,7 +546,20 @@ impl DictStore {
     /// Evict rows from `table` until it holds at most `cap`. Deletes the
     /// least-reinforced rows first (lowest `count`), breaking ties by
     /// earliest ROWID so long-standing but rarely-used entries also age
-    /// out. Cheap when the table is under cap (a single COUNT query).
+    /// out. Cheap when the table is under cap (a single COUNT query per
+    /// commit — SQLite scans an int index, ~µs at 50k rows — small
+    /// enough for the input hot path we're on).
+    ///
+    /// **Memory divergence**: any row this deletes is still present in
+    /// `UserScorer`'s in-memory `counts` / `segmentations` map until the
+    /// engine restarts (they load once at startup and never re-sync
+    /// with the store — the documented v2.0.0 contract). Reads that hit
+    /// only the memory map, notably `UserScorer::lookup_segmentation`,
+    /// can return boundaries whose backing DB row has been evicted;
+    /// they behave as if the row were still there for the rest of the
+    /// session. Only affects rare cap-overflow cases (10k / 50k) so
+    /// isn't treated as a correctness bug — flagged here so future
+    /// changes don't quietly widen its blast radius.
     fn enforce_row_cap(
         conn: &rusqlite::Connection,
         table: &str,

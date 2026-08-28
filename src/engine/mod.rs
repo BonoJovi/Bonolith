@@ -1925,35 +1925,48 @@ mod tests {
     /// Regression [23]: a learned segmentation whose boundaries now
     /// coincide with what the DP segmenter would produce on its own
     /// must be forgotten on the next start_conversion, so long-lived
-    /// rows don't pile up and slow every engine start. Verifies the
-    /// self-cleaning path without needing a full store round-trip.
+    /// rows don't pile up and slow every engine start.
+    ///
+    /// "DP default" here means whatever `start_conversion` computes
+    /// before the learned override runs — that's `segment_with_boost`
+    /// piped through `filter_segmentation`, NOT a bare `dict.segment`.
+    /// An earlier version of this test called `dict.segment` directly
+    /// and matched only by coincidence; a future filter-side change
+    /// would silently break the coupling. Drive one round of
+    /// `start_conversion` with an empty scorer to snapshot the *real*
+    /// DP boundaries, then seed them and re-enter to verify
+    /// self-cleaning fires.
     #[test]
     fn learned_segmentation_matching_dp_is_forgotten() {
-        let engine = ConversionEngine::with_shared(SharedCore::new_hermetic());
-        // Compute the DP-default boundaries for "あめがふる" first so we
-        // know what to inject as the "already-matches-DP" learned row.
-        let dp_default = {
-            let dict = engine.shared.dictionary.read().unwrap();
-            let segs = dict.segment("あめがふる");
-            segs.iter().skip(1).map(|s| s.start).collect::<Vec<_>>()
-        };
-        // Inject that same layout as a learned segmentation.
+        let mut engine = ConversionEngine::with_shared(SharedCore::new_hermetic());
+
+        // Phase 1: run start_conversion with no learned row and
+        // capture the real DP-default boundaries the engine uses.
+        for ch in "amegafuru".chars() {
+            engine.process_key(ch);
+        }
+        engine.start_conversion();
+        let dp_default = boundaries_of(&engine.conversion_state().unwrap().segments);
+        engine.commit_conversion();
+        // commit_conversion is safe on an all-DP layout —
+        // record_segmentation only fires when final != initial.
+
+        // Phase 2: seed that same layout as a learned segmentation.
         {
             let mut scorer = engine.shared.user_scorer.lock().unwrap();
             scorer.record_segmentation("あめがふる", dp_default.clone());
             assert!(
                 scorer.lookup_segmentation("あめがふる").is_some(),
-                "seed row must be present before start_conversion",
+                "seed row must be present before the self-cleaning start_conversion",
             );
         }
-        // Trigger the self-cleaning path.
-        let mut engine = engine;
+
+        // Phase 3: trigger start_conversion again — the learned row
+        // matches the DP default, so the self-cleaning arm retires it.
         for ch in "amegafuru".chars() {
             engine.process_key(ch);
         }
         engine.start_conversion();
-        // The learned row now matches DP, so start_conversion should
-        // have retired it.
         let scorer = engine.shared.user_scorer.lock().unwrap();
         assert!(
             scorer.lookup_segmentation("あめがふる").is_none(),
