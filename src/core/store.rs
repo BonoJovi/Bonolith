@@ -29,6 +29,21 @@ use rusqlite::{params, Connection};
 
 use crate::core::dictionary::{DictionaryEntry, PartOfSpeech};
 
+/// Hard cap on `user_segmentations` rows. Segmentations use the whole
+/// kana as the key, so a heavy long-form typing habit adds a permanent
+/// row per unique sentence — unbounded growth over years. 10k rows is
+/// well past most users' active repertoire (repeat sentences reinforce
+/// existing rows in place) while capping the reload cost at engine
+/// start. Excess rows are evicted lowest-count / oldest-ROWID first,
+/// so long-forgotten one-off sentences give way to the working set.
+pub const MAX_USER_SEGMENTATIONS: usize = 10_000;
+
+/// Hard cap on `user_scores` rows. Bounded naturally by vocabulary
+/// size (one row per unique reading+surface pair the user selects), so
+/// it rarely approaches this in practice; the cap is defensive
+/// backstop matching segmentations' policy.
+pub const MAX_USER_SCORES: usize = 50_000;
+
 const SCHEMA_VERSION: i32 = 1;
 const MIGRATION_FLAG: &str = "legacy_json_migrated";
 
@@ -465,7 +480,10 @@ impl DictStore {
     }
 
     /// Increment the count for `(reading, surface)`. Inserts the row at
-    /// count=1 if absent. Used per-commit by UserScorer.
+    /// count=1 if absent. Used per-commit by UserScorer. Enforces
+    /// `MAX_USER_SCORES` afterwards on the same lowest-count / earliest-
+    /// ROWID policy as segmentations — see `record_segmentation` and
+    /// `enforce_row_cap` for the rationale.
     pub fn increment_score(&self, reading: &str, surface: &str) -> io::Result<()> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
@@ -474,6 +492,7 @@ impl DictStore {
             params![reading, surface],
         )
         .map_err(sqlite_to_io)?;
+        Self::enforce_row_cap(&conn, "user_scores", MAX_USER_SCORES)?;
         Ok(())
     }
 
@@ -484,6 +503,13 @@ impl DictStore {
     /// dragged everything into one bunsetsu). The count is incremented on
     /// each re-record so repeated confirmations reinforce the entry;
     /// changing the segmentation for the same kana replaces `boundaries`.
+    ///
+    /// After insert, enforces `MAX_USER_SEGMENTATIONS` by evicting the
+    /// lowest-count rows first (ties broken by earliest ROWID). Without
+    /// the cap, every unique sentence the user types adds a permanent
+    /// row — segmentations use the whole kana as the key, so long-form
+    /// writing accumulates unbounded and reloads all of it on every
+    /// engine start (bug [23]).
     pub fn record_segmentation(&self, kana: &str, boundaries: &[usize]) -> io::Result<()> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let serialised = encode_boundaries(boundaries);
@@ -496,6 +522,61 @@ impl DictStore {
             params![kana, serialised],
         )
         .map_err(sqlite_to_io)?;
+        Self::enforce_row_cap(
+            &conn,
+            "user_segmentations",
+            MAX_USER_SEGMENTATIONS,
+        )?;
+        Ok(())
+    }
+
+    /// Delete a learned segmentation row (called when the learned layout
+    /// converges back to the DP default — see `ConversionEngine::start_conversion`
+    /// self-cleaning). No error if the row is absent.
+    pub fn forget_segmentation(&self, kana: &str) -> io::Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "DELETE FROM user_segmentations WHERE kana = ?1",
+            params![kana],
+        )
+        .map_err(sqlite_to_io)?;
+        Ok(())
+    }
+
+    /// Evict rows from `table` until it holds at most `cap`. Deletes the
+    /// least-reinforced rows first (lowest `count`), breaking ties by
+    /// earliest ROWID so long-standing but rarely-used entries also age
+    /// out. Cheap when the table is under cap (a single COUNT query).
+    fn enforce_row_cap(
+        conn: &rusqlite::Connection,
+        table: &str,
+        cap: usize,
+    ) -> io::Result<()> {
+        let n: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| {
+                row.get(0)
+            })
+            .map_err(sqlite_to_io)?;
+        if (n as usize) <= cap {
+            return Ok(());
+        }
+        let excess = (n as usize) - cap;
+        conn.execute(
+            &format!(
+                "DELETE FROM {} WHERE ROWID IN (
+                     SELECT ROWID FROM {} ORDER BY count ASC, ROWID ASC LIMIT ?1
+                 )",
+                table, table,
+            ),
+            params![excess as i64],
+        )
+        .map_err(sqlite_to_io)?;
+        log::info!(
+            "Evicted {} lowest-count rows from {} (cap {})",
+            excess,
+            table,
+            cap,
+        );
         Ok(())
     }
 
@@ -640,6 +721,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("dict.sqlite")
+    }
+
+    /// Regression [23]: `user_segmentations` must be capped so a
+    /// heavy-typing habit doesn't grow the table forever (every unique
+    /// sentence uses the full kana as the key). Evict lowest-count /
+    /// oldest ROWID first so long-standing but rarely-reinforced rows
+    /// give way to newer working-set entries.
+    #[test]
+    fn record_segmentation_evicts_lowest_count_over_cap() {
+        // Point the cap at a tiny number for the test by exercising the
+        // enforce_row_cap helper directly.
+        let path = temp_db_path("seg_cap");
+        let store = DictStore::open(&path).unwrap();
+
+        // Prime a few rows with distinct counts so we can observe the
+        // eviction order.
+        store.record_segmentation("high1", &[2, 4]).unwrap();
+        store.record_segmentation("high1", &[2, 4]).unwrap(); // count = 2
+        store.record_segmentation("high2", &[3, 5]).unwrap();
+        store.record_segmentation("high2", &[3, 5]).unwrap();
+        store.record_segmentation("high2", &[3, 5]).unwrap(); // count = 3
+        store.record_segmentation("low1", &[1, 2]).unwrap(); // count = 1
+        store.record_segmentation("low2", &[1, 3]).unwrap(); // count = 1
+
+        // Force a cap of 2 by calling the helper directly.
+        {
+            let conn = store.conn.lock().unwrap();
+            DictStore::enforce_row_cap(&conn, "user_segmentations", 2).unwrap();
+        }
+
+        let loaded = store.load_user_segmentations().unwrap();
+        assert_eq!(loaded.len(), 2, "cap should shrink to 2 rows");
+        // The two highest-count rows must survive; the singletons go.
+        assert!(loaded.contains_key("high1"));
+        assert!(loaded.contains_key("high2"));
+        assert!(!loaded.contains_key("low1"));
+        assert!(!loaded.contains_key("low2"));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Regression [23]: `forget_segmentation` must actually remove the
+    /// row, so the self-cleaning path in ConversionEngine::start_conversion
+    /// (when learned drifts back to the DP default) can permanently
+    /// retire the row and stop reloading it at every engine start.
+    #[test]
+    fn forget_segmentation_removes_row() {
+        let path = temp_db_path("seg_forget");
+        let store = DictStore::open(&path).unwrap();
+        store.record_segmentation("いちご", &[1, 2]).unwrap();
+        assert_eq!(store.load_user_segmentations().unwrap().len(), 1);
+        store.forget_segmentation("いちご").unwrap();
+        assert_eq!(store.load_user_segmentations().unwrap().len(), 0);
+        // Idempotent on missing rows.
+        store.forget_segmentation("いちご").unwrap();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// Regression [24]: a corrupt row in user_segmentations must be

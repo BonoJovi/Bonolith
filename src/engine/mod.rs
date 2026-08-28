@@ -495,10 +495,24 @@ impl ConversionEngine {
                 .iter()
                 .all(|&b| b > 0 && b < kana_char_len)
                 && learned.windows(2).all(|w| w[0] < w[1]);
-            if valid && boundaries_of(&segment_states) != learned {
+            let dp_boundaries = boundaries_of(&segment_states);
+            if valid && dp_boundaries != learned {
                 if let Some(rebuilt) = segments_from_boundaries(&kana, &learned, &dict) {
                     segment_states = self.build_segment_states(&rebuilt);
                 }
+            } else if dp_boundaries == learned {
+                // Self-cleaning (bug [23]): the learned layout now matches
+                // what the DP segmenter would produce on its own —
+                // either the dictionary caught up, or the user resized
+                // back to the default and committed. The row would sit
+                // in the store forever, contributing to reload cost at
+                // engine start, so drop it now.
+                let mut scorer = self
+                    .shared
+                    .user_scorer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                scorer.forget_segmentation(&kana);
             }
         }
         drop(dict);
@@ -1905,6 +1919,45 @@ mod tests {
         assert_eq!(
             before, after,
             "candidates must be untouched by a stale rerank result",
+        );
+    }
+
+    /// Regression [23]: a learned segmentation whose boundaries now
+    /// coincide with what the DP segmenter would produce on its own
+    /// must be forgotten on the next start_conversion, so long-lived
+    /// rows don't pile up and slow every engine start. Verifies the
+    /// self-cleaning path without needing a full store round-trip.
+    #[test]
+    fn learned_segmentation_matching_dp_is_forgotten() {
+        let engine = ConversionEngine::with_shared(SharedCore::new_hermetic());
+        // Compute the DP-default boundaries for "あめがふる" first so we
+        // know what to inject as the "already-matches-DP" learned row.
+        let dp_default = {
+            let dict = engine.shared.dictionary.read().unwrap();
+            let segs = dict.segment("あめがふる");
+            segs.iter().skip(1).map(|s| s.start).collect::<Vec<_>>()
+        };
+        // Inject that same layout as a learned segmentation.
+        {
+            let mut scorer = engine.shared.user_scorer.lock().unwrap();
+            scorer.record_segmentation("あめがふる", dp_default.clone());
+            assert!(
+                scorer.lookup_segmentation("あめがふる").is_some(),
+                "seed row must be present before start_conversion",
+            );
+        }
+        // Trigger the self-cleaning path.
+        let mut engine = engine;
+        for ch in "amegafuru".chars() {
+            engine.process_key(ch);
+        }
+        engine.start_conversion();
+        // The learned row now matches DP, so start_conversion should
+        // have retired it.
+        let scorer = engine.shared.user_scorer.lock().unwrap();
+        assert!(
+            scorer.lookup_segmentation("あめがふる").is_none(),
+            "learned == DP default row must be forgotten by start_conversion",
         );
     }
 

@@ -99,6 +99,27 @@ impl UserScorer {
         self.segmentations.get(kana).map(|v| v.as_slice())
     }
 
+    /// Drop a learned segmentation from memory and the store. Called
+    /// when the learned layout has drifted back to what the DP
+    /// segmenter now produces on its own (dictionary improvements,
+    /// user resizes back to the default) so the row stops taking up
+    /// space and reload cost forever — bug [23]. No-op if the entry
+    /// was never recorded.
+    pub fn forget_segmentation(&mut self, kana: &str) {
+        if self.segmentations.remove(kana).is_none() {
+            return;
+        }
+        if let Some(store) = &self.store {
+            if let Err(e) = store.forget_segmentation(kana) {
+                log::warn!(
+                    "failed to forget segmentation for {}: {}",
+                    kana,
+                    e
+                );
+            }
+        }
+    }
+
     /// Score a (reading, surface) pair based on user history.
     /// Returns 0.0 if never selected. Uses absolute logarithmic scaling
     /// so that even a single selection provides meaningful signal.
