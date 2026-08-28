@@ -169,6 +169,28 @@ pub fn dispatch_key(
     let keyval = event.keyval;
     let has_shift = event.has_shift();
 
+    // Shift+Space → full-width space (Mozc / Google IME / ATOK
+    // convention). Always inserts a full-width `　` directly, even at
+    // an empty preedit (no conversion is triggered). If a conversion
+    // is active, the current text is committed first — same pattern
+    // as a printable char during conversion.
+    if keyval == KEY_SPACE && has_shift {
+        let commit = if *converting {
+            let text = engine.commit_conversion();
+            *converting = false;
+            text
+        } else {
+            None
+        };
+        engine.append_raw("\u{3000}");
+        return KeyOutcome {
+            consumed: true,
+            commit,
+            display: DisplayUpdate::Preedit(engine.preedit()),
+            ..KeyOutcome::default()
+        };
+    }
+
     // Tab while a preedit / conversion is active → commit current text
     // and consume the key. Focus does NOT move — matches the standard
     // Japanese IME convention (Mozc / Google IME / ATOK). When nothing
@@ -652,6 +674,61 @@ mod tests {
         let out = dispatch_key(&mut e, &mut c, ev(b'.' as u32));
         assert!(out.consumed);
         assert_eq!(e.preedit(), "。");
+    }
+
+    /// Shift+Space at an empty preedit inserts a full-width `　`
+    /// directly — it does NOT start a conversion (unlike bare Space,
+    /// which passes through when the preedit is empty). Mozc / Google
+    /// IME convention.
+    #[test]
+    fn shift_space_inserts_fullwidth_space() {
+        let (mut e, mut c) = setup();
+        let out = dispatch_key(&mut e, &mut c, ev_shift(KEY_SPACE));
+        assert!(out.consumed);
+        assert!(!c);
+        assert!(out.commit.is_none());
+        assert_eq!(e.preedit(), "\u{3000}");
+        assert!(matches!(out.display, DisplayUpdate::Preedit(ref p) if p == "\u{3000}"));
+    }
+
+    /// Shift+Space appends to an existing preedit rather than replacing
+    /// or triggering conversion.
+    #[test]
+    fn shift_space_appends_to_preedit() {
+        let (mut e, mut c) = setup();
+        dispatch_key(&mut e, &mut c, ev(b'a' as u32));
+        let out = dispatch_key(&mut e, &mut c, ev_shift(KEY_SPACE));
+        assert!(out.consumed);
+        assert!(!c);
+        assert_eq!(e.preedit(), "あ\u{3000}");
+    }
+
+    /// Shift+Space during conversion commits the current conversion
+    /// first (matching the "printable during conversion" flow), then
+    /// starts a fresh preedit with the full-width space.
+    #[test]
+    fn shift_space_during_conversion_commits_and_appends() {
+        let (mut e, mut c) = setup();
+        for k in [b'k', b'a'] {
+            dispatch_key(&mut e, &mut c, ev(k as u32));
+        }
+        dispatch_key(&mut e, &mut c, ev(KEY_SPACE));
+        assert!(c);
+        let out = dispatch_key(&mut e, &mut c, ev_shift(KEY_SPACE));
+        assert!(out.consumed);
+        assert!(!c, "conversion should end");
+        assert!(out.commit.is_some(), "current conversion should commit");
+        assert!(matches!(out.display, DisplayUpdate::Preedit(ref p) if p.ends_with('\u{3000}')));
+    }
+
+    /// Bare Space with no preedit still passes through (unchanged) —
+    /// only Shift+Space triggers the fullwidth insert.
+    #[test]
+    fn bare_space_no_preedit_still_passes_through() {
+        let (mut e, mut c) = setup();
+        let out = dispatch_key(&mut e, &mut c, ev(KEY_SPACE));
+        assert!(!out.consumed);
+        assert_eq!(e.preedit(), "");
     }
 
     /// Release events are the frontend's job — the dispatcher must not
