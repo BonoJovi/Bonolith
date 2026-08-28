@@ -15,7 +15,7 @@ use std::thread;
 
 use crate::core::{
     dictionary::{connection_cost, Dictionary, DictionaryEntry, PartOfSpeech, Segment},
-    grammar::{GrammarEngine, GrammarToken},
+    grammar::GrammarEngine,
     llm::LlmEngine,
     romaji::RomajiConverter,
     store::DictStore,
@@ -666,44 +666,6 @@ impl ConversionEngine {
     /// Clear conversion state (on commit or cancel).
     pub fn clear_conversion(&mut self) {
         self.conversion = None;
-    }
-
-    /// Trigger conversion (legacy interface for tests).
-    /// Runs the full 3-stage pipeline: dictionary → grammar → LLM.
-    pub fn convert(&mut self) -> Vec<ConversionCandidate> {
-        self.romaji.flush();
-        let kana = self.romaji.output().to_string();
-        if kana.is_empty() {
-            return Vec::new();
-        }
-
-        let segments = self.shared.dictionary.read().unwrap_or_else(|e| e.into_inner()).segment(&kana);
-        if segments.is_empty() {
-            return Vec::new();
-        }
-
-        let candidates = self.build_candidates(&segments);
-
-        let llm = self.shared.llm.lock().unwrap_or_else(|e| e.into_inner());
-        let mut scored: Vec<ConversionCandidate> = candidates
-            .into_iter()
-            .map(|text| {
-                let grammar_tokens = self.tokens_for_grammar(&text, &segments);
-                let grammar_result = self.shared.grammar.score(&grammar_tokens);
-                let llm_score = llm.score_candidate(&text);
-                let combined = grammar_result.score * 0.4 + llm_score * 0.6;
-                ConversionCandidate {
-                    text,
-                    grammar_score: grammar_result.score,
-                    llm_score,
-                    score: combined,
-                }
-            })
-            .collect();
-
-        drop(llm);
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        scored
     }
 
     /// Convert the focused segment's reading to half-width romaji (F10 during conversion mode).
@@ -1437,101 +1399,18 @@ impl ConversionEngine {
         }
     }
 
-    /// Build candidate sentences from segmented words.
-    /// For each segment, pick the top candidates and combine.
-    fn build_candidates(&self, segments: &[Segment]) -> Vec<String> {
-        // Start with the top candidate for each segment (best conversion)
-        let mut results = Vec::new();
-
-        // Best candidate: top surface for each segment
-        let best: String = segments
-            .iter()
-            .map(|seg| {
-                seg.candidates
-                    .first()
-                    .map(|c| c.surface.as_str())
-                    .unwrap_or(&seg.reading)
-            })
-            .collect();
-        results.push(best);
-
-        // Generate alternatives by swapping one segment at a time
-        for (i, seg) in segments.iter().enumerate() {
-            for candidate in seg.candidates.iter().skip(1).take(3) {
-                let alt: String = segments
-                    .iter()
-                    .enumerate()
-                    .map(|(j, s)| {
-                        if j == i {
-                            candidate.surface.as_str()
-                        } else {
-                            s.candidates
-                                .first()
-                                .map(|c| c.surface.as_str())
-                                .unwrap_or(&s.reading)
-                        }
-                    })
-                    .collect();
-                if !results.contains(&alt) {
-                    results.push(alt);
-                }
-            }
-        }
-
-        // Also include the raw kana as a candidate
-        let raw_kana: String = segments.iter().map(|s| s.reading.as_str()).collect();
-        if !results.contains(&raw_kana) {
-            results.push(raw_kana);
-        }
-
-        results
-    }
-
-    /// Create grammar tokens from a candidate text and its segments.
-    fn tokens_for_grammar(&self, _text: &str, segments: &[Segment]) -> Vec<GrammarToken> {
-        segments
-            .iter()
-            .map(|seg| {
-                let pos = seg
-                    .candidates
-                    .first()
-                    .map(|c| c.pos)
-                    .unwrap_or(crate::core::dictionary::PartOfSpeech::Other);
-                GrammarToken {
-                    surface: seg
-                        .candidates
-                        .first()
-                        .map(|c| c.surface.clone())
-                        .unwrap_or_else(|| seg.reading.clone()),
-                    pos,
-                }
-            })
-            .collect()
-    }
 }
 
+/// Return value from `ConversionEngine::process_key`. The dispatcher
+/// discards it — `preedit()` provides the same information — but the
+/// two variants stay for the `process_key_buffering`/`_produces_kana`
+/// tests which pattern-match on them as a state-machine smoke check.
 #[derive(Debug, Clone)]
 pub enum EngineAction {
     /// Key was buffered (incomplete romaji). Contains current preedit.
     Buffering(String),
     /// Preedit text was updated (kana produced). Contains current preedit.
     UpdatePreedit(String),
-    /// Candidates are ready to display.
-    ShowCandidates(Vec<ConversionCandidate>),
-    /// Text was committed.
-    Commit(String),
-}
-
-#[derive(Debug, Clone)]
-pub struct ConversionCandidate {
-    /// Converted text (kanji/mixed)
-    pub text: String,
-    /// Grammar score (0.0–1.0)
-    pub grammar_score: f64,
-    /// LLM score (0.0–1.0)
-    pub llm_score: f64,
-    /// Combined score (grammar * 0.4 + LLM * 0.6)
-    pub score: f64,
 }
 
 #[cfg(test)]
@@ -1816,79 +1695,79 @@ mod tests {
         assert_eq!(engine.preedit(), "かn");
     }
 
+    /// "kyou" (きょう) — the single segment's top candidate should be
+    /// the kanji "今日" (highest dictionary frequency + kanji preference).
     #[test]
     fn convert_basic() {
         let mut engine = ConversionEngine::new();
-        // Type "kyou" → きょう
         for ch in "kyou".chars() {
             engine.process_key(ch);
         }
-        let candidates = engine.convert();
-        assert!(!candidates.is_empty());
-        // Top candidate should be 今日 (highest frequency + kanji bonus)
-        assert_eq!(candidates[0].text, "今日");
+        let state = engine.start_conversion().expect("start_conversion returned None");
+        let seg = &state.segments[0];
+        assert!(!seg.candidates.is_empty());
+        assert_eq!(seg.candidates[0], "今日");
     }
 
+    /// A multi-segment sentence produces at least one segment whose top
+    /// candidate contains a kanji — the dictionary layer must find kanji
+    /// candidates for the common words in "きょうはいいてんき".
     #[test]
     fn convert_sentence() {
         let mut engine = ConversionEngine::new();
-        // Type "kyouhaiitenki" → きょうはいいてんき
         for ch in "kyouhaiitenki".chars() {
             engine.process_key(ch);
         }
-        let candidates = engine.convert();
-        assert!(!candidates.is_empty());
-        // Some candidate should contain kanji conversion
-        let any_has_kanji = candidates.iter().any(|c| {
-            c.text.chars().any(|ch| ('\u{4E00}'..='\u{9FFF}').contains(&ch))
+        let state = engine.start_conversion().expect("start_conversion returned None");
+        let has_kanji = state.segments.iter().any(|s| {
+            s.candidates.iter().any(|c| {
+                c.chars().any(|ch| ('\u{4E00}'..='\u{9FFF}').contains(&ch))
+            })
         });
-        assert!(any_has_kanji, "Expected kanji in candidates: {:?}", candidates.iter().map(|c| &c.text).collect::<Vec<_>>());
+        assert!(
+            has_kanji,
+            "expected kanji in some segment's candidates: {:?}",
+            state.segments.iter().map(|s| &s.candidates).collect::<Vec<_>>()
+        );
     }
 
+    /// start_conversion returns None when there is nothing to convert.
     #[test]
     fn convert_empty() {
         let mut engine = ConversionEngine::new();
-        let candidates = engine.convert();
-        assert!(candidates.is_empty());
+        assert!(engine.start_conversion().is_none());
     }
 
+    /// commit_conversion clears the composing state — preedit is empty
+    /// afterwards.
     #[test]
     fn commit_resets_state() {
         let mut engine = ConversionEngine::new();
         for ch in "kyou".chars() {
             engine.process_key(ch);
         }
-        let candidates = engine.convert();
-        let committed = engine.commit(&candidates[0].text);
-        assert_eq!(committed, candidates[0].text);
+        let committed_text = {
+            let state = engine.start_conversion().expect("start_conversion returned None");
+            state.segments[0].candidates[state.segments[0].selected].clone()
+        };
+        let committed = engine.commit_conversion().expect("commit_conversion returned None");
+        assert_eq!(committed, committed_text);
         assert_eq!(engine.preedit(), "");
     }
 
-    #[test]
-    fn candidates_have_scores() {
-        let mut engine = ConversionEngine::new();
-        for ch in "kyou".chars() {
-            engine.process_key(ch);
-        }
-        let candidates = engine.convert();
-        for c in &candidates {
-            assert!(c.score >= 0.0);
-            assert!(c.score <= 1.0);
-            assert!(c.grammar_score >= 0.0);
-            assert!(c.llm_score >= 0.0);
-        }
-    }
-
+    /// The raw kana "きょう" must not outrank the kanji "今日" in the
+    /// candidate list — the dictionary + rerank layers preserve the
+    /// standard "kanji first" ordering.
     #[test]
     fn kanji_ranked_above_kana() {
         let mut engine = ConversionEngine::new();
         for ch in "kyou".chars() {
             engine.process_key(ch);
         }
-        let candidates = engine.convert();
-        // Raw kana きょう should be ranked below kanji candidates
-        let kana_pos = candidates.iter().position(|c| c.text == "きょう");
-        let kanji_pos = candidates.iter().position(|c| c.text == "今日");
+        let state = engine.start_conversion().expect("start_conversion returned None");
+        let candidates = &state.segments[0].candidates;
+        let kana_pos = candidates.iter().position(|c| c == "きょう");
+        let kanji_pos = candidates.iter().position(|c| c == "今日");
         if let (Some(kp), Some(kap)) = (kana_pos, kanji_pos) {
             assert!(kap < kp, "kanji should rank above kana");
         }
