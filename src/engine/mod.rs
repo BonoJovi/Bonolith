@@ -495,10 +495,24 @@ impl ConversionEngine {
                 .iter()
                 .all(|&b| b > 0 && b < kana_char_len)
                 && learned.windows(2).all(|w| w[0] < w[1]);
-            if valid && boundaries_of(&segment_states) != learned {
+            let dp_boundaries = boundaries_of(&segment_states);
+            if valid && dp_boundaries != learned {
                 if let Some(rebuilt) = segments_from_boundaries(&kana, &learned, &dict) {
                     segment_states = self.build_segment_states(&rebuilt);
                 }
+            } else if dp_boundaries == learned {
+                // Self-cleaning (bug [23]): the learned layout now matches
+                // what the DP segmenter would produce on its own —
+                // either the dictionary caught up, or the user resized
+                // back to the default and committed. The row would sit
+                // in the store forever, contributing to reload cost at
+                // engine start, so drop it now.
+                let mut scorer = self
+                    .shared
+                    .user_scorer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                scorer.forget_segmentation(&kana);
             }
         }
         drop(dict);
@@ -1905,6 +1919,58 @@ mod tests {
         assert_eq!(
             before, after,
             "candidates must be untouched by a stale rerank result",
+        );
+    }
+
+    /// Regression [23]: a learned segmentation whose boundaries now
+    /// coincide with what the DP segmenter would produce on its own
+    /// must be forgotten on the next start_conversion, so long-lived
+    /// rows don't pile up and slow every engine start.
+    ///
+    /// "DP default" here means whatever `start_conversion` computes
+    /// before the learned override runs — that's `segment_with_boost`
+    /// piped through `filter_segmentation`, NOT a bare `dict.segment`.
+    /// An earlier version of this test called `dict.segment` directly
+    /// and matched only by coincidence; a future filter-side change
+    /// would silently break the coupling. Drive one round of
+    /// `start_conversion` with an empty scorer to snapshot the *real*
+    /// DP boundaries, then seed them and re-enter to verify
+    /// self-cleaning fires.
+    #[test]
+    fn learned_segmentation_matching_dp_is_forgotten() {
+        let mut engine = ConversionEngine::with_shared(SharedCore::new_hermetic());
+
+        // Phase 1: run start_conversion with no learned row and
+        // capture the real DP-default boundaries the engine uses.
+        for ch in "amegafuru".chars() {
+            engine.process_key(ch);
+        }
+        engine.start_conversion();
+        let dp_default = boundaries_of(&engine.conversion_state().unwrap().segments);
+        engine.commit_conversion();
+        // commit_conversion is safe on an all-DP layout —
+        // record_segmentation only fires when final != initial.
+
+        // Phase 2: seed that same layout as a learned segmentation.
+        {
+            let mut scorer = engine.shared.user_scorer.lock().unwrap();
+            scorer.record_segmentation("あめがふる", dp_default.clone());
+            assert!(
+                scorer.lookup_segmentation("あめがふる").is_some(),
+                "seed row must be present before the self-cleaning start_conversion",
+            );
+        }
+
+        // Phase 3: trigger start_conversion again — the learned row
+        // matches the DP default, so the self-cleaning arm retires it.
+        for ch in "amegafuru".chars() {
+            engine.process_key(ch);
+        }
+        engine.start_conversion();
+        let scorer = engine.shared.user_scorer.lock().unwrap();
+        assert!(
+            scorer.lookup_segmentation("あめがふる").is_none(),
+            "learned == DP default row must be forgotten by start_conversion",
         );
     }
 

@@ -1143,12 +1143,20 @@ impl BonolithEngine {
             ])
             .output();
 
+        // Capture the selected entry's identity so the apply path below
+        // can re-fetch the LIVE user entries (a concurrent register /
+        // delete may have shifted indices between showing the list and
+        // confirming here — bug [17]).
+        let sel_reading = user_entries[idx].reading.clone();
+        let sel_surface = user_entries[idx].surface.clone();
+        drop(user_entries);
+
         match action {
             Ok(out) if out.status.success() => {
                 let choice = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 match choice.as_str() {
-                    "編集" => Self::edit_user_entry(user_entries, idx),
-                    "削除" => Self::delete_user_entry(user_entries, idx),
+                    "編集" => Self::edit_user_entry(sel_reading, sel_surface),
+                    "削除" => Self::delete_user_entry(sel_reading, sel_surface),
                     _ => {}
                 }
             }
@@ -1156,32 +1164,38 @@ impl BonolithEngine {
         }
     }
 
-    /// Delete a user dictionary entry by index.
-    fn delete_user_entry(mut entries: Vec<DictionaryEntry>, idx: usize) {
-        let entry = &entries[idx];
+    /// Delete a user dictionary entry identified by (reading, surface).
+    /// Re-fetches the live user_entries under the write lock so any
+    /// concurrent addition survives (bug [17]).
+    fn delete_user_entry(reading: String, surface: String) {
         let confirm = std::process::Command::new("zenity")
             .args([
                 "--question", "--title=Bonolith: 削除の確認",
-                &format!("--text=「{}」→「{}」を削除しますか？", entry.reading, entry.surface),
+                &format!("--text=「{}」→「{}」を削除しますか？", reading, surface),
             ])
             .status();
 
-        match confirm {
-            Ok(s) if s.success() => {
-                entries.remove(idx);
-                Self::save_and_apply_user_entries(entries);
-            }
-            _ => {}
+        if !matches!(confirm, Ok(s) if s.success()) {
+            return;
         }
+
+        let shared = SharedCore::global();
+        let mut dict = shared.dictionary.write().unwrap_or_else(|e| e.into_inner());
+        let mut live: Vec<DictionaryEntry> = dict.user_entries().to_vec();
+        let before = live.len();
+        live.retain(|e| !(e.reading == reading && e.surface == surface));
+        if live.len() == before {
+            // Row already gone (raced with another delete).
+            return;
+        }
+        Self::apply_user_entries_locked(&mut dict, live);
     }
 
-    /// Edit a user dictionary entry by index.
+    /// Edit a user dictionary entry identified by (old_reading, old_surface).
     /// Reuses the GTK register dialog in edit mode, prefilled with the
     /// current reading and surface so 単語 stays 日本語ON after Tab.
-    fn edit_user_entry(mut entries: Vec<DictionaryEntry>, idx: usize) {
-        let old_reading = entries[idx].reading.clone();
-        let old_surface = entries[idx].surface.clone();
-
+    /// Applies the change to LIVE entries by identity — see [17].
+    fn edit_user_entry(old_reading: String, old_surface: String) {
         let output = std::process::Command::new("/usr/bin/python3")
             .args([
                 "/usr/share/bonolith/scripts/bonolith_word_register.py",
@@ -1192,33 +1206,50 @@ impl BonolithEngine {
             ])
             .output();
 
-        match output {
-            Ok(out) if out.status.success() => {
-                let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                let parts: Vec<&str> = text.split('|').collect();
-                if parts.len() < 2 {
-                    return;
-                }
-                let new_reading = parts[0].trim();
-                let new_surface = parts[1].trim();
-                if new_reading.is_empty() || new_surface.is_empty() {
-                    return;
-                }
-                if new_reading == old_reading && new_surface == old_surface {
-                    return; // no change
-                }
-                entries[idx].reading = new_reading.to_string();
-                entries[idx].surface = new_surface.to_string();
-                Self::save_and_apply_user_entries(entries);
-            }
-            _ => {}
+        let out = match output {
+            Ok(o) if o.status.success() => o,
+            _ => return,
+        };
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let parts: Vec<&str> = text.split('|').collect();
+        if parts.len() < 2 {
+            return;
         }
-    }
+        let new_reading = parts[0].trim();
+        let new_surface = parts[1].trim();
+        if new_reading.is_empty() || new_surface.is_empty() {
+            return;
+        }
+        if new_reading == old_reading && new_surface == old_surface {
+            return; // no change
+        }
 
-    /// Save modified user entries to file and apply to live dictionary.
-    fn save_and_apply_user_entries(entries: Vec<DictionaryEntry>) {
         let shared = SharedCore::global();
         let mut dict = shared.dictionary.write().unwrap_or_else(|e| e.into_inner());
+        let mut live: Vec<DictionaryEntry> = dict.user_entries().to_vec();
+        let mut hit = false;
+        for e in live.iter_mut() {
+            if e.reading == old_reading && e.surface == old_surface {
+                e.reading = new_reading.to_string();
+                e.surface = new_surface.to_string();
+                hit = true;
+                break;
+            }
+        }
+        if !hit {
+            // Someone deleted this entry concurrently; nothing to update.
+            return;
+        }
+        Self::apply_user_entries_locked(&mut dict, live);
+    }
+
+    /// Push `entries` into the live dictionary + persist. Caller holds
+    /// the dict write lock, so this is a simple `replace_user_entries` +
+    /// `sync_user_entries_to_store` (both are cheap for the user section).
+    fn apply_user_entries_locked(
+        dict: &mut Dictionary,
+        entries: Vec<DictionaryEntry>,
+    ) {
         dict.replace_user_entries(entries);
         if let Err(e) = dict.sync_user_entries_to_store() {
             warn!("Bonolith: Failed to save user dict: {}", e);

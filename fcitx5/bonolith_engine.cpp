@@ -437,7 +437,13 @@ void BonolithEngine::runManageDict() {
         std::string textArg = "--text=「" + selReading + "」→「" + selSurface + "」を削除しますか？";
         std::string cmd = "zenity --question '--title=Bonolith: 削除の確認' " + shellQuote(textArg);
         if (system(cmd.c_str()) == 0) {
-            if (bonolith_dict_delete_entry(idx)) {
+            // Apply by (reading, surface) identity captured above rather
+            // than the display-time index: another dialog / process may
+            // have added or reordered entries between showing the list
+            // and confirming the delete, and an index-based apply would
+            // clobber those changes via the store-level replace (bug [17]).
+            if (bonolith_dict_delete_entry_by_identity(
+                    selReading.c_str(), selSurface.c_str())) {
                 runZenity({"--info", "--title=Bonolith", "--text=削除しました"});
             }
         }
@@ -468,7 +474,11 @@ void BonolithEngine::runManageDict() {
         if (newReading.empty() || newSurface.empty()) return;
         if (newReading == selReading && newSurface == selSurface) return;
 
-        if (bonolith_dict_update_entry(idx, newReading.c_str(), newSurface.c_str())) {
+        // Apply by (old_reading, old_surface) identity — same rationale
+        // as the delete path above (bug [17]).
+        if (bonolith_dict_update_entry_by_identity(
+                selReading.c_str(), selSurface.c_str(),
+                newReading.c_str(), newSurface.c_str())) {
             runZenity({"--info", "--title=Bonolith", "--text=辞書を更新しました"});
         } else {
             runZenity({"--error", "--title=Bonolith", "--text=更新に失敗しました"});

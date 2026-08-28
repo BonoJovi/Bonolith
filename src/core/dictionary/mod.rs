@@ -2571,6 +2571,50 @@ mod tests {
         assert_eq!(results[0].surface, "テスト");
     }
 
+    /// Regression [17]: the dict-management dialog used to hold a
+    /// snapshot of user_entries at dialog-open time, then apply
+    /// delete/edit by index onto that stale vec and push the mutated
+    /// snapshot back through `replace_user_entries`. Any word registered
+    /// between "show list" and "confirm delete" was clobbered by the
+    /// replay of the pre-registration snapshot. The fix re-fetches
+    /// `user_entries()` under the write lock at apply time and applies
+    /// by (reading, surface) identity. This test locks in that pattern:
+    /// a concurrent add survives an identity-based delete.
+    #[test]
+    fn identity_based_delete_preserves_concurrent_add() {
+        let mut dict = Dictionary::new();
+        let user_start = dict.user_start;
+        let entry = |r: &str, s: &str| DictionaryEntry {
+            reading: r.to_string(),
+            surface: s.to_string(),
+            pos: PartOfSpeech::Noun,
+            frequency: 8000,
+        };
+        dict.add_entry(entry("あ", "A"));
+        dict.add_entry(entry("い", "B"));
+        dict.add_entry(entry("う", "C"));
+        // Dialog opens and snapshots — for display only.
+        let _dialog_snapshot: Vec<DictionaryEntry> = dict.user_entries().to_vec();
+        // Concurrent register while dialog is still open.
+        dict.add_entry(entry("え", "D"));
+        // Apply "delete B" the fixed way: re-fetch live entries, drop
+        // by identity, push back through replace_user_entries.
+        let mut live: Vec<DictionaryEntry> = dict.user_entries().to_vec();
+        let before = live.len();
+        live.retain(|e| !(e.reading == "い" && e.surface == "B"));
+        assert_eq!(live.len(), before - 1);
+        dict.replace_user_entries(live);
+        // D must survive.
+        let surfaces: Vec<String> = dict
+            .user_entries()
+            .iter()
+            .map(|e| e.surface.clone())
+            .collect();
+        assert_eq!(surfaces, vec!["A", "C", "D"]);
+        // Built-in entries are still intact (user_start unchanged).
+        assert_eq!(dict.user_start, user_start);
+    }
+
     #[test]
     fn sync_and_load_via_store() {
         let dir = std::env::temp_dir().join("bonolith_test_dict_sync");

@@ -4,7 +4,7 @@
 
 - **Type**: Japanese AI Input Method for Linux (IBus + Fcitx5)
 - **Purpose**: LLM-based intelligent Japanese input method
-- **Version**: v3.1.10
+- **Version**: v3.1.11
 - **Branch**: `dev` for development, `main` for releases
 
 ## Essential Rules
@@ -13,7 +13,7 @@
 2. **Version files**: Update all 6 files simultaneously — `Cargo.toml`, `README.md`, `data/bonolith.xml`, `fcitx5/bonolith-addon.conf`, `fcitx5/CMakeLists.txt`, `CLAUDE.md` (the `**Version**` line below). `cargo build --release` regenerates `Cargo.lock` — commit it too.
 3. **No `unwrap()` in production Rust** — always use `Result<T, E>`
 4. **Commit messages**: English, conventional format `type(scope): description`
-5. **Release**: Use `/release`
+5. **Release**: Use `/release`. **Never merge dev → main directly** — the release ships through a `gh pr create -B main -H dev` PR so Devin's auto-review runs on the whole batch before tagging.
 
 ## Install & Restart
 
