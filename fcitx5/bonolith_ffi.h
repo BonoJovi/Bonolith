@@ -1,5 +1,14 @@
 /// Bonolith C FFI header — generated from src/ffi.rs
 /// Used by the Fcitx5 C++ addon to interface with the Rust engine.
+///
+/// NULL safety: every entry point below tolerates a NULL BonolithContext*
+/// (and NULL `out` for bonolith_get_ui_state, NULL string pointers for
+/// dict entry / import / export operations). Passing NULL returns the
+/// documented default sentinel for that function's return type — false /
+/// -1 / NULL / 0 — and mutates nothing.  This lets the caller check
+/// `bonolith_context_new()` for NULL once and delay allocation failure
+/// handling instead of guarding every subsequent call, though the safe
+/// pattern is still to check.
 
 #ifndef BONOLITH_FFI_H
 #define BONOLITH_FFI_H

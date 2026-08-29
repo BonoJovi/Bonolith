@@ -52,6 +52,20 @@ where
     }
 }
 
+/// Read a nul-terminated C string as an owned `String`, or `None` on
+/// null pointer / non-UTF-8. Callers get NULL-safety for free: the
+/// prior `CStr::from_ptr(p)` was UB on a NULL argument and would
+/// SEGV before `ffi_boundary` could catch anything (Devin PR #3 #6).
+unsafe fn cstr_to_string(p: *const c_char) -> Option<String> {
+    if p.is_null() {
+        return None;
+    }
+    unsafe { std::ffi::CStr::from_ptr(p) }
+        .to_str()
+        .ok()
+        .map(String::from)
+}
+
 /// Maximum number of segments in a conversion.
 const MAX_SEGMENTS: usize = 32;
 /// Maximum number of candidates per segment.
@@ -162,7 +176,7 @@ pub unsafe extern "C" fn bonolith_handle_key(
     state: u32,
 ) -> bool {
     ffi_boundary(false, || {
-        let ctx = unsafe { &mut *ctx };
+        let Some(ctx) = (unsafe { ctx.as_mut() }) else { return false; };
 
         // Consume releases for F6–F10 while composing so GTK apps don't open
         // menus on F10-release. All other releases pass through.
@@ -193,7 +207,7 @@ pub unsafe extern "C" fn bonolith_handle_key(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_get_preedit(ctx: *mut BonolithContext) -> *const c_char {
     ffi_boundary(ptr::null(), || {
-        let ctx = unsafe { &mut *ctx };
+        let Some(ctx) = (unsafe { ctx.as_mut() }) else { return ptr::null(); };
         let preedit = ctx.engine.preedit();
         ctx.cache_preedit = CString::new(preedit).unwrap_or_default();
         ctx.cache_preedit.as_ptr()
@@ -206,7 +220,7 @@ pub unsafe extern "C" fn bonolith_get_preedit(ctx: *mut BonolithContext) -> *con
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_poll_commit(ctx: *mut BonolithContext) -> *const c_char {
     ffi_boundary(ptr::null(), || {
-        let ctx = unsafe { &mut *ctx };
+        let Some(ctx) = (unsafe { ctx.as_mut() }) else { return ptr::null(); };
         match ctx.pending_commit.take() {
             Some(text) => {
                 ctx.cache_commit = CString::new(text).unwrap_or_default();
@@ -221,7 +235,7 @@ pub unsafe extern "C" fn bonolith_poll_commit(ctx: *mut BonolithContext) -> *con
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_is_converting(ctx: *mut BonolithContext) -> bool {
     ffi_boundary(false, || {
-        let ctx = unsafe { &*ctx };
+        let Some(ctx) = (unsafe { ctx.as_ref() }) else { return false; };
         ctx.converting
     })
 }
@@ -232,7 +246,7 @@ pub unsafe extern "C" fn bonolith_is_converting(ctx: *mut BonolithContext) -> bo
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_rerank_pending(ctx: *mut BonolithContext) -> bool {
     ffi_boundary(false, || {
-        let ctx = unsafe { &*ctx };
+        let Some(ctx) = (unsafe { ctx.as_ref() }) else { return false; };
         ctx.engine.rerank_inflight()
     })
 }
@@ -243,7 +257,7 @@ pub unsafe extern "C" fn bonolith_rerank_pending(ctx: *mut BonolithContext) -> b
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_poll_apply_rerank(ctx: *mut BonolithContext) -> bool {
     ffi_boundary(false, || {
-        let ctx = unsafe { &mut *ctx };
+        let Some(ctx) = (unsafe { ctx.as_mut() }) else { return false; };
         ctx.engine.apply_llm_rerank()
     })
 }
@@ -252,7 +266,7 @@ pub unsafe extern "C" fn bonolith_poll_apply_rerank(ctx: *mut BonolithContext) -
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_has_preedit(ctx: *mut BonolithContext) -> bool {
     ffi_boundary(false, || {
-        let ctx = unsafe { &*ctx };
+        let Some(ctx) = (unsafe { ctx.as_ref() }) else { return false; };
         !ctx.engine.preedit().is_empty()
     })
 }
@@ -262,7 +276,7 @@ pub unsafe extern "C" fn bonolith_has_preedit(ctx: *mut BonolithContext) -> bool
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_composed_text(ctx: *mut BonolithContext) -> *const c_char {
     ffi_boundary(ptr::null(), || {
-        let ctx = unsafe { &mut *ctx };
+        let Some(ctx) = (unsafe { ctx.as_mut() }) else { return ptr::null(); };
         let text = ctx.engine.conversion_state()
             .map(|s| s.composed_text())
             .unwrap_or_default();
@@ -275,7 +289,7 @@ pub unsafe extern "C" fn bonolith_composed_text(ctx: *mut BonolithContext) -> *c
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_segment_count(ctx: *mut BonolithContext) -> i32 {
     ffi_boundary(0, || {
-        let ctx = unsafe { &*ctx };
+        let Some(ctx) = (unsafe { ctx.as_ref() }) else { return 0; };
         ctx.engine.conversion_state()
             .map(|s| s.segments.len() as i32)
             .unwrap_or(0)
@@ -286,7 +300,7 @@ pub unsafe extern "C" fn bonolith_segment_count(ctx: *mut BonolithContext) -> i3
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_focus_index(ctx: *mut BonolithContext) -> i32 {
     ffi_boundary(0, || {
-        let ctx = unsafe { &*ctx };
+        let Some(ctx) = (unsafe { ctx.as_ref() }) else { return 0; };
         ctx.engine.conversion_state()
             .map(|s| s.focus as i32)
             .unwrap_or(0)
@@ -297,7 +311,7 @@ pub unsafe extern "C" fn bonolith_focus_index(ctx: *mut BonolithContext) -> i32 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_segment_start_chars(ctx: *mut BonolithContext, seg: i32) -> i32 {
     ffi_boundary(0, || {
-        let ctx = unsafe { &*ctx };
+        let Some(ctx) = (unsafe { ctx.as_ref() }) else { return 0; };
         ctx.engine.conversion_state()
             .and_then(|s| {
                 let ranges = s.segment_char_ranges();
@@ -311,7 +325,7 @@ pub unsafe extern "C" fn bonolith_segment_start_chars(ctx: *mut BonolithContext,
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_segment_char_len(ctx: *mut BonolithContext, seg: i32) -> i32 {
     ffi_boundary(0, || {
-        let ctx = unsafe { &*ctx };
+        let Some(ctx) = (unsafe { ctx.as_ref() }) else { return 0; };
         ctx.engine.conversion_state()
             .and_then(|s| {
                 let ranges = s.segment_char_ranges();
@@ -325,7 +339,7 @@ pub unsafe extern "C" fn bonolith_segment_char_len(ctx: *mut BonolithContext, se
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_candidate_count(ctx: *mut BonolithContext) -> i32 {
     ffi_boundary(0, || {
-        let ctx = unsafe { &*ctx };
+        let Some(ctx) = (unsafe { ctx.as_ref() }) else { return 0; };
         ctx.engine.conversion_state()
             .map(|s| s.segments[s.focus].candidates.len() as i32)
             .unwrap_or(0)
@@ -337,7 +351,7 @@ pub unsafe extern "C" fn bonolith_candidate_count(ctx: *mut BonolithContext) -> 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_candidate_text(ctx: *mut BonolithContext, index: i32) -> *const c_char {
     ffi_boundary(ptr::null(), || {
-        let ctx = unsafe { &mut *ctx };
+        let Some(ctx) = (unsafe { ctx.as_mut() }) else { return ptr::null(); };
         let text = ctx.engine.conversion_state()
             .and_then(|s| {
                 let seg = &s.segments[s.focus];
@@ -353,7 +367,7 @@ pub unsafe extern "C" fn bonolith_candidate_text(ctx: *mut BonolithContext, inde
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_selected_index(ctx: *mut BonolithContext) -> i32 {
     ffi_boundary(0, || {
-        let ctx = unsafe { &*ctx };
+        let Some(ctx) = (unsafe { ctx.as_ref() }) else { return 0; };
         ctx.engine.conversion_state()
             .map(|s| s.segments[s.focus].selected as i32)
             .unwrap_or(0)
@@ -364,7 +378,7 @@ pub unsafe extern "C" fn bonolith_selected_index(ctx: *mut BonolithContext) -> i
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_reset(ctx: *mut BonolithContext) {
     ffi_boundary((), || {
-        let ctx = unsafe { &mut *ctx };
+        let Some(ctx) = (unsafe { ctx.as_mut() }) else { return; };
         ctx.engine.reset();
         ctx.engine.clear_conversion();
         ctx.converting = false;
@@ -380,7 +394,7 @@ pub unsafe extern "C" fn bonolith_reset(ctx: *mut BonolithContext) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_commit_input(ctx: *mut BonolithContext) {
     ffi_boundary((), || {
-        let ctx = unsafe { &mut *ctx };
+        let Some(ctx) = (unsafe { ctx.as_mut() }) else { return; };
         if ctx.converting {
             if let Some(text) = ctx.engine.commit_conversion() {
                 ctx.pending_commit = Some(text);
@@ -404,8 +418,8 @@ pub unsafe extern "C" fn bonolith_commit_input(ctx: *mut BonolithContext) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_get_ui_state(ctx: *mut BonolithContext, out: *mut BonolithUiState) {
     ffi_boundary((), || {
-        let ctx = unsafe { &mut *ctx };
-        let out = unsafe { &mut *out };
+        let Some(ctx) = (unsafe { ctx.as_mut() }) else { return; };
+        let Some(out) = (unsafe { out.as_mut() }) else { return; };
 
         // Zero-init segments and candidates
         for i in 0..MAX_SEGMENTS {
@@ -433,22 +447,25 @@ pub unsafe extern "C" fn bonolith_get_ui_state(ctx: *mut BonolithContext, out: *
             if let Some(state) = ctx.engine.conversion_state() {
                 let composed = state.composed_text();
                 let ranges = state.segment_char_ranges();
-                let seg_count = state.segments.len().min(MAX_SEGMENTS);
-                let focus = state.focus;
+                let (visible_ranges, clamped_focus) =
+                    compress_segments_for_display(&ranges, state.focus);
+                let seg_count = visible_ranges.len();
 
                 out.segment_count = seg_count as i32;
-                out.focus_index = focus as i32;
+                out.focus_index = clamped_focus as i32;
 
-                for i in 0..seg_count {
-                    let (start, end) = ranges[i];
+                for (i, (start, end)) in visible_ranges.iter().enumerate() {
                     out.segments[i] = BonolithSegmentInfo {
-                        start_chars: start as i32,
+                        start_chars: *start as i32,
                         char_len: (end - start) as i32,
                     };
                 }
 
-                // Candidates for focused segment
-                let seg = &state.segments[focus];
+                // Candidates for focused segment — always the real
+                // focus, even when the rendered focus_index above was
+                // clamped for display: candidate cycling / commit
+                // operates on the true segment index.
+                let seg = &state.segments[state.focus];
                 let cand_count = seg.candidates.len().min(MAX_CANDIDATES);
                 out.candidate_count = cand_count as i32;
                 // Clamp the selected index into the visible window: if the
@@ -531,14 +548,8 @@ pub unsafe extern "C" fn bonolith_dict_add_entry(
     surface: *const c_char,
 ) -> bool {
     ffi_boundary(false, || {
-        let reading = match unsafe { std::ffi::CStr::from_ptr(reading) }.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return false,
-        };
-        let surface = match unsafe { std::ffi::CStr::from_ptr(surface) }.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return false,
-        };
+        let Some(reading) = (unsafe { cstr_to_string(reading) }) else { return false; };
+        let Some(surface) = (unsafe { cstr_to_string(surface) }) else { return false; };
         if reading.is_empty() || surface.is_empty() {
             return false;
         }
@@ -552,8 +563,10 @@ pub unsafe extern "C" fn bonolith_dict_add_entry(
 
         let shared = SharedCore::global();
         let mut dict = write_lock_recover(&shared.dictionary);
-        dict.add_entry(entry);
-        dict.sync_user_entries_to_store().is_ok()
+        // Per-row upsert (Devin PR #3 #2) — the prior whole-table
+        // replace_all wiped rows the other frontend added since this
+        // process started.
+        dict.add_user_entry_and_persist(entry).is_ok()
     })
 }
 
@@ -582,29 +595,16 @@ pub unsafe extern "C" fn bonolith_dict_delete_entry_by_identity(
     surface: *const c_char,
 ) -> bool {
     ffi_boundary(false, || {
-        let reading = match unsafe { std::ffi::CStr::from_ptr(reading) }.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return false,
-        };
-        let surface = match unsafe { std::ffi::CStr::from_ptr(surface) }.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return false,
-        };
+        let Some(reading) = (unsafe { cstr_to_string(reading) }) else { return false; };
+        let Some(surface) = (unsafe { cstr_to_string(surface) }) else { return false; };
 
         let shared = SharedCore::global();
         let mut dict = write_lock_recover(&shared.dictionary);
-        // Re-fetch under the write lock so any concurrent add is
-        // included in `live` and only the identified row is dropped.
-        let mut live: Vec<DictionaryEntry> = dict.user_entries().to_vec();
-        let before = live.len();
-        live.retain(|e| !(e.reading == reading && e.surface == surface));
-        if live.len() == before {
-            // Row already gone (double-click / concurrent delete).
-            // Callers treat false as "nothing to do" not an error.
-            return false;
-        }
-        dict.replace_user_entries(live);
-        dict.sync_user_entries_to_store().is_ok()
+        // Per-row DELETE (Devin PR #3 #2) — the prior replace_all
+        // wiped rows the other frontend added since this process
+        // started. Callers treat `false` as "nothing to do".
+        dict.remove_user_entry_and_persist(&reading, &surface)
+            .unwrap_or(false)
     })
 }
 
@@ -621,47 +621,26 @@ pub unsafe extern "C" fn bonolith_dict_update_entry_by_identity(
     new_surface: *const c_char,
 ) -> bool {
     ffi_boundary(false, || {
-        let parse = |p: *const c_char| unsafe { std::ffi::CStr::from_ptr(p) }
-            .to_str()
-            .map(str::to_string)
-            .ok();
-        let old_reading = match parse(old_reading) {
-            Some(s) => s,
-            None => return false,
-        };
-        let old_surface = match parse(old_surface) {
-            Some(s) => s,
-            None => return false,
-        };
-        let new_reading = match parse(new_reading) {
-            Some(s) => s,
-            None => return false,
-        };
-        let new_surface = match parse(new_surface) {
-            Some(s) => s,
-            None => return false,
-        };
+        let Some(old_reading) = (unsafe { cstr_to_string(old_reading) }) else { return false; };
+        let Some(old_surface) = (unsafe { cstr_to_string(old_surface) }) else { return false; };
+        let Some(new_reading) = (unsafe { cstr_to_string(new_reading) }) else { return false; };
+        let Some(new_surface) = (unsafe { cstr_to_string(new_surface) }) else { return false; };
         if new_reading.is_empty() || new_surface.is_empty() {
             return false;
         }
 
         let shared = SharedCore::global();
         let mut dict = write_lock_recover(&shared.dictionary);
-        let mut live: Vec<DictionaryEntry> = dict.user_entries().to_vec();
-        let mut hit = false;
-        for e in live.iter_mut() {
-            if e.reading == old_reading && e.surface == old_surface {
-                e.reading = new_reading.clone();
-                e.surface = new_surface.clone();
-                hit = true;
-                break;
-            }
-        }
-        if !hit {
-            return false;
-        }
-        dict.replace_user_entries(live);
-        dict.sync_user_entries_to_store().is_ok()
+        // Per-row DELETE-then-UPSERT (Devin PR #3 #2) — the prior
+        // replace_all wiped concurrent additions from the other
+        // frontend. POS/frequency are preserved from the old row.
+        dict.update_user_entry_and_persist(
+            &old_reading,
+            &old_surface,
+            &new_reading,
+            &new_surface,
+        )
+        .unwrap_or(false)
     })
 }
 
@@ -759,10 +738,8 @@ pub unsafe extern "C" fn bonolith_dict_free_entries(result: BonolithDictEntries)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_dict_export(path: *const c_char) -> bool {
     ffi_boundary(false, || {
-        let path = match unsafe { std::ffi::CStr::from_ptr(path) }.to_str() {
-            Ok(s) => std::path::PathBuf::from(s),
-            Err(_) => return false,
-        };
+        let Some(path) = (unsafe { cstr_to_string(path) }) else { return false; };
+        let path = std::path::PathBuf::from(path);
         let shared = SharedCore::global();
         let dict = read_lock_recover(&shared.dictionary);
         dict.export(&path).is_ok()
@@ -773,17 +750,15 @@ pub unsafe extern "C" fn bonolith_dict_export(path: *const c_char) -> bool {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_dict_import(path: *const c_char) -> i32 {
     ffi_boundary(-1, || {
-        let path = match unsafe { std::ffi::CStr::from_ptr(path) }.to_str() {
-            Ok(s) => std::path::PathBuf::from(s),
-            Err(_) => return -1,
-        };
+        let Some(path) = (unsafe { cstr_to_string(path) }) else { return -1; };
+        let path = std::path::PathBuf::from(path);
         let shared = SharedCore::global();
         let mut dict = write_lock_recover(&shared.dictionary);
-        match dict.import(&path) {
-            Ok(count) => {
-                let _ = dict.sync_user_entries_to_store();
-                count as i32
-            }
+        // Per-entry upsert (Devin PR #3 #2) — the prior `import` +
+        // whole-table `sync_user_entries_to_store` overwrote rows the
+        // other frontend added since this process started.
+        match dict.import_and_persist(&path) {
+            Ok(count) => count as i32,
             Err(_) => -1,
         }
     })
@@ -801,4 +776,180 @@ pub unsafe extern "C" fn bonolith_clear_learning() -> i32 {
             Err(_) => -1,
         }
     })
+}
+
+/// Truncate a segment-range list to the FFI's fixed MAX_SEGMENTS slot
+/// count, and clamp `focus` into the visible window.
+///
+/// When the real segment count exceeds MAX_SEGMENTS, the last visible
+/// slot absorbs all remaining segments' char range. The Fcitx5 preedit
+/// renderer only iterates up to `segment_count`, so without this merge
+/// segments 33+ would be in `composed_text()` (and would land in the
+/// commit) but never appear in the panel — panel and commit disagree
+/// (Devin PR #3 #5). Segment boundaries past 32 stop being
+/// individually navigable in the panel, but nothing goes invisible.
+///
+/// Focus clamping ensures Fcitx5's `i == focus_index` comparison
+/// always matches some slot; otherwise the panel shows every visible
+/// segment as an underline and the cursor position vanishes.
+fn compress_segments_for_display(
+    ranges: &[(usize, usize)],
+    focus: usize,
+) -> (Vec<(usize, usize)>, usize) {
+    let real = ranges.len();
+    let visible = real.min(MAX_SEGMENTS);
+    let out: Vec<(usize, usize)> = (0..visible)
+        .map(|i| {
+            let (start, end) = ranges[i];
+            if i == visible - 1 && real > MAX_SEGMENTS {
+                (start, ranges[real - 1].1)
+            } else {
+                (start, end)
+            }
+        })
+        .collect();
+    let clamped_focus = if visible == 0 { 0 } else { focus.min(visible - 1) };
+    (out, clamped_focus)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Under the MAX_SEGMENTS cap: every segment passes through
+    /// unchanged and focus is preserved.
+    #[test]
+    fn compress_under_max_passthrough() {
+        let ranges: Vec<(usize, usize)> = (0..10).map(|i| (i * 2, i * 2 + 2)).collect();
+        let (out, focus) = compress_segments_for_display(&ranges, 3);
+        assert_eq!(out, ranges);
+        assert_eq!(focus, 3);
+    }
+
+    /// Exactly at the cap: also unchanged.
+    #[test]
+    fn compress_at_max_passthrough() {
+        let ranges: Vec<(usize, usize)> = (0..MAX_SEGMENTS).map(|i| (i, i + 1)).collect();
+        let (out, focus) = compress_segments_for_display(&ranges, MAX_SEGMENTS - 1);
+        assert_eq!(out.len(), MAX_SEGMENTS);
+        assert_eq!(out, ranges);
+        assert_eq!(focus, MAX_SEGMENTS - 1);
+    }
+
+    /// Past the cap: the last visible slot absorbs every remaining
+    /// segment's char range so `sum(char_len)` equals the full preedit
+    /// length. Devin PR #3 #5.
+    #[test]
+    fn compress_over_max_merges_tail_no_text_loss() {
+        // 40 segments, each 1 char → total 40 chars.
+        let ranges: Vec<(usize, usize)> = (0..40).map(|i| (i, i + 1)).collect();
+        let (out, _focus) = compress_segments_for_display(&ranges, 0);
+        assert_eq!(out.len(), MAX_SEGMENTS);
+        // Slots 0..31 pass through; slot 31 absorbs chars 31..40.
+        assert_eq!(out[0], (0, 1));
+        assert_eq!(out[MAX_SEGMENTS - 2], (30, 31));
+        assert_eq!(out[MAX_SEGMENTS - 1], (31, 40));
+        // Sum of char_len across visible slots covers the full preedit
+        // (0..40) — nothing goes invisible.
+        let total: usize = out.iter().map(|(s, e)| e - s).sum();
+        assert_eq!(total, 40);
+    }
+
+    /// Focus past the cap is clamped to the last visible slot so
+    /// Fcitx5's `i == focus_index` still matches something.
+    #[test]
+    fn compress_clamps_focus_past_max() {
+        let ranges: Vec<(usize, usize)> = (0..40).map(|i| (i, i + 1)).collect();
+        let (_, focus) = compress_segments_for_display(&ranges, 35);
+        assert_eq!(focus, MAX_SEGMENTS - 1);
+    }
+
+    /// Focus inside the visible window stays put even when the total
+    /// exceeds the cap.
+    #[test]
+    fn compress_preserves_focus_when_visible() {
+        let ranges: Vec<(usize, usize)> = (0..40).map(|i| (i, i + 1)).collect();
+        let (_, focus) = compress_segments_for_display(&ranges, 7);
+        assert_eq!(focus, 7);
+    }
+
+    /// Empty input degrades gracefully — no panic, focus stays at 0.
+    #[test]
+    fn compress_empty_input() {
+        let (out, focus) = compress_segments_for_display(&[], 0);
+        assert!(out.is_empty());
+        assert_eq!(focus, 0);
+    }
+
+    // ── NULL-safety regressions (Devin PR #3 #6) ────────────────────
+    //
+    // Every extern "C" entry point on this file used to blindly
+    // dereference its `*mut BonolithContext` / `*const c_char`
+    // arguments. `ffi_boundary` only catches panics, not the UB
+    // triggered by dereferencing NULL — the process would SEGV before
+    // it could recover. Each entry point now guards its pointer
+    // arguments with a null check; these tests call every wrapper
+    // directly from Rust to lock the contract in place.
+
+    #[test]
+    fn null_ctx_handle_key_returns_false() {
+        let ok = unsafe { bonolith_handle_key(ptr::null_mut(), b'a' as u32, 0) };
+        assert!(!ok);
+    }
+
+    #[test]
+    fn null_ctx_state_queries_return_defaults() {
+        assert!(unsafe { bonolith_get_preedit(ptr::null_mut()) }.is_null());
+        assert!(unsafe { bonolith_poll_commit(ptr::null_mut()) }.is_null());
+        assert!(!unsafe { bonolith_is_converting(ptr::null_mut()) });
+        assert!(!unsafe { bonolith_rerank_pending(ptr::null_mut()) });
+        assert!(!unsafe { bonolith_poll_apply_rerank(ptr::null_mut()) });
+        assert!(!unsafe { bonolith_has_preedit(ptr::null_mut()) });
+        assert!(unsafe { bonolith_composed_text(ptr::null_mut()) }.is_null());
+        assert_eq!(unsafe { bonolith_segment_count(ptr::null_mut()) }, 0);
+        assert_eq!(unsafe { bonolith_focus_index(ptr::null_mut()) }, 0);
+        assert_eq!(unsafe { bonolith_segment_start_chars(ptr::null_mut(), 0) }, 0);
+        assert_eq!(unsafe { bonolith_segment_char_len(ptr::null_mut(), 0) }, 0);
+        assert_eq!(unsafe { bonolith_candidate_count(ptr::null_mut()) }, 0);
+        assert!(unsafe { bonolith_candidate_text(ptr::null_mut(), 0) }.is_null());
+        assert_eq!(unsafe { bonolith_selected_index(ptr::null_mut()) }, 0);
+    }
+
+    #[test]
+    fn null_ctx_mutating_ops_are_noops() {
+        // No return values to inspect; the contract is "does not
+        // dereference NULL". The test passes when the calls simply
+        // return instead of aborting the test binary with a SEGV.
+        unsafe {
+            bonolith_reset(ptr::null_mut());
+            bonolith_commit_input(ptr::null_mut());
+            bonolith_context_free(ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn null_ui_state_out_pointer_is_ignored() {
+        // Both null: neither ctx nor out gets touched — no crash.
+        unsafe {
+            bonolith_get_ui_state(ptr::null_mut(), ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn null_dict_paths_return_error_sentinels() {
+        assert!(!unsafe { bonolith_dict_add_entry(ptr::null(), ptr::null()) });
+        assert!(!unsafe {
+            bonolith_dict_delete_entry_by_identity(ptr::null(), ptr::null())
+        });
+        assert!(!unsafe {
+            bonolith_dict_update_entry_by_identity(
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+            )
+        });
+        assert!(!unsafe { bonolith_dict_export(ptr::null()) });
+        assert_eq!(unsafe { bonolith_dict_import(ptr::null()) }, -1);
+    }
 }

@@ -48,27 +48,64 @@ impl UserScorer {
     /// Record a user selection for the given (reading, surface) pair.
     /// Called only for segments where the user explicitly chose a candidate,
     /// so no additional filtering is needed here.
-    pub fn record(&mut self, reading: &str, surface: &str) {
-        let key = Self::key(reading, surface);
-        *self.counts.entry(key).or_insert(0) += 1;
+    ///
+    /// **Ordering** (Devin PR #3 #4a): store first, then memory. On DB
+    /// failure the memory increment is skipped so a subsequent read
+    /// doesn't see phantom learning that will vanish on restart. Also
+    /// prunes memory in lockstep with any cap eviction the store
+    /// reports back (Devin #4c), so `score()` / `lookup_segmentation()`
+    /// no longer diverge from the DB after MAX_USER_SCORES fills.
+    pub fn record(&mut self, reading: &str, surface: &str) -> io::Result<()> {
         if let Some(store) = &self.store {
-            if let Err(e) = store.increment_score(reading, surface) {
-                log::warn!("failed to persist score for {}|{}: {}", reading, surface, e);
+            let evicted = match store.increment_score(reading, surface) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!(
+                        "failed to persist score for {}|{}: {}",
+                        reading,
+                        surface,
+                        e,
+                    );
+                    return Err(e);
+                }
+            };
+            // Store succeeded — reflect in memory: increment then remove
+            // any cap-evicted entries so the map matches the DB.
+            let key = Self::key(reading, surface);
+            *self.counts.entry(key).or_insert(0) += 1;
+            for (r, s) in evicted {
+                self.counts.remove(&Self::key(&r, &s));
             }
+        } else {
+            let key = Self::key(reading, surface);
+            *self.counts.entry(key).or_insert(0) += 1;
         }
+        Ok(())
     }
 
     /// Clear all learning history from memory and the persistent store.
     /// Returns the number of rows deleted from the store (score + segmentation
     /// rows combined).
+    ///
+    /// **Ordering** (Devin PR #3 #4b): store clears first, then memory.
+    /// On DB failure the memory maps stay populated so the session
+    /// stays consistent with what a restart would load; the prior
+    /// order cleared memory optimistically and, on store failure,
+    /// left "cleared now, back next reboot" as the visible state.
     pub fn clear_scores(&mut self) -> io::Result<usize> {
-        self.counts.clear();
-        self.segmentations.clear();
         if let Some(store) = &self.store {
-            let scores = store.clear_user_scores()?;
-            let segs = store.clear_user_segmentations()?;
-            Ok(scores + segs)
+            // Single-transaction wipe of both learning tables (Devin
+            // PR #4 review #4). Prior code cleared user_scores then
+            // user_segmentations as separate auto-commits — a failure
+            // between them left the first cleared, memory unchanged
+            // (early-return), and the two states inconsistent.
+            let total = store.clear_all_user_learning()?;
+            self.counts.clear();
+            self.segmentations.clear();
+            Ok(total)
         } else {
+            self.counts.clear();
+            self.segmentations.clear();
             Ok(0)
         }
     }
@@ -78,17 +115,35 @@ impl UserScorer {
     /// [`DictStore::record_segmentation`] for the format. Called by the
     /// engine on commit when the final segmentation differs from what
     /// the DP segmenter originally produced.
-    pub fn record_segmentation(&mut self, kana: &str, boundaries: Vec<usize>) {
+    /// Store-first ordering + cap-eviction sync (Devin PR #3 #4a, #4c).
+    /// On DB failure the memory map is not updated. Successful persist
+    /// returns any kana keys the store evicted so we drop them from
+    /// memory in the same call.
+    pub fn record_segmentation(
+        &mut self,
+        kana: &str,
+        boundaries: Vec<usize>,
+    ) -> io::Result<()> {
         if let Some(store) = &self.store {
-            if let Err(e) = store.record_segmentation(kana, &boundaries) {
-                log::warn!(
-                    "failed to persist segmentation for {}: {}",
-                    kana,
-                    e
-                );
+            let evicted = match store.record_segmentation(kana, &boundaries) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!(
+                        "failed to persist segmentation for {}: {}",
+                        kana,
+                        e,
+                    );
+                    return Err(e);
+                }
+            };
+            self.segmentations.insert(kana.to_string(), boundaries);
+            for k in evicted {
+                self.segmentations.remove(&k);
             }
+        } else {
+            self.segmentations.insert(kana.to_string(), boundaries);
         }
-        self.segmentations.insert(kana.to_string(), boundaries);
+        Ok(())
     }
 
     /// Look up a learned segmentation for `kana`. Returns the boundary
@@ -174,7 +229,7 @@ mod tests {
     #[test]
     fn record_and_score() {
         let mut scorer = UserScorer::new();
-        scorer.record("きょう", "今日");
+        scorer.record("きょう", "今日").unwrap();
         assert!(scorer.score("きょう", "今日") > 0.0);
     }
 
@@ -182,16 +237,16 @@ mod tests {
     fn more_selections_higher_score() {
         let mut scorer = UserScorer::new();
         for _ in 0..10 {
-            scorer.record("きょう", "今日");
+            scorer.record("きょう", "今日").unwrap();
         }
-        scorer.record("きょう", "京");
+        scorer.record("きょう", "京").unwrap();
         assert!(scorer.score("きょう", "今日") > scorer.score("きょう", "京"));
     }
 
     #[test]
     fn single_selection_gives_boost() {
         let mut scorer = UserScorer::new();
-        scorer.record("へんかん", "変換");
+        scorer.record("へんかん", "変換").unwrap();
         // Even one selection should give a meaningful score
         assert!(scorer.score("へんかん", "変換") > 0.2);
     }
@@ -199,7 +254,7 @@ mod tests {
     #[test]
     fn kana_only_recorded() {
         let mut scorer = UserScorer::new();
-        scorer.record("きょう", "きょう"); // same reading as surface — now recorded
+        scorer.record("きょう", "きょう").unwrap(); // same reading as surface — now recorded
         assert!(scorer.score("きょう", "きょう") > 0.0);
     }
 
@@ -207,8 +262,8 @@ mod tests {
     fn record_persists_through_store() {
         let store = temp_store("persist");
         let mut scorer = UserScorer::from_store(store.clone()).unwrap();
-        scorer.record("きょう", "今日");
-        scorer.record("きょう", "今日");
+        scorer.record("きょう", "今日").unwrap();
+        scorer.record("きょう", "今日").unwrap();
         let s1 = scorer.score("きょう", "今日");
         drop(scorer);
 
