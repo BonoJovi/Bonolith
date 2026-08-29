@@ -457,6 +457,15 @@ impl BonolithEngine {
             engine.clear_conversion();
         }
         *self.converting.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        // Drop any pending release records — the matching release may
+        // never reach us if the client swallowed it during the focus
+        // change, and a stale entry would silently eat the NEXT
+        // press of the same key on a fresh input context (Devin PR
+        // #3 #8).
+        self.pending_release
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         // Deliberately keep `enabled` — standard IMEs hold 日本語ON/OFF per
         // input context across focus changes. Clearing it here made every
         // focus-out drop the mode, and neither focus_in nor IBus' enable
@@ -495,6 +504,14 @@ impl BonolithEngine {
         info!("Bonolith: Disable");
         let _ = self.cancel_input(&emitter).await;
         *self.enabled.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        // Same rationale as focus_out — a release we're owed may
+        // never arrive across a disable, and letting stale entries
+        // sit would eat the first matching press after re-enable
+        // (Devin PR #3 #8).
+        self.pending_release
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Set cursor location (unused but required by interface).
@@ -713,13 +730,18 @@ impl BonolithEngine {
             1,
         ).await.map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
-        // Lookup table for the focused segment's candidates
-        let seg = &state.segments[focus];
-        Self::update_lookup_table(
-            emitter,
-            ibus_lookup_table(&seg.candidates, seg.selected),
-            true,
-        ).await.map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        // Lookup table for the focused segment's candidates.
+        // Devin PR #3 review #7: defensive `.get` so a stale focus
+        // that outran resize doesn't panic — the zbus handler would
+        // otherwise take the input context down with it (Fcitx5's
+        // ffi_boundary catches, IBus's dispatcher does not).
+        if let Some(seg) = state.segments.get(focus) {
+            Self::update_lookup_table(
+                emitter,
+                ibus_lookup_table(&seg.candidates, seg.selected),
+                true,
+            ).await.map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        }
 
         // Keep auxiliary text explicitly empty so the XIM proxy doesn't
         // accumulate stale content (Mozc parity).

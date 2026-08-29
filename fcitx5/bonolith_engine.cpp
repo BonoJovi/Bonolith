@@ -33,11 +33,22 @@ void BonolithState::keyEvent(fcitx::KeyEvent &event) {
     if (event.isRelease())
         state |= (1u << 30); // RELEASE_MASK
 
-    if (bonolith_handle_key(ctx_, sym, state)) {
+    // Snapshot "was showing anything?" so we can skip updateUI when a
+    // passthrough key touched nothing on our side — the prior
+    // unconditional updateUI() reset the panel every keystroke and
+    // could stomp state owned by another addon showing in parallel
+    // (Devin PR #3 review #10).
+    bool wasShowing = bonolith_is_converting(ctx_)
+                      || bonolith_has_preedit(ctx_);
+    bool consumed = bonolith_handle_key(ctx_, sym, state);
+    if (consumed) {
         event.filterAndAccept();
     }
-    // Always update UI after key events to keep preedit display in sync
-    updateUI();
+    bool nowShowing = bonolith_is_converting(ctx_)
+                      || bonolith_has_preedit(ctx_);
+    if (consumed || wasShowing || nowShowing) {
+        updateUI();
+    }
 
     // If this key (conversion start / boundary resize) kicked off a background
     // LLM rerank, poll for its result and refresh the panel when it lands.
@@ -162,12 +173,21 @@ void BonolithState::scheduleRerankRefresh() {
             if (!ctx_ || !bonolith_is_converting(ctx_)) {
                 return true;
             }
-            // Result landed: apply, repaint, and stop.
+            // Result landed AND candidates reordered: apply, repaint, stop.
             if (bonolith_poll_apply_rerank(ctx_)) {
                 updateUI();
                 return true;
             }
-            // Still pending: re-arm until the budget is spent.
+            // Applied-no-change or still pending — distinguish by
+            // asking the engine whether the worker is still in flight
+            // (Devin PR #3 review #11). Prior code always re-armed
+            // for the full 2s budget on a false return, burning CPU
+            // for the applied-no-change case where the worker had
+            // already finished and there was nothing to wait for.
+            if (!bonolith_rerank_pending(ctx_)) {
+                return true;
+            }
+            // Still in flight: re-arm until the budget is spent.
             if (++rerankTicks_ < kMaxTicks) {
                 time->setNextInterval(kPollUs);
                 time->setOneShot();
