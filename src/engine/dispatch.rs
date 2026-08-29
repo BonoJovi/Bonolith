@@ -75,9 +75,18 @@ pub const MOD1_MASK: u32 = 1 << 3;
 // Super / Hyper / Meta: usually grabbed by the compositor, but any press
 // that leaks through must be treated as a passthrough — otherwise
 // Super+e romaji-ifies into "え" and hijacks the user's shortcut.
-// Both IBus and Fcitx5 use these bit positions.
-pub const MOD4_MASK: u32 = 1 << 6; // Super
-pub const HYPER_MASK: u32 = 1 << 5; // Hyper
+//
+// Bit positions are IBus's virtual-modifier convention (which the IBus
+// keymap also uses). Bit 5 was previously listed here as HYPER but that
+// is X11's Mod3 — with Caps or ScrollLock remapped to Mod3, latching
+// the modifier made has_ctrl_alt() return true for every keystroke and
+// the whole IME went silent. IBus's own IBUS_HYPER_MASK sits at bit 27
+// and IBus's SUPER at bit 26; both are unused in Fcitx5's KeyStates
+// (which encodes Super at bit 6 via MOD4_MASK), so this convention is
+// safe for both frontends.
+pub const MOD4_MASK: u32 = 1 << 6; // Super (Fcitx5 Mod4 / IBus Mod4 primary)
+pub const SUPER_MASK: u32 = 1 << 26; // Super (IBus virtual bit)
+pub const HYPER_MASK: u32 = 1 << 27; // Hyper (IBus virtual bit; was 1<<5=Mod3 by mistake)
 pub const META_MASK: u32 = 1 << 28; // Meta
 pub const RELEASE_MASK: u32 = 1 << 30;
 
@@ -98,7 +107,9 @@ impl KeyEvent {
     /// with any of these bits is a shortcut the app owns; the dispatcher
     /// returns passthrough so the char never becomes preedit.
     pub fn has_ctrl_alt(&self) -> bool {
-        self.state & (CONTROL_MASK | MOD1_MASK | MOD4_MASK | HYPER_MASK | META_MASK) != 0
+        self.state
+            & (CONTROL_MASK | MOD1_MASK | MOD4_MASK | SUPER_MASK | HYPER_MASK | META_MASK)
+            != 0
     }
 }
 
@@ -1023,7 +1034,7 @@ mod tests {
     /// consumed as "え".
     #[test]
     fn super_plus_letter_passes_through() {
-        for mask in [MOD4_MASK, HYPER_MASK, META_MASK] {
+        for mask in [MOD4_MASK, SUPER_MASK, HYPER_MASK, META_MASK] {
             let (mut e, mut c) = setup();
             let out = dispatch_key(
                 &mut e,
@@ -1036,6 +1047,32 @@ mod tests {
             assert!(!out.consumed, "modifier 0x{mask:08X}+e should passthrough");
             assert_eq!(e.preedit(), "", "modifier 0x{mask:08X}+e leaked into preedit");
         }
+    }
+
+    /// Regression [Devin #1]: X11's Mod3 (1<<5) — often produced when
+    /// Caps or ScrollLock is remapped as Mod3 and latched — must NOT be
+    /// treated as Hyper. Previously HYPER_MASK sat at 1<<5, so any
+    /// Mod3-latched keystroke registered as Hyper+letter and passed
+    /// through, silently disabling the whole IME. Verify a letter with
+    /// only the Mod3 bit set still produces preedit.
+    #[test]
+    fn mod3_latch_does_not_disable_ime() {
+        const X11_MOD3_MASK: u32 = 1 << 5;
+        let (mut e, mut c) = setup();
+        let out = dispatch_key(
+            &mut e,
+            &mut c,
+            KeyEvent {
+                keyval: b'e' as u32,
+                state: X11_MOD3_MASK,
+            },
+        );
+        assert!(out.consumed, "Mod3-latched 'e' should be consumed, not passthrough");
+        assert_eq!(
+            e.preedit(),
+            "え",
+            "Mod3-latched 'e' should still romaji-ify into preedit"
+        );
     }
 
     /// Release events are the frontend's job — the dispatcher must not
