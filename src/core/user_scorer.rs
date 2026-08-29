@@ -94,11 +94,15 @@ impl UserScorer {
     /// left "cleared now, back next reboot" as the visible state.
     pub fn clear_scores(&mut self) -> io::Result<usize> {
         if let Some(store) = &self.store {
-            let scores = store.clear_user_scores()?;
-            let segs = store.clear_user_segmentations()?;
+            // Single-transaction wipe of both learning tables (Devin
+            // PR #4 review #4). Prior code cleared user_scores then
+            // user_segmentations as separate auto-commits — a failure
+            // between them left the first cleared, memory unchanged
+            // (early-return), and the two states inconsistent.
+            let total = store.clear_all_user_learning()?;
             self.counts.clear();
             self.segmentations.clear();
-            Ok(scores + segs)
+            Ok(total)
         } else {
             self.counts.clear();
             self.segmentations.clear();

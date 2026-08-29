@@ -380,10 +380,13 @@ impl Dictionary {
             pos,
             frequency,
         };
-        // DB: remove old row, upsert new — each surgical.
+        // DB: single-transaction DELETE-old + UPSERT-new (Devin PR #4
+        // review #2). The prior pair of auto-committed statements
+        // would leave the DB with neither row if the UPSERT failed
+        // after a successful DELETE — the edited word vanished on
+        // restart.
         if let Some(store) = self.store.as_ref() {
-            store.remove_user_entry(old_reading, old_surface)?;
-            store.upsert_user_entry(&new_entry)?;
+            store.update_user_entry_by_identity(old_reading, old_surface, &new_entry)?;
         }
         // Memory rebuild.
         let kept: Vec<DictionaryEntry> = self.entries[self.user_start..]

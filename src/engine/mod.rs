@@ -362,25 +362,38 @@ impl SharedCore {
     /// no committed text is silently dropped, which is what the plain
     /// `try_lock` path used to do while the worker held the lock
     /// through a 1800 ms rerank (Devin PR #3 #3).
+    ///
+    /// **Ordering** (Devin PR #4 review #3): the pending mutex is
+    /// taken BEFORE the LLM try_lock so concurrent commits are
+    /// serialised through it. Prior code took locks in the other
+    /// order and had a window where:
+    ///   T0 A: try_lock LLM → Err
+    ///   T1 worker: releases LLM
+    ///   T2 B: try_lock LLM → Ok, drains empty pending, applies "B"
+    ///   T3 A: pushes "A" to pending
+    /// producing the wrong committed-text order (B before A). With
+    /// pending-first, either A applies "A" and drops both locks
+    /// before B enters the guarded region, or A pushes "A" to
+    /// pending before B can take the mutex — in either case B sees
+    /// "A" already recorded (in context or in pending) when it
+    /// reaches its own drain.
     pub fn update_llm_context_or_defer(&self, text: &str) {
+        // Acquire pending FIRST — this serialises every commit through
+        // one mutex, so the observable order of `update_llm_context`
+        // calls matches the order commits acquired this guard.
+        let mut pending = self
+            .pending_llm_context
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         match self.llm.try_lock() {
             Ok(mut llm) => {
-                let pending: Vec<String> = std::mem::take(
-                    &mut *self
-                        .pending_llm_context
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()),
-                );
-                for entry in pending {
+                for entry in pending.drain(..) {
                     llm.update_context(&entry);
                 }
                 llm.update_context(text);
             }
             Err(_) => {
-                self.pending_llm_context
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(text.to_string());
+                pending.push(text.to_string());
                 log::debug!(
                     "LLM lock busy during commit — text queued for next opportunity"
                 );
@@ -3163,6 +3176,69 @@ mod tests {
         let mut llm = shared.llm.lock().unwrap();
         shared.drain_pending_llm_context(&mut llm);
         assert_eq!(llm.context(), "XY");
+        assert!(shared.pending_llm_context.lock().unwrap().is_empty());
+    }
+
+    /// Devin PR #4 review #3: concurrent commits racing while the
+    /// worker holds and releases the LLM lock must ALL land in
+    /// `llm.context()` — none may be silently dropped by a
+    /// try_lock/push race between two threads.
+    ///
+    /// The prior implementation locked pending only inside the Err
+    /// arm, so between commit A's `try_lock -> Err` and its
+    /// `pending.push`, another commit could acquire the LLM lock,
+    /// drain (empty) pending, apply itself, and leave A stranded in
+    /// pending unaccounted for. The fix takes pending FIRST so the
+    /// whole check-and-apply-or-defer runs under that guard.
+    ///
+    /// This test drives ~10 concurrent commits through a
+    /// "worker releases mid-race" window and checks every text
+    /// eventually shows up in context.
+    #[test]
+    fn concurrent_commits_never_lose_text() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        let shared = SharedCore::new_hermetic();
+        // Hold llm so all commit threads land in the defer branch.
+        let guard = shared.llm.lock().unwrap();
+
+        let mut handles = Vec::with_capacity(10);
+        for i in 0..10 {
+            let s = Arc::clone(&shared);
+            handles.push(std::thread::spawn(move || {
+                s.update_llm_context_or_defer(&format!("{}", i));
+            }));
+        }
+        // Let the threads race for pending.
+        std::thread::sleep(Duration::from_millis(30));
+        drop(guard); // now try_lock inside a subsequent call can succeed
+        for h in handles {
+            h.join().expect("commit thread panicked");
+        }
+
+        // Trigger a flush from main; the pending queue drains FIFO
+        // and the sentinel lands last.
+        shared.update_llm_context_or_defer("!");
+
+        let llm = shared.llm.lock().unwrap();
+        let ctx = llm.context();
+        assert_eq!(
+            ctx.chars().count(),
+            11,
+            "expected 10 digits + '!' in context, got {ctx:?}"
+        );
+        for i in 0..10 {
+            assert!(
+                ctx.contains(char::from_digit(i, 10).unwrap()),
+                "digit '{}' missing from context {:?}",
+                i,
+                ctx,
+            );
+        }
+        assert!(
+            ctx.ends_with('!'),
+            "sentinel must be last (called after joins), got {ctx:?}",
+        );
         assert!(shared.pending_llm_context.lock().unwrap().is_empty());
     }
 }

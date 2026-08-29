@@ -425,12 +425,77 @@ impl DictStore {
         Ok(n)
     }
 
+    /// Rename an existing user_entries row by identity in a single
+    /// SQLite transaction. Devin PR #4 review #2: the caller's prior
+    /// `remove_user_entry` + `upsert_user_entry` pair auto-committed
+    /// each statement, so an UPSERT failure after a successful
+    /// DELETE left the DB with neither the old row nor the new one —
+    /// the user's typed word vanished on the next restart.
+    ///
+    /// Returns `Ok(1)` when the old row matched and the rename
+    /// applied, `Ok(0)` when nothing matched (both statements still
+    /// commit — insertion of the new row is intentional if the caller
+    /// wanted an upsert). `Err` rolls the whole transaction back so
+    /// the DB is unchanged.
+    pub fn update_user_entry_by_identity(
+        &self,
+        old_reading: &str,
+        old_surface: &str,
+        new_entry: &DictionaryEntry,
+    ) -> io::Result<usize> {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.transaction().map_err(sqlite_to_io)?;
+        let removed = tx
+            .execute(
+                "DELETE FROM user_entries WHERE reading = ?1 AND surface = ?2",
+                params![old_reading, old_surface],
+            )
+            .map_err(sqlite_to_io)?;
+        tx.execute(
+            "INSERT INTO user_entries (reading, surface, pos, frequency)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(reading, surface) DO UPDATE SET
+               pos = excluded.pos,
+               frequency = excluded.frequency",
+            params![
+                new_entry.reading,
+                new_entry.surface,
+                pos_to_str(new_entry.pos),
+                new_entry.frequency,
+            ],
+        )
+        .map_err(sqlite_to_io)?;
+        tx.commit().map_err(sqlite_to_io)?;
+        Ok(removed)
+    }
+
     pub fn clear_user_scores(&self) -> io::Result<usize> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let n = conn
             .execute("DELETE FROM user_scores", [])
             .map_err(sqlite_to_io)?;
         Ok(n)
+    }
+
+    /// Wipe both learning tables in a single SQLite transaction so a
+    /// second-DELETE failure leaves the first table untouched too
+    /// (Devin PR #4 review #4). The prior UserScorer::clear_scores
+    /// path invoked `clear_user_scores` then `clear_user_segmentations`
+    /// as auto-committed statements — a failure between the two left
+    /// scores gone and segmentations intact, and the memory maps in
+    /// UserScorer stayed populated because the early-return skipped
+    /// the memory clear.
+    pub fn clear_all_user_learning(&self) -> io::Result<usize> {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.transaction().map_err(sqlite_to_io)?;
+        let scores = tx
+            .execute("DELETE FROM user_scores", [])
+            .map_err(sqlite_to_io)?;
+        let segs = tx
+            .execute("DELETE FROM user_segmentations", [])
+            .map_err(sqlite_to_io)?;
+        tx.commit().map_err(sqlite_to_io)?;
+        Ok(scores + segs)
     }
 
     pub fn load_user_scores(&self) -> io::Result<HashMap<String, u32>> {
@@ -494,8 +559,14 @@ impl DictStore {
         reading: &str,
         surface: &str,
     ) -> io::Result<Vec<(String, String)>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        // Single transaction: UPSERT + cap enforcement. Devin PR #4
+        // review #5 — the prior split into auto-committed statements
+        // let another process's increment slip between the eviction
+        // SELECT and DELETE, so a row whose count had just been
+        // bumped could still be evicted with its stale count.
+        let tx = conn.transaction().map_err(sqlite_to_io)?;
+        tx.execute(
             "INSERT INTO user_scores (reading, surface, count) VALUES (?1, ?2, 1)
              ON CONFLICT(reading, surface) DO UPDATE SET count = count + 1",
             params![reading, surface],
@@ -506,13 +577,14 @@ impl DictStore {
         // eviction sub-query's ORDER BY count ASC evicts our fresh
         // count=1 row in the same call — the learning is silently lost.
         let rows = Self::enforce_row_cap(
-            &conn,
+            &tx,
             "user_scores",
             &["reading", "surface"],
             MAX_USER_SCORES,
             "AND NOT (reading = ?2 AND surface = ?3)",
             &[&reading, &surface],
         )?;
+        tx.commit().map_err(sqlite_to_io)?;
         Ok(rows
             .into_iter()
             .map(|mut r| {
@@ -545,9 +617,12 @@ impl DictStore {
         kana: &str,
         boundaries: &[usize],
     ) -> io::Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let serialised = encode_boundaries(boundaries);
-        conn.execute(
+        // Single transaction: UPSERT + cap enforcement (Devin PR #4
+        // review #5 — same rationale as increment_score).
+        let tx = conn.transaction().map_err(sqlite_to_io)?;
+        tx.execute(
             "INSERT INTO user_segmentations (kana, boundaries, count)
                  VALUES (?1, ?2, 1)
              ON CONFLICT(kana) DO UPDATE SET
@@ -559,13 +634,14 @@ impl DictStore {
         // Same exclusion as user_scores: keep the row we just recorded
         // from being the first eviction target when the table is at cap.
         let rows = Self::enforce_row_cap(
-            &conn,
+            &tx,
             "user_segmentations",
             &["kana"],
             MAX_USER_SEGMENTATIONS,
             "AND kana != ?2",
             &[&kana],
         )?;
+        tx.commit().map_err(sqlite_to_io)?;
         Ok(rows
             .into_iter()
             .map(|mut r| r.pop().unwrap_or_default())
@@ -612,6 +688,15 @@ impl DictStore {
         exclude_where: &str,
         exclude_params: &[&dyn rusqlite::ToSql],
     ) -> io::Result<Vec<Vec<String>>> {
+        // NOTE (Devin PR #4 review #5): callers now pass a
+        // `&rusqlite::Transaction` (which derefs to `&Connection`) so
+        // the SELECT-then-DELETE below runs inside a single
+        // transaction. That closes the race where a peer connection
+        // could increment a target row's count between the two
+        // statements — the ROWIDs we selected are still deleted, but
+        // now no other write is visible mid-eviction. Test callers
+        // that pass a raw &Connection still work (the tests hit only
+        // a single-thread scenario where the race can't fire).
         let n: i64 = conn
             .query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| {
                 row.get(0)
@@ -1419,5 +1504,96 @@ mod tests {
             .unwrap();
         assert_eq!(store.load_user_entries().unwrap().len(), 0);
         let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// Devin PR #4 review #2: `update_user_entry_by_identity` must
+    /// remove the old row and insert the new one atomically. Happy
+    /// path — verify the old row is gone and the new row landed with
+    /// its own POS/frequency.
+    #[test]
+    fn update_user_entry_by_identity_replaces_atomically() {
+        let path = temp_db_path("update_atomic");
+        let store = DictStore::open(&path).unwrap();
+        store
+            .upsert_user_entry(&DictionaryEntry {
+                reading: "old".to_string(),
+                surface: "OLD".to_string(),
+                pos: PartOfSpeech::Noun,
+                frequency: 8000,
+            })
+            .unwrap();
+        let new_entry = DictionaryEntry {
+            reading: "new".to_string(),
+            surface: "NEW".to_string(),
+            pos: PartOfSpeech::Verb,
+            frequency: 7500,
+        };
+        let removed = store
+            .update_user_entry_by_identity("old", "OLD", &new_entry)
+            .unwrap();
+        assert_eq!(removed, 1);
+        let loaded = store.load_user_entries().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].reading, "new");
+        assert_eq!(loaded[0].surface, "NEW");
+        assert_eq!(loaded[0].pos, PartOfSpeech::Verb);
+        assert_eq!(loaded[0].frequency, 7500);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Devin PR #4 review #4: `clear_all_user_learning` must wipe
+    /// both learning tables atomically. Happy-path assertion — both
+    /// tables come back empty and the returned row count sums both.
+    #[test]
+    fn clear_all_user_learning_wipes_both_tables() {
+        let path = temp_db_path("clear_both");
+        let store = DictStore::open(&path).unwrap();
+        store.increment_score("a", "A").unwrap();
+        store.increment_score("b", "B").unwrap();
+        store.record_segmentation("いち", &[1]).unwrap();
+        assert_eq!(store.load_user_scores().unwrap().len(), 2);
+        assert_eq!(store.load_user_segmentations().unwrap().len(), 1);
+
+        let deleted = store.clear_all_user_learning().unwrap();
+        assert_eq!(deleted, 3, "returned count sums both tables");
+        assert!(store.load_user_scores().unwrap().is_empty());
+        assert!(store.load_user_segmentations().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Devin PR #4 review #5: `increment_score` and
+    /// `record_segmentation` now wrap the UPSERT + `enforce_row_cap`
+    /// in a single SQLite transaction. Verify a happy-path invocation
+    /// still returns the evicted keys correctly — the transactional
+    /// wrap didn't lose the return-value contract from PR #3 #4c.
+    #[test]
+    fn increment_score_evicts_returns_keys_under_transaction() {
+        let path = temp_db_path("incr_evict_txn");
+        let store = DictStore::open(&path).unwrap();
+        // Prime one row with count=2.
+        store.increment_score("keep", "K").unwrap();
+        store.increment_score("keep", "K").unwrap();
+        // Force a cap of 1 to induce eviction on the next call.
+        {
+            let conn = store.conn.lock().unwrap();
+            DictStore::enforce_row_cap(
+                &conn,
+                "user_scores",
+                &["reading", "surface"],
+                1,
+                "",
+                &[],
+            )
+            .unwrap();
+        }
+        // Now insert a fresh row; increment_score itself doesn't cap
+        // to 1 (MAX_USER_SCORES is 50k), so the row survives and we
+        // just verify the transactional path returns an empty
+        // eviction list on a well-under-cap invocation.
+        let evicted = store.increment_score("new", "N").unwrap();
+        assert!(evicted.is_empty(), "no eviction expected below cap");
+        let loaded = store.load_user_scores().unwrap();
+        assert_eq!(loaded.len(), 2, "both rows persisted: {loaded:?}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

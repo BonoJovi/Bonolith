@@ -193,12 +193,13 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            match dict.import(&path) {
+            // Per-entry upsert (Devin PR #4 review #1) — the prior
+            // `dict.import + sync_user_entries_to_store` combo would
+            // overwrite rows the running IBus/Fcitx5 daemon had added
+            // since this CLI process started. `import_and_persist`
+            // routes each new row through the row-level upsert path.
+            match dict.import_and_persist(&path) {
                 Ok(added) => {
-                    if let Err(e) = dict.sync_user_entries_to_store() {
-                        eprintln!("Error: failed to persist user dictionary: {}", e);
-                        std::process::exit(1);
-                    }
                     println!(
                         "Imported {} new entries from {}",
                         added,
