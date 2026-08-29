@@ -970,16 +970,11 @@ impl BonolithEngine {
                 // "count is shown but entries don't appear".
                 let shared = SharedCore::global();
                 let mut dict = shared.dictionary.write().unwrap_or_else(|e| e.into_inner());
-                match dict.import(std::path::Path::new(&path)) {
+                // Per-entry upsert (Devin PR #3 #2) — the prior
+                // `import` + whole-table sync overwrote rows the other
+                // frontend added since this process started.
+                match dict.import_and_persist(std::path::Path::new(&path)) {
                     Ok(added) => {
-                        if let Err(e) = dict.sync_user_entries_to_store() {
-                            warn!("Bonolith: Failed to save after import: {}", e);
-                            let _ = std::process::Command::new("zenity")
-                                .args(["--error", "--title=Bonolith",
-                                       &format!("--text=保存に失敗しました: {}", e)])
-                                .spawn();
-                            return;
-                        }
                         info!("Bonolith: Imported {} entries from {}", added, path);
                         let _ = std::process::Command::new("zenity")
                             .args(["--info", "--title=Bonolith",
@@ -1038,12 +1033,14 @@ impl BonolithEngine {
                     frequency: 8000,
                 };
 
-                // Add to live dictionary via SharedCore
+                // Add to live dictionary via SharedCore. Per-row upsert
+                // (Devin PR #3 #2) — the prior add_entry + whole-table
+                // sync wiped rows the other frontend added since this
+                // process started.
                 let shared = SharedCore::global();
                 {
                     let mut dict = shared.dictionary.write().unwrap_or_else(|e| e.into_inner());
-                    dict.add_entry(entry);
-                    if let Err(e) = dict.sync_user_entries_to_store() {
+                    if let Err(e) = dict.add_user_entry_and_persist(entry) {
                         warn!("Bonolith: Failed to save user dict: {}", e);
                         let _ = std::process::Command::new("zenity")
                             .args(["--error", "--title=Bonolith",
@@ -1214,14 +1211,18 @@ impl BonolithEngine {
 
         let shared = SharedCore::global();
         let mut dict = shared.dictionary.write().unwrap_or_else(|e| e.into_inner());
-        let mut live: Vec<DictionaryEntry> = dict.user_entries().to_vec();
-        let before = live.len();
-        live.retain(|e| !(e.reading == reading && e.surface == surface));
-        if live.len() == before {
-            // Row already gone (raced with another delete).
-            return;
+        // Per-row DELETE (Devin PR #3 #2).
+        match dict.remove_user_entry_and_persist(&reading, &surface) {
+            Ok(true) => Self::notify_dict_updated(),
+            Ok(false) => {} // row already gone (raced)
+            Err(e) => {
+                warn!("Bonolith: Failed to delete user entry: {}", e);
+                let _ = std::process::Command::new("zenity")
+                    .args(["--error", "--title=Bonolith",
+                           &format!("--text=削除に失敗しました: {}", e)])
+                    .spawn();
+            }
         }
-        Self::apply_user_entries_locked(&mut dict, live);
     }
 
     /// Edit a user dictionary entry identified by (old_reading, old_surface).
@@ -1259,39 +1260,28 @@ impl BonolithEngine {
 
         let shared = SharedCore::global();
         let mut dict = shared.dictionary.write().unwrap_or_else(|e| e.into_inner());
-        let mut live: Vec<DictionaryEntry> = dict.user_entries().to_vec();
-        let mut hit = false;
-        for e in live.iter_mut() {
-            if e.reading == old_reading && e.surface == old_surface {
-                e.reading = new_reading.to_string();
-                e.surface = new_surface.to_string();
-                hit = true;
-                break;
+        // Per-row DELETE-then-UPSERT (Devin PR #3 #2). POS/frequency
+        // preserved from the old row.
+        match dict.update_user_entry_and_persist(
+            &old_reading, &old_surface, new_reading, new_surface,
+        ) {
+            Ok(true) => Self::notify_dict_updated(),
+            Ok(false) => {} // concurrently deleted
+            Err(e) => {
+                warn!("Bonolith: Failed to update user entry: {}", e);
+                let _ = std::process::Command::new("zenity")
+                    .args(["--error", "--title=Bonolith",
+                           &format!("--text=保存に失敗しました: {}", e)])
+                    .spawn();
             }
         }
-        if !hit {
-            // Someone deleted this entry concurrently; nothing to update.
-            return;
-        }
-        Self::apply_user_entries_locked(&mut dict, live);
     }
 
-    /// Push `entries` into the live dictionary + persist. Caller holds
-    /// the dict write lock, so this is a simple `replace_user_entries` +
-    /// `sync_user_entries_to_store` (both are cheap for the user section).
-    fn apply_user_entries_locked(
-        dict: &mut Dictionary,
-        entries: Vec<DictionaryEntry>,
-    ) {
-        dict.replace_user_entries(entries);
-        if let Err(e) = dict.sync_user_entries_to_store() {
-            warn!("Bonolith: Failed to save user dict: {}", e);
-            let _ = std::process::Command::new("zenity")
-                .args(["--error", "--title=Bonolith",
-                       &format!("--text=保存に失敗しました: {}", e)])
-                .spawn();
-            return;
-        }
+    /// Notify the user that the dictionary was successfully updated —
+    /// used by delete/edit paths that previously routed through
+    /// `apply_user_entries_locked` (removed with Devin PR #3 #2 in
+    /// favour of row-level persist methods on Dictionary).
+    fn notify_dict_updated() {
         let _ = std::process::Command::new("zenity")
             .args(["--info", "--title=Bonolith",
                    "--text=辞書を更新しました"])

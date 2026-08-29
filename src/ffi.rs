@@ -552,8 +552,10 @@ pub unsafe extern "C" fn bonolith_dict_add_entry(
 
         let shared = SharedCore::global();
         let mut dict = write_lock_recover(&shared.dictionary);
-        dict.add_entry(entry);
-        dict.sync_user_entries_to_store().is_ok()
+        // Per-row upsert (Devin PR #3 #2) — the prior whole-table
+        // replace_all wiped rows the other frontend added since this
+        // process started.
+        dict.add_user_entry_and_persist(entry).is_ok()
     })
 }
 
@@ -593,18 +595,11 @@ pub unsafe extern "C" fn bonolith_dict_delete_entry_by_identity(
 
         let shared = SharedCore::global();
         let mut dict = write_lock_recover(&shared.dictionary);
-        // Re-fetch under the write lock so any concurrent add is
-        // included in `live` and only the identified row is dropped.
-        let mut live: Vec<DictionaryEntry> = dict.user_entries().to_vec();
-        let before = live.len();
-        live.retain(|e| !(e.reading == reading && e.surface == surface));
-        if live.len() == before {
-            // Row already gone (double-click / concurrent delete).
-            // Callers treat false as "nothing to do" not an error.
-            return false;
-        }
-        dict.replace_user_entries(live);
-        dict.sync_user_entries_to_store().is_ok()
+        // Per-row DELETE (Devin PR #3 #2) — the prior replace_all
+        // wiped rows the other frontend added since this process
+        // started. Callers treat `false` as "nothing to do".
+        dict.remove_user_entry_and_persist(&reading, &surface)
+            .unwrap_or(false)
     })
 }
 
@@ -647,21 +642,16 @@ pub unsafe extern "C" fn bonolith_dict_update_entry_by_identity(
 
         let shared = SharedCore::global();
         let mut dict = write_lock_recover(&shared.dictionary);
-        let mut live: Vec<DictionaryEntry> = dict.user_entries().to_vec();
-        let mut hit = false;
-        for e in live.iter_mut() {
-            if e.reading == old_reading && e.surface == old_surface {
-                e.reading = new_reading.clone();
-                e.surface = new_surface.clone();
-                hit = true;
-                break;
-            }
-        }
-        if !hit {
-            return false;
-        }
-        dict.replace_user_entries(live);
-        dict.sync_user_entries_to_store().is_ok()
+        // Per-row DELETE-then-UPSERT (Devin PR #3 #2) — the prior
+        // replace_all wiped concurrent additions from the other
+        // frontend. POS/frequency are preserved from the old row.
+        dict.update_user_entry_and_persist(
+            &old_reading,
+            &old_surface,
+            &new_reading,
+            &new_surface,
+        )
+        .unwrap_or(false)
     })
 }
 
@@ -779,11 +769,11 @@ pub unsafe extern "C" fn bonolith_dict_import(path: *const c_char) -> i32 {
         };
         let shared = SharedCore::global();
         let mut dict = write_lock_recover(&shared.dictionary);
-        match dict.import(&path) {
-            Ok(count) => {
-                let _ = dict.sync_user_entries_to_store();
-                count as i32
-            }
+        // Per-entry upsert (Devin PR #3 #2) — the prior `import` +
+        // whole-table `sync_user_entries_to_store` overwrote rows the
+        // other frontend added since this process started.
+        match dict.import_and_persist(&path) {
+            Ok(count) => count as i32,
             Err(_) => -1,
         }
     })

@@ -289,12 +289,132 @@ impl Dictionary {
     /// Persist the current user portion of the dictionary to the store.
     /// Replaces all rows in user_entries in a single transaction.
     /// No-op when no store is attached.
+    ///
+    /// **Prefer the row-level `*_and_persist` methods for mutations
+    /// (add / delete / update / import).** This whole-table replace is a
+    /// multi-process data-loss vector: each process loads user_entries
+    /// once at startup, and a subsequent replace_all here writes THIS
+    /// process's stale snapshot back to the DB, wiping any row the
+    /// other frontend (IBus vs Fcitx5) added since our startup. See
+    /// Devin PR #3 #2. Kept for the few callers that legitimately want
+    /// snapshot semantics (Import of a whole file with intent to
+    /// overwrite, tests) — no current path should rely on it for
+    /// individual edits.
     pub fn sync_user_entries_to_store(&self) -> io::Result<()> {
         let store = match &self.store {
             Some(s) => s,
             None => return Ok(()),
         };
         store.replace_all_user_entries(&self.entries[self.user_start..])
+    }
+
+    /// Add a user entry to memory AND, if a store is attached, upsert
+    /// the single row to the DB. Unlike `sync_user_entries_to_store`,
+    /// this does NOT replace the whole `user_entries` table, so rows
+    /// the other frontend added since our startup are preserved
+    /// (Devin PR #3 #2).
+    pub fn add_user_entry_and_persist(&mut self, entry: DictionaryEntry) -> io::Result<()> {
+        if let Some(store) = self.store.as_ref() {
+            store.upsert_user_entry(&entry)?;
+        }
+        self.add_entry(entry);
+        Ok(())
+    }
+
+    /// Remove a user entry by (reading, surface) identity from memory
+    /// AND, if a store is attached, DELETE the single row from the DB.
+    /// Returns `Ok(true)` when a matching row was found and removed,
+    /// `Ok(false)` when nothing matched, `Err` on DB failure.
+    ///
+    /// Uses `DictStore::remove_user_entry` so only the identified row
+    /// is touched — other processes' concurrent additions survive.
+    /// In-memory rebuild via `replace_user_entries` is O(n) in user
+    /// portion, which is small.
+    pub fn remove_user_entry_and_persist(
+        &mut self,
+        reading: &str,
+        surface: &str,
+    ) -> io::Result<bool> {
+        let present = self.entries[self.user_start..]
+            .iter()
+            .any(|e| e.reading == reading && e.surface == surface);
+        if !present {
+            return Ok(false);
+        }
+        // DB first so a store failure aborts before we mutate memory.
+        if let Some(store) = self.store.as_ref() {
+            store.remove_user_entry(reading, surface)?;
+        }
+        let kept: Vec<DictionaryEntry> = self.entries[self.user_start..]
+            .iter()
+            .filter(|e| !(e.reading == reading && e.surface == surface))
+            .cloned()
+            .collect();
+        self.replace_user_entries(kept);
+        Ok(true)
+    }
+
+    /// Update a user entry identified by (old_reading, old_surface) to
+    /// (new_reading, new_surface), preserving POS and frequency. Both
+    /// memory and DB are updated by identity — no whole-table replace.
+    /// Returns `Ok(true)` when the old row was found and updated,
+    /// `Ok(false)` when nothing matched, `Err` on DB failure.
+    pub fn update_user_entry_and_persist(
+        &mut self,
+        old_reading: &str,
+        old_surface: &str,
+        new_reading: &str,
+        new_surface: &str,
+    ) -> io::Result<bool> {
+        let (pos, frequency) = match self
+            .entries[self.user_start..]
+            .iter()
+            .find(|e| e.reading == old_reading && e.surface == old_surface)
+        {
+            Some(e) => (e.pos, e.frequency),
+            None => return Ok(false),
+        };
+        let new_entry = DictionaryEntry {
+            reading: new_reading.to_string(),
+            surface: new_surface.to_string(),
+            pos,
+            frequency,
+        };
+        // DB: remove old row, upsert new — each surgical.
+        if let Some(store) = self.store.as_ref() {
+            store.remove_user_entry(old_reading, old_surface)?;
+            store.upsert_user_entry(&new_entry)?;
+        }
+        // Memory rebuild.
+        let kept: Vec<DictionaryEntry> = self.entries[self.user_start..]
+            .iter()
+            .filter(|e| !(e.reading == old_reading && e.surface == old_surface))
+            .cloned()
+            .chain(std::iter::once(new_entry))
+            .collect();
+        self.replace_user_entries(kept);
+        Ok(true)
+    }
+
+    /// Import from a JSON file. Each new (reading, surface) pair not
+    /// already in memory is added to memory AND upserted to the DB
+    /// row-by-row (no whole-table replace). Returns the count added.
+    /// Duplicates in memory are skipped; the DB upsert overwrites an
+    /// existing row's pos/frequency with the imported entry's values.
+    pub fn import_and_persist(&mut self, path: &Path) -> io::Result<usize> {
+        let entries = read_and_parse_dict(path)?;
+        let mut added = 0;
+        for entry in entries {
+            if self.has_entry(&entry.reading, &entry.surface) {
+                continue;
+            }
+            if let Some(store) = self.store.as_ref() {
+                store.upsert_user_entry(&entry)?;
+            }
+            self.add_entry(entry);
+            added += 1;
+        }
+        Ok(added)
     }
 
     /// Add a single entry. During bulk-load (before `finalize_sort`) this
@@ -3346,6 +3466,120 @@ mod tests {
                 "{reading}: expected at least one kanji-stem+particle candidate in {all_surfaces:?}",
             );
         }
+    }
+
+    /// Devin PR #3 #2 regression: row-level user-entry mutations must
+    /// NOT wipe rows the other frontend added since our startup.
+    ///
+    /// The prior `sync_user_entries_to_store` path called
+    /// `DELETE FROM user_entries` + `INSERT` from this process's stale
+    /// in-memory snapshot. Two processes sharing the DB (IBus and
+    /// Fcitx5 both installed) triggered irreversible data loss: any
+    /// delete/edit/add via one frontend flushed the other frontend's
+    /// concurrent additions.
+    ///
+    /// Simulate the scenario:
+    /// 1. Dict A opens store, adds E1 via the persist path.
+    /// 2. "Other frontend" writes E2 directly to the store (bypassing
+    ///    Dict A's memory — i.e., Dict A doesn't know E2 exists).
+    /// 3. Dict A deletes E1 via the persist path.
+    /// 4. Dict B opens the same store fresh — E2 MUST survive.
+    #[test]
+    fn row_level_persist_preserves_concurrent_frontend_entries() {
+        use crate::core::store::DictStore;
+        let dir = std::env::temp_dir().join("bonolith_test_row_level_persist");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("dict.sqlite");
+
+        let store = Arc::new(DictStore::open(&db_path).unwrap());
+
+        // Dict A: our process. Add E1 via the persist path.
+        let mut dict_a = Dictionary::new();
+        dict_a.attach_store(store.clone());
+        dict_a
+            .add_user_entry_and_persist(DictionaryEntry {
+                reading: "aaa".to_string(),
+                surface: "AAA".to_string(),
+                pos: PartOfSpeech::Noun,
+                frequency: 8000,
+            })
+            .unwrap();
+
+        // Other frontend: writes E2 directly to the DB. Dict A never
+        // sees this — its in-memory snapshot only knows E1.
+        store
+            .upsert_user_entry(&DictionaryEntry {
+                reading: "bbb".to_string(),
+                surface: "BBB".to_string(),
+                pos: PartOfSpeech::Noun,
+                frequency: 8000,
+            })
+            .unwrap();
+
+        // Dict A: remove E1 via the persist path. The prior bug
+        // wrote Dict A's stale (only-E1) snapshot back and wiped E2.
+        let removed = dict_a
+            .remove_user_entry_and_persist("aaa", "AAA")
+            .unwrap();
+        assert!(removed);
+
+        // Dict B: fresh process on the same store. E2 must still exist.
+        let loaded = store.load_user_entries().unwrap();
+        assert_eq!(loaded.len(), 1, "loaded rows: {:?}", loaded);
+        assert_eq!(loaded[0].reading, "bbb");
+        assert_eq!(loaded[0].surface, "BBB");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same contract for `update_user_entry_and_persist`: editing a
+    /// row in one frontend must not wipe rows the other frontend added.
+    #[test]
+    fn update_persist_preserves_concurrent_frontend_entries() {
+        use crate::core::store::DictStore;
+        let dir = std::env::temp_dir().join("bonolith_test_update_persist");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("dict.sqlite");
+
+        let store = Arc::new(DictStore::open(&db_path).unwrap());
+
+        let mut dict_a = Dictionary::new();
+        dict_a.attach_store(store.clone());
+        dict_a
+            .add_user_entry_and_persist(DictionaryEntry {
+                reading: "old".to_string(),
+                surface: "OLD".to_string(),
+                pos: PartOfSpeech::Noun,
+                frequency: 8000,
+            })
+            .unwrap();
+
+        // Other frontend adds a row Dict A doesn't know about.
+        store
+            .upsert_user_entry(&DictionaryEntry {
+                reading: "keep".to_string(),
+                surface: "KEEP".to_string(),
+                pos: PartOfSpeech::Noun,
+                frequency: 8000,
+            })
+            .unwrap();
+
+        // Dict A edits its row.
+        let updated = dict_a
+            .update_user_entry_and_persist("old", "OLD", "new", "NEW")
+            .unwrap();
+        assert!(updated);
+
+        // Both the renamed row AND the concurrently-added row survive.
+        let loaded = store.load_user_entries().unwrap();
+        let readings: Vec<&str> = loaded.iter().map(|e| e.reading.as_str()).collect();
+        assert!(readings.contains(&"new"), "renamed row missing: {loaded:?}");
+        assert!(readings.contains(&"keep"), "concurrent row wiped: {loaded:?}");
+        assert!(!readings.contains(&"old"), "old row survived: {loaded:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
