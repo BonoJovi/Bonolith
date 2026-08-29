@@ -484,7 +484,16 @@ impl DictStore {
     /// `MAX_USER_SCORES` afterwards on the same lowest-count / earliest-
     /// ROWID policy as segmentations — see `record_segmentation` and
     /// `enforce_row_cap` for the rationale.
-    pub fn increment_score(&self, reading: &str, surface: &str) -> io::Result<()> {
+    ///
+    /// Returns the `(reading, surface)` pairs of any rows evicted by
+    /// the cap enforcement, so the in-memory scorer map can be kept
+    /// in sync with the DB (Devin PR #3 #4c). Empty when nothing was
+    /// evicted, which is the common case (table is under cap).
+    pub fn increment_score(
+        &self,
+        reading: &str,
+        surface: &str,
+    ) -> io::Result<Vec<(String, String)>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT INTO user_scores (reading, surface, count) VALUES (?1, ?2, 1)
@@ -496,14 +505,22 @@ impl DictStore {
         // hits MAX_USER_SCORES with every existing row at count ≥ 2, the
         // eviction sub-query's ORDER BY count ASC evicts our fresh
         // count=1 row in the same call — the learning is silently lost.
-        Self::enforce_row_cap(
+        let rows = Self::enforce_row_cap(
             &conn,
             "user_scores",
+            &["reading", "surface"],
             MAX_USER_SCORES,
             "AND NOT (reading = ?2 AND surface = ?3)",
             &[&reading, &surface],
         )?;
-        Ok(())
+        Ok(rows
+            .into_iter()
+            .map(|mut r| {
+                let s = r.pop().unwrap_or_default();
+                let read = r.pop().unwrap_or_default();
+                (read, s)
+            })
+            .collect())
     }
 
     /// Record a user-preferred segmentation. `boundaries` is the list of
@@ -520,7 +537,14 @@ impl DictStore {
     /// row — segmentations use the whole kana as the key, so long-form
     /// writing accumulates unbounded and reloads all of it on every
     /// engine start (bug [23]).
-    pub fn record_segmentation(&self, kana: &str, boundaries: &[usize]) -> io::Result<()> {
+    /// Returns the `kana` keys of any rows evicted by the cap
+    /// enforcement so the in-memory scorer map can be kept in sync
+    /// (Devin PR #3 #4c). Empty when nothing was evicted.
+    pub fn record_segmentation(
+        &self,
+        kana: &str,
+        boundaries: &[usize],
+    ) -> io::Result<Vec<String>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let serialised = encode_boundaries(boundaries);
         conn.execute(
@@ -534,14 +558,18 @@ impl DictStore {
         .map_err(sqlite_to_io)?;
         // Same exclusion as user_scores: keep the row we just recorded
         // from being the first eviction target when the table is at cap.
-        Self::enforce_row_cap(
+        let rows = Self::enforce_row_cap(
             &conn,
             "user_segmentations",
+            &["kana"],
             MAX_USER_SEGMENTATIONS,
             "AND kana != ?2",
             &[&kana],
         )?;
-        Ok(())
+        Ok(rows
+            .into_iter()
+            .map(|mut r| r.pop().unwrap_or_default())
+            .collect())
     }
 
     /// Delete a learned segmentation row (called when the learned layout
@@ -564,56 +592,90 @@ impl DictStore {
     /// commit — SQLite scans an int index, ~µs at 50k rows — small
     /// enough for the input hot path we're on).
     ///
-    /// **Memory divergence**: any row this deletes is still present in
-    /// `UserScorer`'s in-memory `counts` / `segmentations` map until the
-    /// engine restarts (they load once at startup and never re-sync
-    /// with the store — the documented v2.0.0 contract). Reads that hit
-    /// only the memory map, notably `UserScorer::lookup_segmentation`,
-    /// can return boundaries whose backing DB row has been evicted;
-    /// they behave as if the row were still there for the rest of the
-    /// session. Only affects rare cap-overflow cases (10k / 50k) so
-    /// isn't treated as a correctness bug — flagged here so future
-    /// changes don't quietly widen its blast radius.
+    /// SELECT the eviction victims by identity (so the caller can sync
+    /// its in-memory map — Devin PR #3 #4c) then DELETE them by ROWID.
+    /// Returns each victim as a `Vec<String>` mirroring the order in
+    /// `key_columns`, so a scores caller gets `["reading","surface"]`
+    /// pairs and a segmentations caller gets `["kana"]` singletons.
+    ///
+    /// Prior behaviour DELETE'd silently and left `UserScorer`'s memory
+    /// map holding evicted rows until the process restarted — reads
+    /// through `lookup_segmentation` returned boundaries whose backing
+    /// DB row was gone, and the session then diverged from what the
+    /// next process would see. Fixed by returning the victims to the
+    /// caller, who prunes memory in the same call.
     fn enforce_row_cap(
         conn: &rusqlite::Connection,
         table: &str,
+        key_columns: &[&str],
         cap: usize,
         exclude_where: &str,
         exclude_params: &[&dyn rusqlite::ToSql],
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<Vec<String>>> {
         let n: i64 = conn
             .query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| {
                 row.get(0)
             })
             .map_err(sqlite_to_io)?;
         if (n as usize) <= cap {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let excess = (n as usize) - cap;
-        // The eviction sub-query's WHERE bakes in `exclude_where` so the
-        // caller's just-touched key never lands in the delete set. The
-        // key uses ?2… and up; ?1 is reserved for LIMIT.
-        let sql = format!(
-            "DELETE FROM {table} WHERE ROWID IN (
-                 SELECT ROWID FROM {table}
-                 WHERE 1=1 {exclude_where}
-                 ORDER BY count ASC, ROWID ASC
-                 LIMIT ?1
-             )",
+        // SELECT the victim ROWIDs (with their key columns) so we can
+        // report them to the caller AND delete them by ROWID atomically.
+        let projection = key_columns.join(", ");
+        let select_sql = format!(
+            "SELECT ROWID, {projection} FROM {table}
+             WHERE 1=1 {exclude_where}
+             ORDER BY count ASC, ROWID ASC
+             LIMIT ?1"
         );
         let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(1 + exclude_params.len());
         let excess_i64 = excess as i64;
         params_vec.push(&excess_i64);
         params_vec.extend_from_slice(exclude_params);
-        conn.execute(&sql, params_vec.as_slice())
+
+        let mut stmt = conn.prepare(&select_sql).map_err(sqlite_to_io)?;
+        let key_count = key_columns.len();
+        let victim_rows: Vec<(i64, Vec<String>)> = stmt
+            .query_map(params_vec.as_slice(), |row| {
+                let rowid: i64 = row.get(0)?;
+                let mut keys = Vec::with_capacity(key_count);
+                for i in 0..key_count {
+                    let s: String = row.get(1 + i)?;
+                    keys.push(s);
+                }
+                Ok((rowid, keys))
+            })
+            .map_err(sqlite_to_io)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_to_io)?;
+
+        if victim_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        // DELETE by ROWID — clearer than repeating the ORDER BY / LIMIT
+        // subquery and cheap for the small victim set.
+        let placeholders: Vec<String> = (0..victim_rows.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect();
+        let delete_sql = format!(
+            "DELETE FROM {table} WHERE ROWID IN ({})",
+            placeholders.join(", ")
+        );
+        let rowids: Vec<&dyn rusqlite::ToSql> = victim_rows
+            .iter()
+            .map(|(id, _)| id as &dyn rusqlite::ToSql)
+            .collect();
+        conn.execute(&delete_sql, rowids.as_slice())
             .map_err(sqlite_to_io)?;
         log::info!(
             "Evicted {} lowest-count rows from {} (cap {})",
-            excess,
+            victim_rows.len(),
             table,
             cap,
         );
-        Ok(())
+        Ok(victim_rows.into_iter().map(|(_, keys)| keys).collect())
     }
 
     /// Load all learned segmentations into an in-memory map. Called once
@@ -801,7 +863,15 @@ mod tests {
         // Force a cap of 2 by calling the helper directly.
         {
             let conn = store.conn.lock().unwrap();
-            DictStore::enforce_row_cap(&conn, "user_segmentations", 2, "", &[]).unwrap();
+            DictStore::enforce_row_cap(
+                &conn,
+                "user_segmentations",
+                &["kana"],
+                2,
+                "",
+                &[],
+            )
+            .unwrap();
         }
 
         let loaded = store.load_user_segmentations().unwrap();
@@ -846,9 +916,10 @@ mod tests {
             DictStore::enforce_row_cap(
                 &conn,
                 "user_segmentations",
+                &["kana"],
                 2,
                 "AND kana != ?2",
-                &[&fresh_key],
+                &[&fresh_key as &dyn rusqlite::ToSql],
             )
             .unwrap();
         }
@@ -860,6 +931,56 @@ mod tests {
             loaded.keys().collect::<Vec<_>>(),
         );
         assert_eq!(loaded.len(), 2, "cap enforcement should leave exactly 2 rows");
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Devin PR #3 #4c: enforce_row_cap must report the keys it deleted
+    /// so `UserScorer` can prune them from its in-memory map. Without
+    /// the return the DB row was gone but `lookup_segmentation` still
+    /// hit the memory copy, so learned layouts for the "evicted"
+    /// sentences kept firing until the next restart. Assert the return
+    /// contains exactly the low-count victims in FIFO order.
+    #[test]
+    fn enforce_row_cap_returns_evicted_keys() {
+        let path = temp_db_path("seg_cap_returns");
+        let store = DictStore::open(&path).unwrap();
+
+        // Two count=2 rows and two count=1 rows.
+        for _ in 0..2 {
+            store.record_segmentation("high1", &[2, 4]).unwrap();
+            store.record_segmentation("high2", &[3, 5]).unwrap();
+        }
+        store.record_segmentation("low1", &[1, 2]).unwrap();
+        store.record_segmentation("low2", &[1, 3]).unwrap();
+
+        let victims = {
+            let conn = store.conn.lock().unwrap();
+            DictStore::enforce_row_cap(
+                &conn,
+                "user_segmentations",
+                &["kana"],
+                2,
+                "",
+                &[],
+            )
+            .unwrap()
+        };
+
+        // Two victims (excess = 4 - 2 = 2), both singletons, low1
+        // first (earlier ROWID).
+        assert_eq!(
+            victims,
+            vec![vec!["low1".to_string()], vec!["low2".to_string()]],
+        );
+        // DB survivors are the two high-count rows.
+        let loaded = store.load_user_segmentations().unwrap();
+        let keys: std::collections::HashSet<&str> =
+            loaded.keys().map(|s| s.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["high1", "high2"].into_iter().collect(),
+        );
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

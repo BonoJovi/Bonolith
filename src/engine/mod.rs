@@ -994,12 +994,18 @@ impl ConversionEngine {
             for seg in &state.segments {
                 if seg.user_selected {
                     let surface = &seg.candidates[seg.selected];
-                    user_scorer.record(&seg.reading, surface);
+                    // Errors are already warn!-logged inside `record`;
+                    // commit_conversion returns Option<String> so we can't
+                    // propagate them further without cascading a signature
+                    // change through every dispatch path. The store-first
+                    // ordering there means a DB failure now leaves memory
+                    // untouched, matching what a restart would see.
+                    let _ = user_scorer.record(&seg.reading, surface);
                 }
             }
             let final_boundaries = boundaries_of(&state.segments);
             if final_boundaries != state.initial_boundaries {
-                user_scorer.record_segmentation(&state.kana, final_boundaries);
+                let _ = user_scorer.record_segmentation(&state.kana, final_boundaries);
             }
         }
 
@@ -2086,7 +2092,7 @@ mod tests {
         // Phase 2: seed that same layout as a learned segmentation.
         {
             let mut scorer = engine.shared.user_scorer.lock().unwrap();
-            scorer.record_segmentation("あめがふる", dp_default.clone());
+            scorer.record_segmentation("あめがふる", dp_default.clone()).unwrap();
             assert!(
                 scorer.lookup_segmentation("あめがふる").is_some(),
                 "seed row must be present before the self-cleaning start_conversion",
@@ -2226,7 +2232,7 @@ mod tests {
                 {
                     let mut user = shared.user_scorer.lock().unwrap_or_else(|e| e.into_inner());
                     for _ in 0..n {
-                        user.record(reading, target);
+                        user.record(reading, target).unwrap();
                     }
                 }
                 let mut engine = ConversionEngine::with_shared(shared);
