@@ -412,8 +412,14 @@ impl ConversionEngine {
     }
 
     /// Append a raw string directly to the preedit (e.g., punctuation).
+    ///
+    /// A pending romaji buffer (single mid-syllable consonant like "m"
+    /// from vim→Space→Enter) is preserved AS-LITERAL rather than
+    /// silently dropped — the prior `romaji.flush()` here discarded any
+    /// non-"n" pending, so typing a digit / symbol / Shift+Space after
+    /// a restored Space-path buffer lost the letter (Devin PR #3 #1).
     pub fn append_raw(&mut self, s: &str) {
-        self.romaji.flush();
+        self.romaji.flush_pending_as_literal();
         self.romaji.append_raw(s);
     }
 

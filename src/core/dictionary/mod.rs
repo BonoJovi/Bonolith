@@ -1788,6 +1788,9 @@ impl Dictionary {
             ("はやくて", "速くて", 7300),
             ("はやくない", "速くない", 7300),
             ("はやさ",   "速さ",   7300),
+            // 早さ (temporal earliness) at 7100 — 速さ (speed) is by far the
+            // more common reading for はやさ in modern text, so 速さ stays top.
+            ("はやさ",   "早さ",   7100),
             ("ひろく",   "広く",   7500),
             ("ひろくて", "広くて", 7500),
             ("ひろくない", "広くない", 7500),
@@ -1803,9 +1806,11 @@ impl Dictionary {
             ("ひくく",   "低く",   7500),
             ("ひくくて", "低くて", 7500),
             ("ひくくない", "低くない", 7500),
+            ("ひくさ",   "低さ",   7500),
             ("しろく",   "白く",   7500),
             ("しろくて", "白くて", 7500),
             ("しろくない", "白くない", 7500),
+            ("しろさ",   "白さ",   7500),
             ("おもく",   "重く",   7500),
             ("おもくて", "重くて", 7500),
             ("おもくない", "重くない", 7500),
@@ -1813,6 +1818,7 @@ impl Dictionary {
             ("とおく",   "遠く",   7500),
             ("とおくて", "遠くて", 7500),
             ("とおくない", "遠くない", 7500),
+            ("とおさ",   "遠さ",   7500),
             ("わかく",   "若く",   7500),
             ("わかくて", "若くて", 7500),
             ("わかくない", "若くない", 7500),
@@ -1820,9 +1826,11 @@ impl Dictionary {
             ("みじかく", "短く",   7500),
             ("みじかくて", "短くて", 7500),
             ("みじかくない", "短くない", 7500),
+            ("みじかさ", "短さ",   7500),
             ("すごく",   "凄く",   7500),
             ("すごくて", "凄くて", 7500),
             ("すごくない", "凄くない", 7500),
+            ("すごさ",   "凄さ",   7500),
             ("うれしく", "嬉しく", 7500),
             ("うれしくて", "嬉しくて", 7500),
             ("うれしくない", "嬉しくない", 7500),
@@ -3118,6 +3126,91 @@ mod tests {
             }
         }
         assert_eq!(failures, 0, "{failures} supplement entries missing from candidates");
+    }
+
+    /// Table-driven coverage: every listed i-adjective family MUST have
+    /// all four standard conjugations (~く / ~くて / ~くない / ~さ)
+    /// reachable via `segment()`. Unlike `general_supplement_coverage`
+    /// which enumerates registered entries, this test enumerates the
+    /// *expected* coverage set — so a missing form (e.g. Devin PR #3's
+    /// gap "はやさ→早さ / ひくさ→低さ / しろさ→白さ / とおさ→遠さ /
+    /// みじかさ→短さ / すごさ→凄さ") fails automatically the moment
+    /// a family is added to the list without the matching supplement
+    /// entries.
+    ///
+    /// Add a family here whenever you add a new i-adjective batch; keep
+    /// it out only for adjectives with genuinely irregular coverage
+    /// (よろし: 名詞形「宜しさ」は非自然、~くない も 現代語で稀).
+    #[test]
+    fn i_adjective_conjugation_coverage() {
+        let dict = Dictionary::new();
+        // (stem_reading, stem_surface). Kanji column is the primary
+        // surface; secondary surfaces (早/速 both for はや) are checked
+        // via `secondary_forms` below.
+        let families: &[(&str, &str)] = &[
+            ("つよ",   "強"),
+            ("たか",   "高"),
+            ("はや",   "早"),
+            ("ひろ",   "広"),
+            ("せま",   "狭"),
+            ("なが",   "長"),
+            ("ひく",   "低"),
+            ("しろ",   "白"),
+            ("おも",   "重"),
+            ("とお",   "遠"),
+            ("わか",   "若"),
+            ("みじか", "短"),
+            ("すご",   "凄"),
+            ("うれし", "嬉し"),
+            ("かなし", "悲し"),
+            ("たのし", "楽し"),
+            ("さびし", "寂し"),
+        ];
+        // (suffix_reading, suffix_surface): the four standard forms.
+        let forms: &[(&str, &str)] = &[
+            ("く",     "く"),
+            ("くて",   "くて"),
+            ("くない", "くない"),
+            ("さ",     "さ"),
+        ];
+        // Secondary surface families that must also appear (adjacent
+        // homograph readings that IPADIC lists as a distinct Adjective):
+        // for はや, 速い は 別語なので 連用形/名詞形 も 速く/速さ で
+        // 到達可能でなければならない。
+        let secondary: &[(&str, &str)] = &[
+            ("はや", "速"),
+        ];
+        let mut failures: Vec<(String, String)> = Vec::new();
+        let check = |stem_r: &str, stem_s: &str, failures: &mut Vec<(String, String)>| {
+            for &(suf_r, suf_s) in forms {
+                let reading = format!("{stem_r}{suf_r}");
+                let expected = format!("{stem_s}{suf_s}");
+                let all_surfaces: Vec<String> = dict
+                    .segment(&reading)
+                    .iter()
+                    .flat_map(|s| s.candidates.iter().map(|c| c.surface.clone()))
+                    .collect();
+                if !all_surfaces.contains(&expected) {
+                    failures.push((reading, expected));
+                }
+            }
+        };
+        for &(stem_r, stem_s) in families {
+            check(stem_r, stem_s, &mut failures);
+        }
+        for &(stem_r, stem_s) in secondary {
+            check(stem_r, stem_s, &mut failures);
+        }
+        assert!(
+            failures.is_empty(),
+            "{} i-adjective conjugation(s) unreachable via segment():\n{}",
+            failures.len(),
+            failures
+                .iter()
+                .map(|(r, e)| format!("  {r:>12} → expected {e}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 
     /// Regression: `てき` had 的 Suffix (7408) dominant over 敵 Noun (5474),

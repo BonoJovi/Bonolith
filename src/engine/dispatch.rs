@@ -1075,6 +1075,82 @@ mod tests {
         );
     }
 
+    /// Regression [Devin PR #3 #1]: after Space→Enter with a pending
+    /// consonant restored to the romaji buffer, feeding a non-alphabetic
+    /// input (digit / general symbol / Shift+Space) MUST preserve that
+    /// consonant instead of silently discarding it.
+    ///
+    /// The prior `ConversionEngine::append_raw` called `romaji.flush()`
+    /// which cleared any non-"n" pending, so "vim → Space → Enter → 1"
+    /// lost the "m". Follow-up alphabet input goes through
+    /// `process_key` and combines with the pending buffer naturally, so
+    /// that path is asserted here as the control case.
+    fn vim_space_enter(e: &mut ConversionEngine, c: &mut bool) {
+        for ch in "vim".chars() {
+            dispatch_key(e, c, ev(ch as u32));
+        }
+        assert_eq!(e.preedit(), "ゔぃm", "setup: preedit should be ゔぃm");
+        dispatch_key(e, c, ev(KEY_SPACE));
+        assert!(*c, "setup: Space should enter conversion");
+        let out = dispatch_key(e, c, ev(KEY_RETURN));
+        assert!(out.commit.is_some(), "setup: Enter should commit");
+        // Post-commit: output cleared, buffer restored to "m".
+        assert_eq!(e.preedit(), "m", "setup: pending buffer should restore to m");
+    }
+
+    #[test]
+    fn pending_survives_alphabet_after_space_enter() {
+        let (mut e, mut c) = setup();
+        vim_space_enter(&mut e, &mut c);
+        // 'a' combines with pending "m" via romaji → "ま".
+        let out = dispatch_key(&mut e, &mut c, ev(b'a' as u32));
+        assert!(out.consumed);
+        assert_eq!(e.preedit(), "ま", "m+a should compose into ま");
+    }
+
+    #[test]
+    fn pending_survives_digit_after_space_enter() {
+        let (mut e, mut c) = setup();
+        vim_space_enter(&mut e, &mut c);
+        // '1' → fullwidth '１' via append_raw. Pending "m" must be
+        // preserved as literal in the preedit.
+        let out = dispatch_key(&mut e, &mut c, ev(b'1' as u32));
+        assert!(out.consumed);
+        assert_eq!(
+            e.preedit(),
+            "m１",
+            "digit after restored pending should preserve m as literal"
+        );
+    }
+
+    #[test]
+    fn pending_survives_symbol_after_space_enter() {
+        let (mut e, mut c) = setup();
+        vim_space_enter(&mut e, &mut c);
+        // '.' → fullwidth '。' via append_raw. Same preservation contract.
+        let out = dispatch_key(&mut e, &mut c, ev(b'.' as u32));
+        assert!(out.consumed);
+        assert_eq!(
+            e.preedit(),
+            "m。",
+            "symbol after restored pending should preserve m as literal"
+        );
+    }
+
+    #[test]
+    fn pending_survives_shift_space_after_space_enter() {
+        let (mut e, mut c) = setup();
+        vim_space_enter(&mut e, &mut c);
+        // Shift+Space → fullwidth '　' via append_raw. Same contract.
+        let out = dispatch_key(&mut e, &mut c, ev_shift(KEY_SPACE));
+        assert!(out.consumed);
+        assert_eq!(
+            e.preedit(),
+            "m\u{3000}",
+            "Shift+Space after restored pending should preserve m as literal"
+        );
+    }
+
     /// Release events are the frontend's job — the dispatcher must not
     /// touch state when one slips through.
     #[test]

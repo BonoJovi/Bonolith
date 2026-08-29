@@ -213,6 +213,31 @@ impl RomajiConverter {
         self.raw_input = None;
     }
 
+    /// Flush any pending buffer AS-LITERAL into `output` and return whether
+    /// anything was written. "n" is the one case that produces kana (ん);
+    /// every other non-empty pending is a single mid-syllable consonant
+    /// like "m" or "ky" which `flush()` would silently discard. This
+    /// preserves those chars as verbatim preedit text so the caller can
+    /// then append a symbol / digit without losing what the user typed
+    /// (Devin PR #3 #1 — Space→Enter→digit/symbol dropped restored "m").
+    pub fn flush_pending_as_literal(&mut self) -> bool {
+        if self.buffer.is_empty() {
+            return false;
+        }
+        if self.buffer == "n" {
+            self.buffer.clear();
+            self.output.push('ん');
+            return true;
+        }
+        // Preserve the raw pending consonant(s) in output as-typed. Once
+        // in output the 1:1 raw-input record no longer maps cleanly, so
+        // invalidate `raw_input` (same convention as append_raw).
+        self.output.push_str(&self.buffer);
+        self.buffer.clear();
+        self.raw_input = None;
+        true
+    }
+
     /// Get accumulated kana output
     pub fn output(&self) -> &str {
         &self.output
