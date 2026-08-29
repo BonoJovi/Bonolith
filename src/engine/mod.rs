@@ -70,15 +70,25 @@ pub struct ConversionState {
     /// kana is typed the learned layout is applied up front.
     pub initial_boundaries: Vec<usize>,
     /// Pending romaji-buffer text (e.g. the "m" in "vim") that was
-    /// captured from the converter into this conversion's kana at
-    /// `start_kana_conversion` time. `cancel_conversion` writes it back
-    /// to the romaji buffer so Escape / Backspace from an F-key
-    /// conversion restores the exact preedit the user had before F-key
-    /// (Mozc / ATOK parity — otherwise "vim → F7 → Esc" leaves preedit
-    /// as "ゔぃ" and the "m" is silently lost). Empty when the
-    /// conversion was entered via Space (that path's flush drops the
-    /// trailing consonant by design — see bug [16]).
+    /// captured from the converter at `start_conversion` /
+    /// `start_kana_conversion` time. `cancel_conversion` always writes
+    /// it back so Escape / Backspace restores the exact preedit the
+    /// user had before ("vim → F7 → Esc" → "ゔぃm"). `commit_conversion`
+    /// writes it back only when `pending_consumed_in_kana` is false —
+    /// i.e. the Space path, whose kana does *not* include the pending
+    /// buffer, so re-injecting it as buffered input matches Mozc parity
+    /// (bug [16]). Empty when nothing was pending at start time.
     pub pending_from_romaji: String,
+    /// True when `pending_from_romaji` is already part of `kana` and
+    /// therefore of the eventual committed text — the F-key path
+    /// (`start_kana_conversion`) appends the trailing buffer to kana so
+    /// F7-F10 render "vim" → "ヴィム" instead of dropping the "m".
+    /// `commit_conversion` must NOT restore the pending buffer in that
+    /// case, or the "m" gets committed once and then also lingers in
+    /// the romaji buffer for the next keystroke (bug [25]:
+    /// "vim → F7 → Enter → a" → "ヴィムま"). False for the Space path,
+    /// whose kana excludes the pending buffer by design.
+    pub pending_consumed_in_kana: bool,
 }
 
 /// Extract segment start positions (excluding 0) from a segment list.
@@ -402,8 +412,14 @@ impl ConversionEngine {
     }
 
     /// Append a raw string directly to the preedit (e.g., punctuation).
+    ///
+    /// A pending romaji buffer (single mid-syllable consonant like "m"
+    /// from vim→Space→Enter) is preserved AS-LITERAL rather than
+    /// silently dropped — the prior `romaji.flush()` here discarded any
+    /// non-"n" pending, so typing a digit / symbol / Shift+Space after
+    /// a restored Space-path buffer lost the letter (Devin PR #3 #1).
     pub fn append_raw(&mut self, s: &str) {
-        self.romaji.flush();
+        self.romaji.flush_pending_as_literal();
         self.romaji.append_raw(s);
     }
 
@@ -534,6 +550,10 @@ impl ConversionEngine {
             raw_input,
             initial_boundaries,
             pending_from_romaji,
+            // Space path: pending buffer is NOT included in kana (only
+            // `romaji.output()` is), so commit must restore it for the
+            // next syllable.
+            pending_consumed_in_kana: false,
         });
 
         // Trigger LLM reranking in background — results applied on next interaction
@@ -817,6 +837,14 @@ impl ConversionEngine {
             // so cancel_conversion can restore it to the romaji buffer
             // (bug [15]: "vim → F7 → Esc" left the "m" behind).
             pending_from_romaji: pending,
+            // F-key path already appended the pending buffer to `kana`
+            // above, so it is part of every candidate form and will be
+            // included in the committed text. commit_conversion must
+            // therefore skip the restore, else the "m" would be
+            // committed as part of "ヴィム" and *also* linger in the
+            // romaji buffer for the next keystroke — bug [25]:
+            // "vim → F7 → Enter → a" produced "ヴィムま".
+            pending_consumed_in_kana: true,
         });
         self.conversion.as_ref()
     }
@@ -922,8 +950,13 @@ impl ConversionEngine {
         // start_conversion time (e.g. "m" from "vim → Space → Enter")
         // so the user's next keystroke continues building that syllable
         // instead of dropping the character. Mirrors cancel_conversion
-        // and matches Mozc — bug [16]. No-op when nothing was pending.
-        self.romaji.restore_buffer(&state.pending_from_romaji);
+        // and matches Mozc — bug [16]. Skipped for the F-key path,
+        // whose kana already included the pending buffer and just got
+        // committed with it — restoring here would double-count the
+        // "m" (bug [25]).
+        if !state.pending_consumed_in_kana {
+            self.romaji.restore_buffer(&state.pending_from_romaji);
+        }
         // Retire any in-flight rerank pass so a late-arriving worker cannot
         // repaint over the just-committed (hidden) preedit — a mode=1
         // ghost that would auto-commit on focus loss = duplicate insertion.
@@ -968,6 +1001,20 @@ impl ConversionEngine {
                     let score_b = Self::effective_score_with(&user_scorer, &seg.reading, b);
                     score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
                 });
+                // Dedupe entries by surface — the same kanji surface can
+                // reach us multiple times when IPADIC ships POS variants
+                // (早く is both Noun 7500 and Adverb 3494 for はやく; 苦
+                // is both Noun 3269 and Suffix 1482 for く) or when the
+                // affix-merge synthesizer produces a compound already
+                // present as a whole-word dict entry. Since entries is
+                // already sorted highest-score-first, retaining first
+                // occurrence keeps the best-scored representative. This
+                // MUST run before the kana insert-position calculation
+                // so `entries` and the eventual `candidates` array stay
+                // index-parallel.
+                let mut seen_surfaces: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                entries.retain(|e| seen_surfaces.insert(e.surface.clone()));
                 let mut candidates: Vec<String> =
                     entries.iter().map(|e| e.surface.clone()).collect();
                 // Always include the raw reading (kana) as a candidate.
@@ -1365,7 +1412,17 @@ impl ConversionEngine {
         // e.g. これ, それ, いる, する, いい
         if surface == reading {
             return match pos {
-                PartOfSpeech::Particle | PartOfSpeech::Auxiliary => 0.2,
+                PartOfSpeech::Particle | PartOfSpeech::Auxiliary => {
+                    // Bonus only for lone functional words (は, の, から,
+                    // まで, です …). Synthetic Noun+Particle compounds
+                    // inherit Particle POS via merge_affix_compounds, and
+                    // their kana Cartesian entry (そら+に=そらに 4288)
+                    // would otherwise outrank the kanji version (空+に=
+                    // 空に 5000) by +0.2, sending 「そらに」→「そらに」
+                    // instead of 「空に」. 3+ char readings are almost
+                    // always compound merges, never lone particles.
+                    if reading.chars().count() <= 2 { 0.2 } else { 0.0 }
+                }
                 PartOfSpeech::Verb | PartOfSpeech::Adjective | PartOfSpeech::Adverb => 0.15,
                 PartOfSpeech::Noun => 0.1,  // pronouns are Noun
                 _ => 0.0,
@@ -1672,6 +1729,12 @@ impl ConversionEngine {
             let score_b = Self::effective_score_with(&user_scorer, &reading, b);
             score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
         });
+        // Dedupe by surface, mirroring build_segment_states. See its
+        // comment for the rationale; MUST run before the kana
+        // insert-position calculation so entries stays index-parallel.
+        let mut seen_surfaces: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        entries.retain(|e| seen_surfaces.insert(e.surface.clone()));
         let mut candidates: Vec<String> = entries.iter().map(|e| e.surface.clone()).collect();
         if candidates.is_empty() || !candidates.contains(&reading) {
             let kana_user = user_scorer.score(&reading, &reading);
@@ -2260,6 +2323,31 @@ mod tests {
         assert!(engine.start_conversion().is_none());
     }
 
+    /// Candidate lists must not contain duplicate surface strings.
+    /// はやく carries IPADIC's 早く as both Noun 7500 (supplement) and Adverb 3494,
+    /// and く carries 苦 as both Noun 3269 and Suffix 1482. Without the dedup pass
+    /// in build_segment_states/relookup_segment the user sees the same kanji
+    /// twice in the candidate window.
+    #[test]
+    fn candidates_are_deduped_by_surface() {
+        let mut engine = ConversionEngine::new();
+        for ch in "hayaku".chars() {
+            engine.process_key(ch);
+        }
+        let state = engine.start_conversion().expect("start_conversion returned None");
+        for seg in &state.segments {
+            let mut seen = std::collections::HashSet::new();
+            for c in &seg.candidates {
+                assert!(
+                    seen.insert(c.clone()),
+                    "duplicate candidate {c:?} in segment {:?}: {:?}",
+                    seg.reading,
+                    seg.candidates
+                );
+            }
+        }
+    }
+
     /// commit_conversion clears the composing state — preedit is empty
     /// afterwards.
     #[test]
@@ -2483,6 +2571,89 @@ mod tests {
                 "F-key form {form} lost pending 'm'",
             );
         }
+    }
+
+    /// Regression for bug [25]: F-key commit must NOT restore the
+    /// pending buffer into the romaji converter — the pending was
+    /// already appended to `kana` in start_kana_conversion and just got
+    /// committed as part of the F-key text. Restoring here would double-
+    /// count the "m": committed once inside "ヴィム" and then also
+    /// lingering as buffered input so the next 'a' produces "ま".
+    /// Space path's pending is NOT in kana, so restore is correct there
+    /// and covered by `space_commit_restores_pending_for_next_syllable`.
+    #[test]
+    fn f_key_commit_does_not_leave_pending_in_buffer() {
+        let mut engine = ConversionEngine::new();
+        for ch in "vim".chars() {
+            engine.process_key(ch);
+        }
+        engine
+            .start_kana_conversion(1)
+            .expect("start_kana_conversion returned None");
+        engine
+            .commit_conversion()
+            .expect("commit_conversion returned None");
+        assert_eq!(
+            engine.preedit(),
+            "",
+            "F-key commit left \"{}\" behind — pending 'm' double-counted",
+            engine.preedit(),
+        );
+        engine.process_key('a');
+        assert_eq!(
+            engine.preedit(),
+            "あ",
+            "next keystroke after F-key commit should build a fresh syllable, not a ghost 'ま'",
+        );
+    }
+
+    /// Space path's pending buffer IS restored on commit so "vim → Space
+    /// → Enter → a" builds "ま" (Mozc parity, bug [16]). Complements the
+    /// F-key test above.
+    #[test]
+    fn space_commit_restores_pending_for_next_syllable() {
+        let mut engine = ConversionEngine::new();
+        for ch in "vim".chars() {
+            engine.process_key(ch);
+        }
+        engine
+            .start_conversion()
+            .expect("start_conversion returned None");
+        engine
+            .commit_conversion()
+            .expect("commit_conversion returned None");
+        assert_eq!(engine.preedit(), "m", "Space commit must restore pending 'm'");
+        engine.process_key('a');
+        assert_eq!(engine.preedit(), "ま", "restored 'm' + 'a' must build 'ま'");
+    }
+
+    /// Regression for bug [26]: after Space→Enter restores "m" to the
+    /// buffer, raw_input must also carry "m" so F9/F10 on the next
+    /// syllable renders "ma", not "a". commit_conversion's romaji.reset()
+    /// leaves raw_input=Some("") and without the parallel restore inside
+    /// restore_buffer the two silently diverge.
+    #[test]
+    fn space_commit_restore_keeps_raw_input_in_parity() {
+        let mut engine = ConversionEngine::new();
+        for ch in "vim".chars() {
+            engine.process_key(ch);
+        }
+        engine
+            .start_conversion()
+            .expect("start_conversion returned None");
+        engine
+            .commit_conversion()
+            .expect("commit_conversion returned None");
+        engine.process_key('a');
+        let state = engine
+            .start_kana_conversion(3)
+            .expect("start_kana_conversion returned None");
+        assert_eq!(
+            state.composed_text(),
+            "ma",
+            "F10 after restored 'm' + 'a' must emit \"ma\" (raw_input parity), got \"{}\"",
+            state.composed_text(),
+        );
     }
 
     /// Non-romaji forms (F6 hiragana, F7 katakana, F8 halfwidth katakana)

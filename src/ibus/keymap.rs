@@ -19,7 +19,14 @@ pub const IBUS_MOD1_MASK: u32 = 1 << 3; // Alt
 // that doesn't grab) must NOT be treated as printable — otherwise Super+e
 // romaji-ifies into "え". See `has_modifier` / `KeyEvent::has_ctrl_alt`.
 pub const IBUS_MOD4_MASK: u32 = 1 << 6; // Super (IBus convention)
-pub const IBUS_HYPER_MASK: u32 = 1 << 5; // Hyper (rare, still worth ignoring)
+// IBus's virtual HYPER mask is bit 27, not bit 5 — bit 5 is X11's Mod3,
+// which some users assign to ScrollLock / Kana / their Caps swap. Catching
+// Mod3 here made the engine treat every keystroke as a modifier combo
+// while that latch was on, silently dropping the whole IME (has_modifier
+// returned true → dispatch skipped). Correct value keeps Hyper covered
+// without collateral damage.
+pub const IBUS_SUPER_MASK: u32 = 1 << 26; // Super (IBus virtual bit)
+pub const IBUS_HYPER_MASK: u32 = 1 << 27; // Hyper (IBus virtual bit, rare)
 pub const IBUS_META_MASK: u32 = 1 << 28; // Meta (macOS-style keyboards)
 
 // Toggle-key parser needs these names — one source of truth in dispatch.
@@ -40,7 +47,14 @@ pub const IBUS_KEY_MUHENKAN: u32 = 0xFF22;
 /// compositor (X11 apps with their own bindings) doesn't romaji-ify
 /// the shortcut key into preedit.
 pub fn has_modifier(state: u32) -> bool {
-    state & (IBUS_CONTROL_MASK | IBUS_MOD1_MASK | IBUS_MOD4_MASK | IBUS_HYPER_MASK | IBUS_META_MASK) != 0
+    state
+        & (IBUS_CONTROL_MASK
+            | IBUS_MOD1_MASK
+            | IBUS_MOD4_MASK
+            | IBUS_SUPER_MASK
+            | IBUS_HYPER_MASK
+            | IBUS_META_MASK)
+        != 0
 }
 
 /// Check if this is a key release event.

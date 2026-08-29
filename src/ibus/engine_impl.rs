@@ -18,6 +18,22 @@ use super::config::{CompiledToggleKey, BonolithConfig};
 use super::factory::ForceEnable;
 use super::keymap::*;
 
+/// Fold ASCII uppercase (A-Z) to lowercase (a-z) for keyval matching.
+/// Mirrors `CompiledToggleKey::matches`'s Shift+letter normalisation so
+/// pending_release records/lookups survive Shift-first release order:
+/// press "Shift+A" → OS delivers 0x41; release Shift before A → the A
+/// release arrives as 0x61 (Shift no longer set at the release event).
+/// Without folding both sides, the release misses the recorded 0x41
+/// and leaks as a phantom character in XIM-derived clients — the same
+/// symptom bug [13] tackled for non-shifted keys. Bug [28].
+fn unshift_letter(keyval: u32) -> u32 {
+    if (0x41..=0x5A).contains(&keyval) {
+        keyval + 0x20
+    } else {
+        keyval
+    }
+}
+
 /// IBus Engine state
 pub struct BonolithEngine {
     /// Arc so a detached background task (LLM rerank refresh) can hold a clone
@@ -246,11 +262,15 @@ impl BonolithEngine {
         // first: any key whose press we consumed must have its release
         // consumed too, regardless of the current enabled state.
         if is_release(state) {
+            // Fold A-Z → a-z on lookup so a Shift+letter binding that
+            // recorded the uppercase keysym on press still matches when
+            // the user releases Shift before the letter (bug [28]).
+            let lookup_key = unshift_letter(keyval);
             let owed = self
                 .pending_release
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .remove(&keyval);
+                .remove(&lookup_key);
             if owed {
                 return Ok(true);
             }
@@ -293,7 +313,7 @@ impl BonolithEngine {
                 self.pending_release
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(keyval);
+                    .insert(unshift_letter(keyval));
                 return Ok(true);
             }
         }
@@ -313,10 +333,12 @@ impl BonolithEngine {
             // this the matching release would slip through the release-
             // consume gate and let XIM clients synthesise a phantom press
             // for the toggle key (e.g. a raw ` on grave-based bindings).
+            // Unshift-fold so Shift+letter toggles (bug [11]) survive
+            // Shift-first release order — bug [28].
             self.pending_release
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(keyval);
+                .insert(unshift_letter(keyval));
             return Ok(true);
         }
 
@@ -594,7 +616,8 @@ impl BonolithEngine {
         // then commit_text + hide_preedit_text combine cleanly. Needed
         // whenever we commit or clear the display; safe (no-op-ish) at
         // other times.
-        let needs_neutralise = outcome.commit.is_some()
+        let had_commit = outcome.commit.is_some();
+        let needs_neutralise = had_commit
             || matches!(outcome.display, DisplayUpdate::Cleared);
         if needs_neutralise {
             if let Err(e) = Self::update_preedit_text(
@@ -620,6 +643,16 @@ impl BonolithEngine {
                 let _ = Self::hide_auxiliary_text(emitter).await;
             }
             DisplayUpdate::Preedit(text) => {
+                // If we just committed (a conversion finished with a
+                // Space-path pending buffer still live), the lookup
+                // table and aux text from that conversion are still
+                // visible. Hide them before showing the fresh preedit
+                // so the leftover candidate window doesn't linger over
+                // the "m" the user is about to keep typing (bug [27]).
+                if had_commit {
+                    let _ = Self::hide_lookup_table(emitter).await;
+                    let _ = Self::hide_auxiliary_text(emitter).await;
+                }
                 // Best-effort: engine state has already been mutated by the
                 // dispatcher (buffer advanced, romaji flushed, etc.). If
                 // the D-Bus emit fails we still need to return
@@ -1265,4 +1298,29 @@ impl BonolithEngine {
             .spawn();
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unshift_letter;
+
+    /// Bug [28] regression: pending_release records and lookups both go
+    /// through `unshift_letter`, so a Shift+A press (delivered as 0x41)
+    /// still matches its release when Shift is released first and the
+    /// release keysym arrives as 0x61.
+    #[test]
+    fn unshift_letter_folds_uppercase_ascii() {
+        // A..Z → a..z
+        for (upper, lower) in [(0x41, 0x61), (0x4D, 0x6D), (0x5A, 0x7A)] {
+            assert_eq!(unshift_letter(upper), lower);
+            // Idempotent on lowercase.
+            assert_eq!(unshift_letter(lower), lower);
+        }
+        // Non-letters (digits, punctuation, space, F-keys, IBus keysyms)
+        // pass through unchanged — they're layout-dependent under Shift
+        // and users must configure the shifted keyval explicitly.
+        for k in [0x20u32, 0x30, 0x39, 0x40, 0x5B, 0x60, 0x7B, 0xFF0D, 0xFF1B] {
+            assert_eq!(unshift_letter(k), k, "keyval 0x{k:04X} should not be folded");
+        }
+    }
 }

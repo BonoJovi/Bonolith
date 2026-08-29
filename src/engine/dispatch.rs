@@ -75,9 +75,18 @@ pub const MOD1_MASK: u32 = 1 << 3;
 // Super / Hyper / Meta: usually grabbed by the compositor, but any press
 // that leaks through must be treated as a passthrough — otherwise
 // Super+e romaji-ifies into "え" and hijacks the user's shortcut.
-// Both IBus and Fcitx5 use these bit positions.
-pub const MOD4_MASK: u32 = 1 << 6; // Super
-pub const HYPER_MASK: u32 = 1 << 5; // Hyper
+//
+// Bit positions are IBus's virtual-modifier convention (which the IBus
+// keymap also uses). Bit 5 was previously listed here as HYPER but that
+// is X11's Mod3 — with Caps or ScrollLock remapped to Mod3, latching
+// the modifier made has_ctrl_alt() return true for every keystroke and
+// the whole IME went silent. IBus's own IBUS_HYPER_MASK sits at bit 27
+// and IBus's SUPER at bit 26; both are unused in Fcitx5's KeyStates
+// (which encodes Super at bit 6 via MOD4_MASK), so this convention is
+// safe for both frontends.
+pub const MOD4_MASK: u32 = 1 << 6; // Super (Fcitx5 Mod4 / IBus Mod4 primary)
+pub const SUPER_MASK: u32 = 1 << 26; // Super (IBus virtual bit)
+pub const HYPER_MASK: u32 = 1 << 27; // Hyper (IBus virtual bit; was 1<<5=Mod3 by mistake)
 pub const META_MASK: u32 = 1 << 28; // Meta
 pub const RELEASE_MASK: u32 = 1 << 30;
 
@@ -98,7 +107,9 @@ impl KeyEvent {
     /// with any of these bits is a shortcut the app owns; the dispatcher
     /// returns passthrough so the char never becomes preedit.
     pub fn has_ctrl_alt(&self) -> bool {
-        self.state & (CONTROL_MASK | MOD1_MASK | MOD4_MASK | HYPER_MASK | META_MASK) != 0
+        self.state
+            & (CONTROL_MASK | MOD1_MASK | MOD4_MASK | SUPER_MASK | HYPER_MASK | META_MASK)
+            != 0
     }
 }
 
@@ -240,7 +251,20 @@ pub fn dispatch_key(
         if *converting {
             if let Some(text) = engine.commit_conversion() {
                 *converting = false;
-                return KeyOutcome::commit(text);
+                // Same as KEY_RETURN: keep the preedit visible when a
+                // Space-path pending buffer ("m") is still live so IBus
+                // doesn't leave it as an invisible ghost (bug [27]).
+                let preedit = engine.preedit();
+                return KeyOutcome {
+                    consumed: true,
+                    commit: Some(text),
+                    display: if preedit.is_empty() {
+                        DisplayUpdate::Cleared
+                    } else {
+                        DisplayUpdate::Preedit(preedit)
+                    },
+                    ..KeyOutcome::default()
+                };
             }
             *converting = false;
             return KeyOutcome::cleared();
@@ -490,10 +514,22 @@ fn conversion_key(
         KEY_RETURN => {
             let text = engine.commit_conversion();
             *converting = false;
+            // commit_conversion restores the Space-path pending buffer
+            // (e.g. "m" from "vim → Space → Enter") back into the
+            // romaji converter. Reflect that in the display so IBus's
+            // preedit stays in sync with `engine.preedit()`; otherwise
+            // the "m" lingers invisibly and the next Enter commits it
+            // as a phantom keystroke (bug [27]). apply_outcome handles
+            // commit+preedit combined. F-key path's kana already
+            // included the pending buffer, so preedit will be empty.
             Some(KeyOutcome {
                 consumed: true,
                 commit: text,
-                display: DisplayUpdate::Cleared,
+                display: if engine.preedit().is_empty() {
+                    DisplayUpdate::Cleared
+                } else {
+                    DisplayUpdate::Preedit(engine.preedit())
+                },
                 ..KeyOutcome::default()
             })
         }
@@ -884,12 +920,60 @@ mod tests {
             "m",
             "commit did not preserve trailing 'm' as pending",
         );
+        // Bug [27]: display must reflect the restored preedit so IBus
+        // paints the "m" instead of clearing it into an invisible ghost
+        // that Enter later "commits" as a phantom keystroke.
+        assert!(
+            matches!(&out.display, DisplayUpdate::Preedit(t) if t == "m"),
+            "commit-with-pending must emit Preedit(\"m\"), got {:?}",
+            out.display,
+        );
         dispatch_key(&mut e, &mut c, ev(b'a' as u32));
         assert!(
             e.preedit().ends_with('ま'),
             "'m' + 'a' should continue as 'ま', got {:?}",
             e.preedit(),
         );
+    }
+
+    /// Regression [25]: F-key commit's pending buffer is already part of
+    /// the committed text (start_kana_conversion appended it to kana), so
+    /// commit must NOT restore it to the romaji buffer. Otherwise
+    /// "vim → F7 → Enter → a" produces "ヴィムま" — the "m" gets
+    /// committed inside "ヴィム" AND lingers as buffered input.
+    #[test]
+    fn f_key_conversion_commit_does_not_double_count_pending() {
+        for commit_key in [KEY_RETURN, KEY_TAB] {
+            let (mut e, mut c) = setup();
+            for k in b"vim" {
+                dispatch_key(&mut e, &mut c, ev(*k as u32));
+            }
+            assert_eq!(e.preedit(), "ゔぃm");
+            dispatch_key(&mut e, &mut c, ev(KEY_F7));
+            assert!(c, "F7 should enter conversion");
+            let out = dispatch_key(&mut e, &mut c, ev(commit_key));
+            assert!(out.consumed);
+            assert!(!c);
+            assert!(out.commit.is_some(), "commit key 0x{commit_key:04X} should commit");
+            assert_eq!(
+                e.preedit(),
+                "",
+                "F-key commit via 0x{commit_key:04X} left preedit \"{}\" — pending 'm' double-counted",
+                e.preedit(),
+            );
+            assert!(
+                matches!(out.display, DisplayUpdate::Cleared),
+                "F-key commit display should be Cleared (no leftover preedit), got {:?}",
+                out.display,
+            );
+            dispatch_key(&mut e, &mut c, ev(b'a' as u32));
+            assert_eq!(
+                e.preedit(),
+                "あ",
+                "next keystroke after F-key commit should build fresh 'あ', got {:?}",
+                e.preedit(),
+            );
+        }
     }
 
     /// Regression [16] symmetric: cancel from a Space-triggered
@@ -950,7 +1034,7 @@ mod tests {
     /// consumed as "え".
     #[test]
     fn super_plus_letter_passes_through() {
-        for mask in [MOD4_MASK, HYPER_MASK, META_MASK] {
+        for mask in [MOD4_MASK, SUPER_MASK, HYPER_MASK, META_MASK] {
             let (mut e, mut c) = setup();
             let out = dispatch_key(
                 &mut e,
@@ -963,6 +1047,108 @@ mod tests {
             assert!(!out.consumed, "modifier 0x{mask:08X}+e should passthrough");
             assert_eq!(e.preedit(), "", "modifier 0x{mask:08X}+e leaked into preedit");
         }
+    }
+
+    /// Regression [Devin #1]: X11's Mod3 (1<<5) — often produced when
+    /// Caps or ScrollLock is remapped as Mod3 and latched — must NOT be
+    /// treated as Hyper. Previously HYPER_MASK sat at 1<<5, so any
+    /// Mod3-latched keystroke registered as Hyper+letter and passed
+    /// through, silently disabling the whole IME. Verify a letter with
+    /// only the Mod3 bit set still produces preedit.
+    #[test]
+    fn mod3_latch_does_not_disable_ime() {
+        const X11_MOD3_MASK: u32 = 1 << 5;
+        let (mut e, mut c) = setup();
+        let out = dispatch_key(
+            &mut e,
+            &mut c,
+            KeyEvent {
+                keyval: b'e' as u32,
+                state: X11_MOD3_MASK,
+            },
+        );
+        assert!(out.consumed, "Mod3-latched 'e' should be consumed, not passthrough");
+        assert_eq!(
+            e.preedit(),
+            "え",
+            "Mod3-latched 'e' should still romaji-ify into preedit"
+        );
+    }
+
+    /// Regression [Devin PR #3 #1]: after Space→Enter with a pending
+    /// consonant restored to the romaji buffer, feeding a non-alphabetic
+    /// input (digit / general symbol / Shift+Space) MUST preserve that
+    /// consonant instead of silently discarding it.
+    ///
+    /// The prior `ConversionEngine::append_raw` called `romaji.flush()`
+    /// which cleared any non-"n" pending, so "vim → Space → Enter → 1"
+    /// lost the "m". Follow-up alphabet input goes through
+    /// `process_key` and combines with the pending buffer naturally, so
+    /// that path is asserted here as the control case.
+    fn vim_space_enter(e: &mut ConversionEngine, c: &mut bool) {
+        for ch in "vim".chars() {
+            dispatch_key(e, c, ev(ch as u32));
+        }
+        assert_eq!(e.preedit(), "ゔぃm", "setup: preedit should be ゔぃm");
+        dispatch_key(e, c, ev(KEY_SPACE));
+        assert!(*c, "setup: Space should enter conversion");
+        let out = dispatch_key(e, c, ev(KEY_RETURN));
+        assert!(out.commit.is_some(), "setup: Enter should commit");
+        // Post-commit: output cleared, buffer restored to "m".
+        assert_eq!(e.preedit(), "m", "setup: pending buffer should restore to m");
+    }
+
+    #[test]
+    fn pending_survives_alphabet_after_space_enter() {
+        let (mut e, mut c) = setup();
+        vim_space_enter(&mut e, &mut c);
+        // 'a' combines with pending "m" via romaji → "ま".
+        let out = dispatch_key(&mut e, &mut c, ev(b'a' as u32));
+        assert!(out.consumed);
+        assert_eq!(e.preedit(), "ま", "m+a should compose into ま");
+    }
+
+    #[test]
+    fn pending_survives_digit_after_space_enter() {
+        let (mut e, mut c) = setup();
+        vim_space_enter(&mut e, &mut c);
+        // '1' → fullwidth '１' via append_raw. Pending "m" must be
+        // preserved as literal in the preedit.
+        let out = dispatch_key(&mut e, &mut c, ev(b'1' as u32));
+        assert!(out.consumed);
+        assert_eq!(
+            e.preedit(),
+            "m１",
+            "digit after restored pending should preserve m as literal"
+        );
+    }
+
+    #[test]
+    fn pending_survives_symbol_after_space_enter() {
+        let (mut e, mut c) = setup();
+        vim_space_enter(&mut e, &mut c);
+        // '.' → fullwidth '。' via append_raw. Same preservation contract.
+        let out = dispatch_key(&mut e, &mut c, ev(b'.' as u32));
+        assert!(out.consumed);
+        assert_eq!(
+            e.preedit(),
+            "m。",
+            "symbol after restored pending should preserve m as literal"
+        );
+    }
+
+    #[test]
+    fn pending_survives_shift_space_after_space_enter() {
+        let (mut e, mut c) = setup();
+        vim_space_enter(&mut e, &mut c);
+        // Shift+Space → fullwidth '　' via append_raw. Same contract.
+        let out = dispatch_key(&mut e, &mut c, ev_shift(KEY_SPACE));
+        assert!(out.consumed);
+        assert_eq!(
+            e.preedit(),
+            "m\u{3000}",
+            "Shift+Space after restored pending should preserve m as literal"
+        );
     }
 
     /// Release events are the frontend's job — the dispatcher must not

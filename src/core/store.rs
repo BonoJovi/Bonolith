@@ -492,7 +492,17 @@ impl DictStore {
             params![reading, surface],
         )
         .map_err(sqlite_to_io)?;
-        Self::enforce_row_cap(&conn, "user_scores", MAX_USER_SCORES)?;
+        // Exclude the row we just touched: without this, once the table
+        // hits MAX_USER_SCORES with every existing row at count ≥ 2, the
+        // eviction sub-query's ORDER BY count ASC evicts our fresh
+        // count=1 row in the same call — the learning is silently lost.
+        Self::enforce_row_cap(
+            &conn,
+            "user_scores",
+            MAX_USER_SCORES,
+            "AND NOT (reading = ?2 AND surface = ?3)",
+            &[&reading, &surface],
+        )?;
         Ok(())
     }
 
@@ -522,10 +532,14 @@ impl DictStore {
             params![kana, serialised],
         )
         .map_err(sqlite_to_io)?;
+        // Same exclusion as user_scores: keep the row we just recorded
+        // from being the first eviction target when the table is at cap.
         Self::enforce_row_cap(
             &conn,
             "user_segmentations",
             MAX_USER_SEGMENTATIONS,
+            "AND kana != ?2",
+            &[&kana],
         )?;
         Ok(())
     }
@@ -564,6 +578,8 @@ impl DictStore {
         conn: &rusqlite::Connection,
         table: &str,
         cap: usize,
+        exclude_where: &str,
+        exclude_params: &[&dyn rusqlite::ToSql],
     ) -> io::Result<()> {
         let n: i64 = conn
             .query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| {
@@ -574,16 +590,23 @@ impl DictStore {
             return Ok(());
         }
         let excess = (n as usize) - cap;
-        conn.execute(
-            &format!(
-                "DELETE FROM {} WHERE ROWID IN (
-                     SELECT ROWID FROM {} ORDER BY count ASC, ROWID ASC LIMIT ?1
-                 )",
-                table, table,
-            ),
-            params![excess as i64],
-        )
-        .map_err(sqlite_to_io)?;
+        // The eviction sub-query's WHERE bakes in `exclude_where` so the
+        // caller's just-touched key never lands in the delete set. The
+        // key uses ?2… and up; ?1 is reserved for LIMIT.
+        let sql = format!(
+            "DELETE FROM {table} WHERE ROWID IN (
+                 SELECT ROWID FROM {table}
+                 WHERE 1=1 {exclude_where}
+                 ORDER BY count ASC, ROWID ASC
+                 LIMIT ?1
+             )",
+        );
+        let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(1 + exclude_params.len());
+        let excess_i64 = excess as i64;
+        params_vec.push(&excess_i64);
+        params_vec.extend_from_slice(exclude_params);
+        conn.execute(&sql, params_vec.as_slice())
+            .map_err(sqlite_to_io)?;
         log::info!(
             "Evicted {} lowest-count rows from {} (cap {})",
             excess,
@@ -609,6 +632,7 @@ impl DictStore {
             })
             .map_err(sqlite_to_io)?;
         let mut out = HashMap::new();
+        let mut corrupt: Vec<String> = Vec::new();
         for row in rows {
             let (kana, boundaries) = row.map_err(sqlite_to_io)?;
             // Silently drop rows whose boundaries don't parse cleanly.
@@ -625,6 +649,22 @@ impl DictStore {
                     kana,
                     boundaries,
                 );
+                corrupt.push(kana);
+            }
+        }
+        drop(stmt);
+        // Bug [24] follow-up: a row that fails decode_boundaries can
+        // never be applied again, but the previous behaviour left it in
+        // the table — every subsequent startup re-logged the same warn
+        // AND the row still counted toward MAX_USER_SEGMENTATIONS,
+        // pressuring healthy rows out of the cap. Delete on load so the
+        // slot goes back to the LRU pool.
+        for kana in &corrupt {
+            if let Err(e) = conn.execute(
+                "DELETE FROM user_segmentations WHERE kana = ?1",
+                params![kana],
+            ) {
+                log::warn!("failed to purge corrupt segmentation '{}': {}", kana, e);
             }
         }
         Ok(out)
@@ -761,7 +801,7 @@ mod tests {
         // Force a cap of 2 by calling the helper directly.
         {
             let conn = store.conn.lock().unwrap();
-            DictStore::enforce_row_cap(&conn, "user_segmentations", 2).unwrap();
+            DictStore::enforce_row_cap(&conn, "user_segmentations", 2, "", &[]).unwrap();
         }
 
         let loaded = store.load_user_segmentations().unwrap();
@@ -771,6 +811,97 @@ mod tests {
         assert!(loaded.contains_key("high2"));
         assert!(!loaded.contains_key("low1"));
         assert!(!loaded.contains_key("low2"));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Regression [23] follow-up: when the table is at cap and every
+    /// existing row has count ≥ 2, a fresh insert used to evict its own
+    /// count=1 row in the same enforce_row_cap call. The exclusion
+    /// clause keeps the just-touched key out of the eviction set.
+    /// Drives the failing scenario via the helper directly with a small
+    /// cap (production cap is 10k, so end-to-end via record_segmentation
+    /// would need 10k+1 primes).
+    #[test]
+    fn enforce_row_cap_excludes_named_key() {
+        let path = temp_db_path("seg_cap_self_evict");
+        let store = DictStore::open(&path).unwrap();
+
+        // Prime two rows with count = 2 each — they'd beat "fresh"
+        // (count=1) on ORDER BY count ASC without the exclusion.
+        for _ in 0..2 {
+            store.record_segmentation("occ1", &[2, 4]).unwrap();
+            store.record_segmentation("occ2", &[3, 5]).unwrap();
+        }
+        // Fresh row at count=1.
+        store.record_segmentation("fresh", &[1, 3]).unwrap();
+        assert_eq!(store.load_user_segmentations().unwrap().len(), 3);
+
+        // Simulate the eviction pass record_segmentation would run for
+        // "fresh" at cap=2. Without the exclusion "fresh" is the one
+        // that gets dropped (lowest count, ORDER BY count ASC).
+        let fresh_key: &str = "fresh";
+        {
+            let conn = store.conn.lock().unwrap();
+            DictStore::enforce_row_cap(
+                &conn,
+                "user_segmentations",
+                2,
+                "AND kana != ?2",
+                &[&fresh_key],
+            )
+            .unwrap();
+        }
+
+        let loaded = store.load_user_segmentations().unwrap();
+        assert!(
+            loaded.contains_key("fresh"),
+            "excluded key must survive its own eviction pass, got {:?}",
+            loaded.keys().collect::<Vec<_>>(),
+        );
+        assert_eq!(loaded.len(), 2, "cap enforcement should leave exactly 2 rows");
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Regression [24] follow-up: rows whose boundaries fail to decode
+    /// are dropped in-memory AND now purged from the store on load, so
+    /// the same corrupt row doesn't re-log the warn on every startup
+    /// and doesn't eat a cap slot from healthy segmentations.
+    #[test]
+    fn load_user_segmentations_purges_corrupt_rows() {
+        let path = temp_db_path("seg_corrupt_purge");
+        let store = DictStore::open(&path).unwrap();
+
+        store.record_segmentation("clean", &[2, 4]).unwrap();
+        // Corrupt row: sneak an unparseable value straight into the DB.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO user_segmentations (kana, boundaries, count) VALUES (?1, ?2, 1)",
+                params!["dirty", "3,x,6"],
+            )
+            .unwrap();
+        }
+        // First load: sees both, drops the dirty one from the map,
+        // and purges its DB row on the way out.
+        let loaded = store.load_user_segmentations().unwrap();
+        assert!(loaded.contains_key("clean"));
+        assert!(!loaded.contains_key("dirty"));
+
+        // Second load must see nothing corrupt still lingering.
+        let after = {
+            let conn = store.conn.lock().unwrap();
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM user_segmentations WHERE kana = 'dirty'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            n
+        };
+        assert_eq!(after, 0, "corrupt row should be purged from DB");
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

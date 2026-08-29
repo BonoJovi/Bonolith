@@ -126,6 +126,9 @@ const PRIORITY_OVERRIDES: &[(&str, &str, u32)] = &[
     ("かわ", "川", 3900), // was 1150, below 皮 3755
     ("かみ", "髪", 4000), // was 3300, below 加味 3609
     ("かみ", "神", 3800), // was 3065, below 加味 3609 (髪 > 神 kept)
+    ("そら", "空", 5000), // was 2561, below そら Interjection 4288 — sky/blank
+    ("やま", "山", 4500), // was 938, below 止ま 2394 (a verb inflection) — mountain
+    ("みず", "水", 4200), // was 2615, below 瑞 3948 (rare "auspicious") — water
     ("りょうり", "料理", 4400), // was 3968, below 良吏 4296 (rare "good official")
     ("かぎ", "鍵", 4200),       // was 4119, below 鈎 4124 (rare "hook/gaff")
     ("ひと", "人", 4100), // was 2882, below 匪徒/費途 3982 (rare "bandit"/"expense")
@@ -192,6 +195,33 @@ const PRIORITY_OVERRIDES: &[(&str, &str, u32)] = &[
     ("しました", "しました", 9500),
     ("しません", "しません", 9000),
     ("しましょう", "しましょう", 9000),
+    // Stem+Particle homographs. IPADIC ships several 2/3-char Nouns whose
+    // reading is exactly `<content stem> + <strong particle>` (きょうは→
+    // 教派, かれは→枯れ葉, そらに→空似, …). The DP prefers those 1-word
+    // entries over the Noun+Particle split by a hair (segment_cost -32.5
+    // vs -31.8 for きょうは), so 「きょうは」 conversion resurfaces as
+    // "教派" instead of "今日は". Demote the archaic / niche readings
+    // below 3000 so the everyday N+P parse wins; the compound entry
+    // remains reachable if the user actually types towards it. Same
+    // shape as the existing つぎは→継歯 demotion (2026-05 fix).
+    ("きょうは", "教派", 2500),       // religious sect; 今日+は is the default
+    ("きょうが", "恭賀", 2500),       // formal congratulations; 今日+が default
+    ("かれは", "枯れ葉", 2500),       // dead-leaves noun; 彼+は default
+    ("かれは", "枯葉", 2500),         // alt surface for the same
+    // These are 3-char readings; the DP's char_len multiplier keeps the
+    // 1-seg entry ahead of そら+に / やま+が until freq < ~2260, so
+    // demote further than the 2-char cases above.
+    ("そらに", "空似", 1500),         // coincidental resemblance; 空+に default
+    ("そらに", "そら似", 1500),       // alt surface
+    ("そらで", "空手", 1500),         // からて reading (karate) is untouched
+    ("やまが", "山家", 1500),         // mountain-dweller archaic; 山+が default
+    // "これ" as 之 is a legitimate archaic reading, but Cartesian
+    // product for compounds like これが / これは pulled 之が / 之は
+    // into rank-2. Demoting 之 below the take_top cutoff keeps the
+    // compound clean while the standalone 之 candidate (which the user
+    // has to cycle to) stays intact through the Noun+Particle
+    // compound-candidate limit.
+    ("これ", "之", 2500),             // was 6273; archaic possessive form
 ];
 
 pub struct Dictionary {
@@ -507,6 +537,14 @@ impl Dictionary {
     /// segments were kept whole for the right reason and must not be
     /// touched here.
     fn split_particle_head_segments(&self, segs: Vec<Segment>) -> Vec<Segment> {
+        // A 2-char reading with a strong Noun/Verb/Adj runner-up alongside
+        // its Suffix leader is an everyday content word wearing a Suffix
+        // hat — 敵 (Noun 5474) alongside 的 (Suffix 7408) for てき,
+        // 戦 (Noun 5x) alongside 戦 Suffix for せん, etc. Splitting drops
+        // the content word from every reachable parse. がき's runner-up
+        // is 餓鬼 (Noun 4353), so the threshold stays above that to keep
+        // the がき→物書き Noun+Suffix rebuild firing.
+        const CONTENT_RUNNER_UP_MIN: u32 = 4500;
         let mut out: Vec<Segment> = Vec::with_capacity(segs.len());
         for seg in segs {
             let chars: Vec<char> = seg.reading.chars().collect();
@@ -515,6 +553,21 @@ impl Dictionary {
                 continue;
             }
             if !matches!(Self::dominant_pos(&seg), Some(PartOfSpeech::Suffix)) {
+                out.push(seg);
+                continue;
+            }
+            // Suffix wins on freq, but is there a strong content-word
+            // runner-up on the SAME 2-char reading? If so the split
+            // would strand it — bug [1] 残: てき split loses 敵 entirely
+            // because the ensuing き+を Noun+Particle merge fuses き's
+            // 気 with を into 気を, so no parse ever reaches 敵.
+            let has_strong_content = seg.candidates.iter().any(|e| {
+                matches!(
+                    e.pos,
+                    PartOfSpeech::Noun | PartOfSpeech::Verb | PartOfSpeech::Adjective
+                ) && e.frequency >= CONTENT_RUNNER_UP_MIN
+            });
+            if has_strong_content {
                 out.push(seg);
                 continue;
             }
@@ -552,8 +605,36 @@ impl Dictionary {
     }
 
     /// Return the dominant (highest-frequency) PartOfSpeech for a segment, if any.
+    ///
+    /// Tie-breaker: on equal frequency, prefer content POS (Noun / Verb /
+    /// Adjective) over affix POS (Suffix / Prefix). PRIORITY_OVERRIDES
+    /// keys on (reading, surface) and therefore hits every entry with the
+    /// same kanji regardless of POS — 山 Noun and 山 Suffix both land at
+    /// 4500 after the override, and `max_by_key`'s "last wins" default
+    /// picked the Suffix and vetoed the Noun+Particle merge that would
+    /// have turned やまは into 山は (bug: kana top1 for that reading).
     fn dominant_pos(seg: &Segment) -> Option<PartOfSpeech> {
-        seg.candidates.iter().max_by_key(|e| e.frequency).map(|e| e.pos)
+        seg.candidates
+            .iter()
+            .max_by(|a, b| {
+                a.frequency
+                    .cmp(&b.frequency)
+                    .then_with(|| Self::pos_tiebreaker(a.pos).cmp(&Self::pos_tiebreaker(b.pos)))
+            })
+            .map(|e| e.pos)
+    }
+
+    /// Higher = wins ties in `dominant_pos`. Content POS beats functional
+    /// POS, which beats affixes.
+    fn pos_tiebreaker(pos: PartOfSpeech) -> u8 {
+        match pos {
+            PartOfSpeech::Noun | PartOfSpeech::Verb | PartOfSpeech::Adjective => 3,
+            PartOfSpeech::Adverb | PartOfSpeech::Interjection => 2,
+            PartOfSpeech::Particle
+            | PartOfSpeech::Auxiliary
+            | PartOfSpeech::Conjunction => 1,
+            PartOfSpeech::Prefix | PartOfSpeech::Suffix | PartOfSpeech::Other => 0,
+        }
     }
 
     /// Merge adjacent compound pairs into single segments.
@@ -785,6 +866,26 @@ impl Dictionary {
                     (Some(PartOfSpeech::Prefix), Some(PartOfSpeech::Suffix)) => {
                         (Some(PartOfSpeech::Prefix), Some(PartOfSpeech::Suffix))
                     }
+                    // Noun+Particle: filter the right side to Particle POS
+                    // only. Without this, take_top's top-5 pulls in the
+                    // homograph Noun candidates for common trailing
+                    // particles (は→刃/歯/覇/葉, の→之/野/盧) and the
+                    // Cartesian product ships nonsense compounds like
+                    // 後刃 / 私之 / 跡刃 as visible candidates. Left stays
+                    // unfiltered so the dictionary's kana entry for the
+                    // stem (わたし, あと …) keeps surfacing alongside the
+                    // kanji form. Verb+Aux and Noun+Conj get the same
+                    // treatment for the same reason (auxiliary / conjunction
+                    // homographs would otherwise leak through).
+                    (Some(PartOfSpeech::Noun), Some(PartOfSpeech::Particle)) => {
+                        (None, Some(PartOfSpeech::Particle))
+                    }
+                    (Some(PartOfSpeech::Verb), Some(PartOfSpeech::Auxiliary)) => {
+                        (None, Some(PartOfSpeech::Auxiliary))
+                    }
+                    (Some(PartOfSpeech::Noun), Some(PartOfSpeech::Conjunction)) => {
+                        (None, Some(PartOfSpeech::Conjunction))
+                    }
                     _ => (None, None),
                 };
                 let merged_candidates = {
@@ -826,10 +927,29 @@ impl Dictionary {
                             role: Option<PartOfSpeech>,
                         ) -> Vec<&'a DictionaryEntry> {
                             if let Some(p) = role {
+                                // Functional POS are near-closed classes
+                                // where the top-frequency entry is the
+                                // modern-Japanese default and the long
+                                // tail is archaic/rare (の's Particle
+                                // homograph 之, は's Particle homograph
+                                // 巴, だ's Auxiliary homograph 抱 …).
+                                // Enumerating those on the Cartesian
+                                // product produces "後之" / "私之" style
+                                // nonsense candidates. Cap to top-1 for
+                                // Particle / Auxiliary / Conjunction; the
+                                // open-class Suffix / Noun / Prefix roles
+                                // still enumerate the top-5 so long-tail
+                                // homographs (家 for か) stay reachable.
+                                let cap = match p {
+                                    PartOfSpeech::Particle
+                                    | PartOfSpeech::Auxiliary
+                                    | PartOfSpeech::Conjunction => 1,
+                                    _ => 5,
+                                };
                                 let filtered: Vec<&DictionaryEntry> = cands
                                     .iter()
                                     .filter(|e| e.pos == p)
-                                    .take(5)
+                                    .take(cap)
                                     .collect();
                                 if !filtered.is_empty() {
                                     return filtered;
@@ -1628,9 +1748,107 @@ impl Dictionary {
             ("おいし",   "美味し", 7500),
             ("すずし",   "涼し",   7000), // IPADIC has 生絹(4378)
             ("やさし",   "優し",   7000),
+            // 2-char い-adjective stems — needed for 連用形 (~く) / 名詞形 (~さ) /
+            // 否定形 (~くない) / 中止形 (~くて). Without these つよく → ツヨ+く
+            // and 強 never surfaces (only つよかった group + つよい are in IPADIC
+            // as whole forms; 連用形 family is missing).
+            ("つよ",     "強",     7000), // IPADIC top is ツヨ Noun 3102
             // Verb forms / adverbials
             ("いれ",     "淹れ",   4000), // brew (tea/coffee); above IPADIC 入れ(3307)
             ("おそく",   "遅く",   7500),
+            // 連用形 whole forms — the stem entry alone leaves つよくなる → つ+よく+なる
+            // because よく Adverb (10294) is dense enough to swallow the middle
+            // syllable in the DP. Adding the 3-char 連用形 gives DP a longer,
+            // cheaper alternative that wins over the よく split.
+            //
+            // Same fix applied to a batch of common i-adjectives whose 連用形
+            // (~く) / 中止形 (~くて) / 否定形 (~くない) / 名詞形 (~さ) are
+            // similarly unreachable via segmentation — IPADIC picks
+            // nonsense homographs (たかく→多角, はやく→破約, ひろく→秘録,
+            // うれしく→売れ+市区, …) or bad splits (せまく→せ+まく,
+            // ながく→な+がく, わかく→わ+かく, …). Whole-form entries at
+            // 7500 win the DP cleanly. Adjectives whose ~く is already
+            // reachable via 2-segment stem+く (あかく=赤+く, くろく=黒+く,
+            // あたらしく=新し+く, …) are intentionally left off — the user
+            // can still cycle to kana on the second segment.
+            ("つよく",   "強く",   7500),
+            ("つよくて", "強くて", 7500),
+            ("つよくない", "強くない", 7500),
+            ("つよさ",   "強さ",   7500),
+            ("たかく",   "高く",   7500),
+            ("たかくて", "高くて", 7500),
+            ("たかくない", "高くない", 7500),
+            ("はやく",   "早く",   7500),
+            ("はやくて", "早くて", 7500),
+            ("はやくない", "早くない", 7500),
+            // 速い family (IPADIC has 速い Adj 5231 but ships no 速く/速さ);
+            // freq 7300 keeps 早く as the DP-picked default while surfacing
+            // 速く as the immediate runner-up so it is one cycle away.
+            ("はやく",   "速く",   7300),
+            ("はやくて", "速くて", 7300),
+            ("はやくない", "速くない", 7300),
+            ("はやさ",   "速さ",   7300),
+            // 早さ (temporal earliness) at 7100 — 速さ (speed) is by far the
+            // more common reading for はやさ in modern text, so 速さ stays top.
+            ("はやさ",   "早さ",   7100),
+            ("ひろく",   "広く",   7500),
+            ("ひろくて", "広くて", 7500),
+            ("ひろくない", "広くない", 7500),
+            ("ひろさ",   "広さ",   7500),
+            ("せまく",   "狭く",   7500),
+            ("せまくて", "狭くて", 7500),
+            ("せまくない", "狭くない", 7500),
+            ("せまさ",   "狭さ",   7500),
+            ("ながく",   "長く",   7500),
+            ("ながくて", "長くて", 7500),
+            ("ながくない", "長くない", 7500),
+            ("ながさ",   "長さ",   7500),
+            ("ひくく",   "低く",   7500),
+            ("ひくくて", "低くて", 7500),
+            ("ひくくない", "低くない", 7500),
+            ("ひくさ",   "低さ",   7500),
+            ("しろく",   "白く",   7500),
+            ("しろくて", "白くて", 7500),
+            ("しろくない", "白くない", 7500),
+            ("しろさ",   "白さ",   7500),
+            ("おもく",   "重く",   7500),
+            ("おもくて", "重くて", 7500),
+            ("おもくない", "重くない", 7500),
+            ("おもさ",   "重さ",   7500),
+            ("とおく",   "遠く",   7500),
+            ("とおくて", "遠くて", 7500),
+            ("とおくない", "遠くない", 7500),
+            ("とおさ",   "遠さ",   7500),
+            ("わかく",   "若く",   7500),
+            ("わかくて", "若くて", 7500),
+            ("わかくない", "若くない", 7500),
+            ("わかさ",   "若さ",   7500),
+            ("みじかく", "短く",   7500),
+            ("みじかくて", "短くて", 7500),
+            ("みじかくない", "短くない", 7500),
+            ("みじかさ", "短さ",   7500),
+            ("すごく",   "凄く",   7500),
+            ("すごくて", "凄くて", 7500),
+            ("すごくない", "凄くない", 7500),
+            ("すごさ",   "凄さ",   7500),
+            ("うれしく", "嬉しく", 7500),
+            ("うれしくて", "嬉しくて", 7500),
+            ("うれしくない", "嬉しくない", 7500),
+            ("うれしさ", "嬉しさ", 7500),
+            ("かなしく", "悲しく", 7500),
+            ("かなしくて", "悲しくて", 7500),
+            ("かなしくない", "悲しくない", 7500),
+            ("かなしさ", "悲しさ", 7500),
+            ("たのしく", "楽しく", 7500),
+            ("たのしくて", "楽しくて", 7500),
+            ("たのしくない", "楽しくない", 7500),
+            ("たのしさ", "楽しさ", 7500),
+            ("さびしく", "寂しく", 7500),
+            ("さびしくて", "寂しくて", 7500),
+            ("さびしくない", "寂しくない", 7500),
+            ("さびしさ", "寂しさ", 7500),
+            ("よろしく", "宜しく", 7500),
+            ("ふるさ",   "古さ",   7500),
             // Noun-stem + さ derivations
             ("たかさ", "高さ", 8000),
             ("ふとさ", "太さ", 7500),
@@ -2860,7 +3078,37 @@ mod tests {
             ("やさし",     "優し"),
             ("いれ",       "淹れ"),
             ("おそく",     "遅く"),
+            ("つよ",       "強"),
+            ("つよく",     "強く"),
+            ("つよくて",   "強くて"),
+            ("つよくない", "強くない"),
+            ("つよさ",     "強さ"),
+            ("たかく",     "高く"),
+            ("たかくない", "高くない"),
             ("たかさ",     "高さ"),
+            ("はやく",     "早く"),
+            ("ひろく",     "広く"),
+            ("ひろさ",     "広さ"),
+            ("せまく",     "狭く"),
+            ("ながく",     "長く"),
+            ("ながさ",     "長さ"),
+            ("ひくく",     "低く"),
+            ("しろく",     "白く"),
+            ("おもく",     "重く"),
+            ("おもさ",     "重さ"),
+            ("とおく",     "遠く"),
+            ("わかく",     "若く"),
+            ("わかさ",     "若さ"),
+            ("みじかく",   "短く"),
+            ("すごく",     "凄く"),
+            ("うれしく",   "嬉しく"),
+            ("うれしさ",   "嬉しさ"),
+            ("かなしく",   "悲しく"),
+            ("たのしく",   "楽しく"),
+            ("たのしさ",   "楽しさ"),
+            ("さびしく",   "寂しく"),
+            ("よろしく",   "宜しく"),
+            ("ふるさ",     "古さ"),
             ("ふとさ",     "太さ"),
             ("くらっかー", "🎉"),
         ];
@@ -2878,6 +3126,226 @@ mod tests {
             }
         }
         assert_eq!(failures, 0, "{failures} supplement entries missing from candidates");
+    }
+
+    /// Table-driven coverage: every listed i-adjective family MUST have
+    /// all four standard conjugations (~く / ~くて / ~くない / ~さ)
+    /// reachable via `segment()`. Unlike `general_supplement_coverage`
+    /// which enumerates registered entries, this test enumerates the
+    /// *expected* coverage set — so a missing form (e.g. Devin PR #3's
+    /// gap "はやさ→早さ / ひくさ→低さ / しろさ→白さ / とおさ→遠さ /
+    /// みじかさ→短さ / すごさ→凄さ") fails automatically the moment
+    /// a family is added to the list without the matching supplement
+    /// entries.
+    ///
+    /// Add a family here whenever you add a new i-adjective batch; keep
+    /// it out only for adjectives with genuinely irregular coverage
+    /// (よろし: 名詞形「宜しさ」は非自然、~くない も 現代語で稀).
+    #[test]
+    fn i_adjective_conjugation_coverage() {
+        let dict = Dictionary::new();
+        // (stem_reading, stem_surface). Kanji column is the primary
+        // surface; secondary surfaces (早/速 both for はや) are checked
+        // via `secondary_forms` below.
+        let families: &[(&str, &str)] = &[
+            ("つよ",   "強"),
+            ("たか",   "高"),
+            ("はや",   "早"),
+            ("ひろ",   "広"),
+            ("せま",   "狭"),
+            ("なが",   "長"),
+            ("ひく",   "低"),
+            ("しろ",   "白"),
+            ("おも",   "重"),
+            ("とお",   "遠"),
+            ("わか",   "若"),
+            ("みじか", "短"),
+            ("すご",   "凄"),
+            ("うれし", "嬉し"),
+            ("かなし", "悲し"),
+            ("たのし", "楽し"),
+            ("さびし", "寂し"),
+        ];
+        // (suffix_reading, suffix_surface): the four standard forms.
+        let forms: &[(&str, &str)] = &[
+            ("く",     "く"),
+            ("くて",   "くて"),
+            ("くない", "くない"),
+            ("さ",     "さ"),
+        ];
+        // Secondary surface families that must also appear (adjacent
+        // homograph readings that IPADIC lists as a distinct Adjective):
+        // for はや, 速い は 別語なので 連用形/名詞形 も 速く/速さ で
+        // 到達可能でなければならない。
+        let secondary: &[(&str, &str)] = &[
+            ("はや", "速"),
+        ];
+        let mut failures: Vec<(String, String)> = Vec::new();
+        let check = |stem_r: &str, stem_s: &str, failures: &mut Vec<(String, String)>| {
+            for &(suf_r, suf_s) in forms {
+                let reading = format!("{stem_r}{suf_r}");
+                let expected = format!("{stem_s}{suf_s}");
+                let all_surfaces: Vec<String> = dict
+                    .segment(&reading)
+                    .iter()
+                    .flat_map(|s| s.candidates.iter().map(|c| c.surface.clone()))
+                    .collect();
+                if !all_surfaces.contains(&expected) {
+                    failures.push((reading, expected));
+                }
+            }
+        };
+        for &(stem_r, stem_s) in families {
+            check(stem_r, stem_s, &mut failures);
+        }
+        for &(stem_r, stem_s) in secondary {
+            check(stem_r, stem_s, &mut failures);
+        }
+        assert!(
+            failures.is_empty(),
+            "{} i-adjective conjugation(s) unreachable via segment():\n{}",
+            failures.len(),
+            failures
+                .iter()
+                .map(|(r, e)| format!("  {r:>12} → expected {e}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// Regression: `てき` had 的 Suffix (7408) dominant over 敵 Noun (5474),
+    /// so `split_particle_head_segments` fired and shredded the reading
+    /// into て+き — 敵 then vanished from every reachable parse because
+    /// `てき+を+叩く` became `て+きを+叩く` after Noun+Particle merge.
+    /// The runner-up gate keeps 2-char readings whole when they carry a
+    /// strong Noun/Verb/Adj candidate (freq ≥ 4500) alongside the Suffix
+    /// leader, so 敵 stays reachable in the てき segment.
+    #[test]
+    fn split_particle_head_keeps_content_runnerup() {
+        let dict = Dictionary::new();
+        // 敵 (Noun 5474) alongside 的 (Suffix 7408) → keep てき whole.
+        let segs = dict.segment("てきをたたく");
+        let readings: Vec<&str> = segs.iter().map(|s| s.reading.as_str()).collect();
+        assert_eq!(
+            readings,
+            vec!["てき", "を", "たたく"],
+            "てき must stay whole so 敵 is reachable, got {:?}",
+            readings,
+        );
+        let teki_surfaces: Vec<&str> = segs[0]
+            .candidates
+            .iter()
+            .map(|e| e.surface.as_str())
+            .collect();
+        assert!(
+            teki_surfaces.contains(&"敵"),
+            "敵 must appear in てき candidates, got {:?}",
+            teki_surfaces,
+        );
+        // Sanity: がき's runner-up 餓鬼 (Noun 4353) sits BELOW the 4500
+        // gate on purpose, so the がき split still fires for がき+的
+        // reclass (previous behaviour preserved — not asserted per-parse
+        // here since surrounding-context segmentation is orthogonal).
+    }
+
+    /// Regression: several stem-particle readings had niche 1-word dict
+    /// entries (きょうは→教派, かれは→枯れ葉, そらに→空似, やまが→
+    /// 山家, これが→...→之が) winning by 1-seg cost advantage over the
+    /// everyday Noun+Particle split. The demotions in PRIORITY_OVERRIDES
+    /// plus the reading-length gate in surface_adjustment restore the
+    /// modern default. The dominant_pos tie-breaker keeps やま Noun 4500
+    /// ahead of やま Suffix 4500 so Noun+Particle merge fires for やまは.
+    #[test]
+    fn stem_particle_defaults_to_noun_plus_particle() {
+        use crate::engine::{ConversionEngine, SharedCore};
+        let shared = SharedCore::new_hermetic();
+        // Romaji key-streams are used directly so combined kana (きょ) don't
+        // get mistyped as ki+yo → 器用 by a naive kana→key converter.
+        let cases = [
+            ("kyouha", "今日は"),
+            ("kyouga", "今日が"),
+            ("kareha", "彼は"),
+            ("sorani", "空に"),
+            ("sorade", "空で"),
+            ("yamaga", "山が"),
+            ("yamaha", "山は"),
+            ("mizuwo", "水を"),
+        ];
+        for (input, want) in cases {
+            let mut e = ConversionEngine::with_shared(shared.clone());
+            for ch in input.chars() {
+                e.process_key(ch);
+            }
+            let state = e.start_conversion().expect("start_conversion");
+            let top: String = state
+                .segments
+                .iter()
+                .filter_map(|s| s.candidates.first().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join("");
+            assert_eq!(top, want, "{input}: expected {want}, got {top}");
+        }
+
+        // Lone particles must still get their +0.2 surface==reading bonus
+        // (the reading-length gate only fires at 3+ chars).
+        for (input, want) in [("ha", "は"), ("no", "の"), ("kara", "から"), ("made", "まで")] {
+            let mut e = ConversionEngine::with_shared(shared.clone());
+            for ch in input.chars() {
+                e.process_key(ch);
+            }
+            let state = e.start_conversion().expect("start_conversion");
+            let top = state.segments[0].candidates[0].as_str();
+            assert_eq!(top, want, "{input}: lone particle must top its candidate list");
+        }
+    }
+
+    /// The Noun+Particle merge in merge_affix_compounds used to pull the
+    /// homograph Noun / archaic-Particle candidates for common trailing
+    /// particles into the compound Cartesian product — visible symptom:
+    /// "後は" showing "後刃" / "跡刃" as sibling candidates, "後の"
+    /// showing "後之" / "跡之". The role filter now restricts the right
+    /// side to Particle POS with a top-1 cap, so only the modern default
+    /// "は" / "の" propagates.
+    #[test]
+    fn noun_particle_merge_hides_homograph_kanji() {
+        let dict = Dictionary::new();
+        // Nonsense surfaces that must NOT appear in the compound candidates.
+        let cases: &[(&str, &[&str])] = &[
+            ("あとは", &["後刃", "跡刃", "蹟刃", "痕刃"]),
+            ("あとの", &["後之", "跡之", "蹟之", "痕之"]),
+            ("わたしは", &["私刃", "わたし刃", "渡し刃"]),
+            ("わたしの", &["私之", "わたし之", "渡し之"]),
+        ];
+        for &(reading, forbidden) in cases {
+            let segs = dict.segment(reading);
+            let all_surfaces: Vec<&str> = segs
+                .iter()
+                .flat_map(|s| s.candidates.iter().map(|c| c.surface.as_str()))
+                .collect();
+            for bad in forbidden {
+                assert!(
+                    !all_surfaces.contains(bad),
+                    "{reading}: nonsense surface {bad:?} leaked into candidates {all_surfaces:?}",
+                );
+            }
+            // Sanity: the modern-particle form must still be present.
+            let modern = match reading.chars().last().unwrap() {
+                'は' => format!("{}は", &reading[..reading.len() - "は".len()]),
+                'の' => format!("{}の", &reading[..reading.len() - "の".len()]),
+                _ => unreachable!(),
+            };
+            // At least one surface should end with the modern particle
+            // over a kanji stem (e.g. "後は" / "私の").
+            let has_kanji_particle = all_surfaces.iter().any(|s| {
+                s.ends_with(modern.chars().last().unwrap())
+                    && s.chars().count() >= 2
+                    && !s.starts_with(reading.chars().next().unwrap())
+            });
+            assert!(
+                has_kanji_particle,
+                "{reading}: expected at least one kanji-stem+particle candidate in {all_surfaces:?}",
+            );
+        }
     }
 }
 

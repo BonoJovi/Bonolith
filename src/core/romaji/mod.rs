@@ -154,9 +154,21 @@ impl RomajiConverter {
     /// here lets the follow-up `preedit()` show kana+"m" as it did before
     /// F-key (bug [15]). No-op if the buffer already holds content — a
     /// concurrent keystroke would have already advanced past the cancel.
+    ///
+    /// Also mirrors the pending into `raw_input` when it is currently
+    /// Some, keeping F9/F10 parity: without this, `commit_conversion`'s
+    /// preceding `reset()` sets raw_input=Some("") and the follow-up
+    /// buffer restore of "m" left them desynced — a subsequent 'a'
+    /// would yield "ま" with raw_input="a", so F10 emitted "a" instead
+    /// of "ma" (bug [26]). The cancel path had raw_input=None already
+    /// (F-key start_kana_conversion's flush cleared it), so this is a
+    /// no-op there and doesn't reintroduce ghost input.
     pub fn restore_buffer(&mut self, pending: &str) {
         if !pending.is_empty() && self.buffer.is_empty() {
             self.buffer.push_str(pending);
+            if let Some(raw) = self.raw_input.as_mut() {
+                raw.push_str(pending);
+            }
         }
     }
 
@@ -199,6 +211,31 @@ impl RomajiConverter {
         self.output.push_str(s);
         // Bypass mode — the output no longer has a 1:1 raw-input record.
         self.raw_input = None;
+    }
+
+    /// Flush any pending buffer AS-LITERAL into `output` and return whether
+    /// anything was written. "n" is the one case that produces kana (ん);
+    /// every other non-empty pending is a single mid-syllable consonant
+    /// like "m" or "ky" which `flush()` would silently discard. This
+    /// preserves those chars as verbatim preedit text so the caller can
+    /// then append a symbol / digit without losing what the user typed
+    /// (Devin PR #3 #1 — Space→Enter→digit/symbol dropped restored "m").
+    pub fn flush_pending_as_literal(&mut self) -> bool {
+        if self.buffer.is_empty() {
+            return false;
+        }
+        if self.buffer == "n" {
+            self.buffer.clear();
+            self.output.push('ん');
+            return true;
+        }
+        // Preserve the raw pending consonant(s) in output as-typed. Once
+        // in output the 1:1 raw-input record no longer maps cleanly, so
+        // invalidate `raw_input` (same convention as append_raw).
+        self.output.push_str(&self.buffer);
+        self.buffer.clear();
+        self.raw_input = None;
+        true
     }
 
     /// Get accumulated kana output
@@ -330,11 +367,14 @@ pub fn hiragana_to_romaji(s: &str) -> String {
             if let Some(romaji) = kana_to_romaji_lookup(&slice) {
                 result.push_str(romaji);
                 i += len;
-                // ん + vowel / y-row / ん needs an explicit "n'" so a
-                // later kana→romaji reader can't re-parse "kani" as
-                // か+に instead of か+ん+い. `kana_to_romaji_lookup`
-                // returns bare "n" only for ん, so a bare "n" here
-                // means slice == "ん".
+                // ん + vowel / y-row needs an explicit "n'" so a later
+                // kana→romaji reader can't re-parse "kani" as か+に
+                // instead of か+ん+い. `kana_to_romaji_lookup` returns
+                // bare "n" only for ん, so a bare "n" here means
+                // slice == "ん". ん+ん stays "nn" — the Hepburn "nn"
+                // convention for ん would be ambiguous either way, and
+                // this branch is round-tripped via `hiragana_to_romaji`
+                // for F9/F10, not fed back into the segmenter.
                 if romaji == "n" && needs_n_apostrophe(chars.get(i).copied()) {
                     result.push('\'');
                 }

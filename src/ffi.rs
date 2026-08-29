@@ -112,24 +112,35 @@ pub struct BonolithContext {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_context_new() -> *mut BonolithContext {
-    let ctx = Box::new(BonolithContext {
-        engine: ConversionEngine::new(),
-        converting: false,
-        pending_commit: None,
-        cache_preedit: CString::default(),
-        cache_commit: CString::default(),
-        cache_composed: CString::default(),
-        cache_candidate: CString::default(),
-        cache_candidates: Vec::new(),
-    });
-    Box::into_raw(ctx)
+    // Wrapped like every other extern-"C" entry point: dictionary /
+    // scorer construction can panic on OOM or corrupted state, and
+    // letting the unwind cross the C boundary aborts Fcitx5. Returning
+    // null on failure is what the frontend already handles for OOM in
+    // `bonolith_context_new` and keeps the daemon alive.
+    ffi_boundary(ptr::null_mut(), || {
+        let ctx = Box::new(BonolithContext {
+            engine: ConversionEngine::new(),
+            converting: false,
+            pending_commit: None,
+            cache_preedit: CString::default(),
+            cache_commit: CString::default(),
+            cache_composed: CString::default(),
+            cache_candidate: CString::default(),
+            cache_candidates: Vec::new(),
+        });
+        Box::into_raw(ctx)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bonolith_context_free(ctx: *mut BonolithContext) {
-    if !ctx.is_null() {
-        unsafe { drop(Box::from_raw(ctx)) }
-    }
+    // Drop can panic (a poisoned Mutex holding a payload with a
+    // panicking Drop, e.g.) — same policy as every other boundary here.
+    ffi_boundary((), || {
+        if !ctx.is_null() {
+            unsafe { drop(Box::from_raw(ctx)) }
+        }
+    })
 }
 
 // ── Key handling ─────────────────────────────────────────────────────────────
