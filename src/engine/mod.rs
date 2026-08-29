@@ -256,6 +256,18 @@ pub struct SharedCore {
     /// the database could not be opened (in which case the engine still
     /// runs but mutations are not persisted).
     pub store: Option<Arc<DictStore>>,
+    /// Buffered commit texts whose `update_context` couldn't take the
+    /// `llm` lock because the background rerank worker was holding it
+    /// (worker holds through all HTTP scoring, up to
+    /// `RERANK_TOTAL_BUDGET` = 1800 ms). The prior code
+    /// `try_lock().or(log::debug!)` dropped those commits on the floor
+    /// so the LLM's committed-text history silently missed anything
+    /// typed during a busy rerank — Devin PR #3 #3.
+    ///
+    /// Order preserved via `Vec<String>` (FIFO). Flushed into
+    /// `LlmEngine::update_context` by whoever next acquires the `llm`
+    /// lock (a later commit, or the next rerank worker at start).
+    pub pending_llm_context: Mutex<Vec<String>>,
 }
 
 /// Global shared core, initialized on first use.
@@ -316,6 +328,7 @@ impl SharedCore {
                     llm: Mutex::new(llm),
                     user_scorer: Mutex::new(user_scorer),
                     store,
+                    pending_llm_context: Mutex::new(Vec::new()),
                 })
             })
             .clone()
@@ -337,7 +350,58 @@ impl SharedCore {
             llm: Mutex::new(LlmEngine::with_scorer(scorer)),
             user_scorer: Mutex::new(UserScorer::new()),
             store: None,
+            pending_llm_context: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Feed a just-committed text to the LLM context — non-blocking.
+    /// Tries `llm.try_lock`; on success drains any pending buffer FIFO
+    /// then applies the new text; on failure appends to
+    /// `pending_llm_context` so a later successful lock (a subsequent
+    /// commit, or the next background worker) flushes it. Guarantees
+    /// no committed text is silently dropped, which is what the plain
+    /// `try_lock` path used to do while the worker held the lock
+    /// through a 1800 ms rerank (Devin PR #3 #3).
+    pub fn update_llm_context_or_defer(&self, text: &str) {
+        match self.llm.try_lock() {
+            Ok(mut llm) => {
+                let pending: Vec<String> = std::mem::take(
+                    &mut *self
+                        .pending_llm_context
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()),
+                );
+                for entry in pending {
+                    llm.update_context(&entry);
+                }
+                llm.update_context(text);
+            }
+            Err(_) => {
+                self.pending_llm_context
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(text.to_string());
+                log::debug!(
+                    "LLM lock busy during commit — text queued for next opportunity"
+                );
+            }
+        }
+    }
+
+    /// Called by holders of `llm.lock()` (chiefly the rerank worker at
+    /// its start) to move any queued commit texts into the LLM's
+    /// committed-text history before consuming that history for
+    /// scoring. Drains FIFO.
+    pub fn drain_pending_llm_context(&self, llm: &mut LlmEngine) {
+        let pending: Vec<String> = std::mem::take(
+            &mut *self
+                .pending_llm_context
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        for entry in pending {
+            llm.update_context(&entry);
+        }
     }
 
     /// Hermetic evaluation core: [`new_eval`] wired to the deterministic
@@ -900,10 +964,10 @@ impl ConversionEngine {
 
     /// Commit the selected candidate and update context.
     pub fn commit(&mut self, candidate: &str) -> String {
-        match self.shared.llm.try_lock() {
-            Ok(mut llm) => llm.update_context(candidate),
-            Err(_) => log::debug!("LLM lock busy during commit, skipping context update"),
-        }
+        // Non-blocking LLM context update — deferred to the next lock
+        // opportunity if the rerank worker is holding the lock
+        // (Devin PR #3 #3).
+        self.shared.update_llm_context_or_defer(candidate);
         self.romaji.reset();
         candidate.to_string()
     }
@@ -939,12 +1003,10 @@ impl ConversionEngine {
             }
         }
 
-        // Use try_lock to avoid blocking if LLM background thread holds the lock.
-        // If we can't acquire the lock now, update context on next available opportunity.
-        match self.shared.llm.try_lock() {
-            Ok(mut llm) => llm.update_context(&text),
-            Err(_) => log::debug!("LLM lock busy during commit, skipping context update"),
-        }
+        // Non-blocking LLM context update — deferred to the next lock
+        // opportunity if the rerank worker is holding the lock
+        // (Devin PR #3 #3). No committed text is dropped.
+        self.shared.update_llm_context_or_defer(&text);
         self.romaji.reset();
         // Re-inject any pending romaji buffer that was live at
         // start_conversion time (e.g. "m" from "vim → Space → Enter")
@@ -1092,7 +1154,14 @@ impl ConversionEngine {
         thread::spawn(move || {
             // Catch any panics to prevent crashing the IBus process
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let llm = shared.llm.lock().unwrap_or_else(|e| e.into_inner());
+                let mut llm = shared.llm.lock().unwrap_or_else(|e| e.into_inner());
+                // Drain any commits that hit us mid-worker and were
+                // deferred by `update_llm_context_or_defer` — Devin
+                // PR #3 #3. Must run before we snapshot context so
+                // the deferred texts join this pass's scoring window
+                // (or at least the next one, if we snapshot right
+                // after).
+                shared.drain_pending_llm_context(&mut llm);
                 let committed_context = llm.context().to_string();
                 // running_context accumulates chosen candidates as we go through segments.
                 // Start empty — committed_context is passed separately to score_with_context.
@@ -3023,5 +3092,71 @@ mod tests {
             "single-segment rerank blew inner-loop budget: {}ms",
             elapsed.as_millis(),
         );
+    }
+
+    /// Devin PR #3 #3 regression: while the rerank worker holds
+    /// `shared.llm.lock()`, `update_llm_context_or_defer` must defer
+    /// the commit into `pending_llm_context` and NOT drop it — a later
+    /// successful lock (from another commit or the worker's next
+    /// pass) then drains the queue in FIFO order before applying its
+    /// own text.
+    #[test]
+    fn commit_context_deferred_when_worker_holds_llm_lock() {
+        let shared = SharedCore::new_hermetic();
+
+        // Take the LLM lock to simulate the rerank worker's ~1800 ms
+        // hold.
+        let guard = shared.llm.lock().unwrap();
+
+        // Commit twice while the lock is held — both must land in the
+        // pending queue, in order.
+        shared.update_llm_context_or_defer("A");
+        shared.update_llm_context_or_defer("B");
+        {
+            let pending = shared.pending_llm_context.lock().unwrap();
+            assert_eq!(pending.as_slice(), &["A".to_string(), "B".to_string()]);
+        }
+        // LLM's context is still whatever it started with (empty) —
+        // nothing was applied yet.
+        assert_eq!(guard.context(), "");
+
+        // Release the lock. The next commit takes the lock, drains
+        // the pending FIFO, then applies its own text.
+        drop(guard);
+        shared.update_llm_context_or_defer("C");
+
+        let llm = shared.llm.lock().unwrap();
+        assert_eq!(llm.context(), "ABC");
+        assert!(shared.pending_llm_context.lock().unwrap().is_empty());
+    }
+
+    /// Same contract for the worker path: when the worker acquires
+    /// `llm.lock()` at start of a rerank pass, it must call
+    /// `drain_pending_llm_context` so any deferred commits from the
+    /// previous pass join the LLM's committed-text history before
+    /// scoring uses it.
+    #[test]
+    fn worker_drain_absorbs_deferred_commits() {
+        let shared = SharedCore::new_hermetic();
+
+        // Simulate a busy worker holding the lock while two commits
+        // land in the pending queue.
+        {
+            let _guard = shared.llm.lock().unwrap();
+            shared.update_llm_context_or_defer("X");
+            shared.update_llm_context_or_defer("Y");
+        }
+        // After the "worker" releases, pending still holds X and Y —
+        // no one drained yet.
+        assert_eq!(
+            shared.pending_llm_context.lock().unwrap().as_slice(),
+            &["X".to_string(), "Y".to_string()]
+        );
+
+        // Simulate the next worker pass: acquire llm, drain pending.
+        let mut llm = shared.llm.lock().unwrap();
+        shared.drain_pending_llm_context(&mut llm);
+        assert_eq!(llm.context(), "XY");
+        assert!(shared.pending_llm_context.lock().unwrap().is_empty());
     }
 }
