@@ -995,6 +995,20 @@ impl ConversionEngine {
                     let score_b = Self::effective_score_with(&user_scorer, &seg.reading, b);
                     score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
                 });
+                // Dedupe entries by surface — the same kanji surface can
+                // reach us multiple times when IPADIC ships POS variants
+                // (早く is both Noun 7500 and Adverb 3494 for はやく; 苦
+                // is both Noun 3269 and Suffix 1482 for く) or when the
+                // affix-merge synthesizer produces a compound already
+                // present as a whole-word dict entry. Since entries is
+                // already sorted highest-score-first, retaining first
+                // occurrence keeps the best-scored representative. This
+                // MUST run before the kana insert-position calculation
+                // so `entries` and the eventual `candidates` array stay
+                // index-parallel.
+                let mut seen_surfaces: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                entries.retain(|e| seen_surfaces.insert(e.surface.clone()));
                 let mut candidates: Vec<String> =
                     entries.iter().map(|e| e.surface.clone()).collect();
                 // Always include the raw reading (kana) as a candidate.
@@ -1709,6 +1723,12 @@ impl ConversionEngine {
             let score_b = Self::effective_score_with(&user_scorer, &reading, b);
             score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
         });
+        // Dedupe by surface, mirroring build_segment_states. See its
+        // comment for the rationale; MUST run before the kana
+        // insert-position calculation so entries stays index-parallel.
+        let mut seen_surfaces: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        entries.retain(|e| seen_surfaces.insert(e.surface.clone()));
         let mut candidates: Vec<String> = entries.iter().map(|e| e.surface.clone()).collect();
         if candidates.is_empty() || !candidates.contains(&reading) {
             let kana_user = user_scorer.score(&reading, &reading);
@@ -2295,6 +2315,31 @@ mod tests {
     fn convert_empty() {
         let mut engine = ConversionEngine::new();
         assert!(engine.start_conversion().is_none());
+    }
+
+    /// Candidate lists must not contain duplicate surface strings.
+    /// はやく carries IPADIC's 早く as both Noun 7500 (supplement) and Adverb 3494,
+    /// and く carries 苦 as both Noun 3269 and Suffix 1482. Without the dedup pass
+    /// in build_segment_states/relookup_segment the user sees the same kanji
+    /// twice in the candidate window.
+    #[test]
+    fn candidates_are_deduped_by_surface() {
+        let mut engine = ConversionEngine::new();
+        for ch in "hayaku".chars() {
+            engine.process_key(ch);
+        }
+        let state = engine.start_conversion().expect("start_conversion returned None");
+        for seg in &state.segments {
+            let mut seen = std::collections::HashSet::new();
+            for c in &seg.candidates {
+                assert!(
+                    seen.insert(c.clone()),
+                    "duplicate candidate {c:?} in segment {:?}: {:?}",
+                    seg.reading,
+                    seg.candidates
+                );
+            }
+        }
     }
 
     /// commit_conversion clears the composing state — preedit is empty
