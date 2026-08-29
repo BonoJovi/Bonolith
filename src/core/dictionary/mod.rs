@@ -1781,6 +1781,13 @@ impl Dictionary {
             ("はやく",   "早く",   7500),
             ("はやくて", "早くて", 7500),
             ("はやくない", "早くない", 7500),
+            // 速い family (IPADIC has 速い Adj 5231 but ships no 速く/速さ);
+            // freq 7300 keeps 早く as the DP-picked default while surfacing
+            // 速く as the immediate runner-up so it is one cycle away.
+            ("はやく",   "速く",   7300),
+            ("はやくて", "速くて", 7300),
+            ("はやくない", "速くない", 7300),
+            ("はやさ",   "速さ",   7300),
             ("ひろく",   "広く",   7500),
             ("ひろくて", "広くて", 7500),
             ("ひろくない", "広くない", 7500),
