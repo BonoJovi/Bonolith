@@ -433,22 +433,25 @@ pub unsafe extern "C" fn bonolith_get_ui_state(ctx: *mut BonolithContext, out: *
             if let Some(state) = ctx.engine.conversion_state() {
                 let composed = state.composed_text();
                 let ranges = state.segment_char_ranges();
-                let seg_count = state.segments.len().min(MAX_SEGMENTS);
-                let focus = state.focus;
+                let (visible_ranges, clamped_focus) =
+                    compress_segments_for_display(&ranges, state.focus);
+                let seg_count = visible_ranges.len();
 
                 out.segment_count = seg_count as i32;
-                out.focus_index = focus as i32;
+                out.focus_index = clamped_focus as i32;
 
-                for i in 0..seg_count {
-                    let (start, end) = ranges[i];
+                for (i, (start, end)) in visible_ranges.iter().enumerate() {
                     out.segments[i] = BonolithSegmentInfo {
-                        start_chars: start as i32,
+                        start_chars: *start as i32,
                         char_len: (end - start) as i32,
                     };
                 }
 
-                // Candidates for focused segment
-                let seg = &state.segments[focus];
+                // Candidates for focused segment — always the real
+                // focus, even when the rendered focus_index above was
+                // clamped for display: candidate cycling / commit
+                // operates on the true segment index.
+                let seg = &state.segments[state.focus];
                 let cand_count = seg.candidates.len().min(MAX_CANDIDATES);
                 out.candidate_count = cand_count as i32;
                 // Clamp the selected index into the visible window: if the
@@ -791,4 +794,108 @@ pub unsafe extern "C" fn bonolith_clear_learning() -> i32 {
             Err(_) => -1,
         }
     })
+}
+
+/// Truncate a segment-range list to the FFI's fixed MAX_SEGMENTS slot
+/// count, and clamp `focus` into the visible window.
+///
+/// When the real segment count exceeds MAX_SEGMENTS, the last visible
+/// slot absorbs all remaining segments' char range. The Fcitx5 preedit
+/// renderer only iterates up to `segment_count`, so without this merge
+/// segments 33+ would be in `composed_text()` (and would land in the
+/// commit) but never appear in the panel — panel and commit disagree
+/// (Devin PR #3 #5). Segment boundaries past 32 stop being
+/// individually navigable in the panel, but nothing goes invisible.
+///
+/// Focus clamping ensures Fcitx5's `i == focus_index` comparison
+/// always matches some slot; otherwise the panel shows every visible
+/// segment as an underline and the cursor position vanishes.
+fn compress_segments_for_display(
+    ranges: &[(usize, usize)],
+    focus: usize,
+) -> (Vec<(usize, usize)>, usize) {
+    let real = ranges.len();
+    let visible = real.min(MAX_SEGMENTS);
+    let out: Vec<(usize, usize)> = (0..visible)
+        .map(|i| {
+            let (start, end) = ranges[i];
+            if i == visible - 1 && real > MAX_SEGMENTS {
+                (start, ranges[real - 1].1)
+            } else {
+                (start, end)
+            }
+        })
+        .collect();
+    let clamped_focus = if visible == 0 { 0 } else { focus.min(visible - 1) };
+    (out, clamped_focus)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Under the MAX_SEGMENTS cap: every segment passes through
+    /// unchanged and focus is preserved.
+    #[test]
+    fn compress_under_max_passthrough() {
+        let ranges: Vec<(usize, usize)> = (0..10).map(|i| (i * 2, i * 2 + 2)).collect();
+        let (out, focus) = compress_segments_for_display(&ranges, 3);
+        assert_eq!(out, ranges);
+        assert_eq!(focus, 3);
+    }
+
+    /// Exactly at the cap: also unchanged.
+    #[test]
+    fn compress_at_max_passthrough() {
+        let ranges: Vec<(usize, usize)> = (0..MAX_SEGMENTS).map(|i| (i, i + 1)).collect();
+        let (out, focus) = compress_segments_for_display(&ranges, MAX_SEGMENTS - 1);
+        assert_eq!(out.len(), MAX_SEGMENTS);
+        assert_eq!(out, ranges);
+        assert_eq!(focus, MAX_SEGMENTS - 1);
+    }
+
+    /// Past the cap: the last visible slot absorbs every remaining
+    /// segment's char range so `sum(char_len)` equals the full preedit
+    /// length. Devin PR #3 #5.
+    #[test]
+    fn compress_over_max_merges_tail_no_text_loss() {
+        // 40 segments, each 1 char → total 40 chars.
+        let ranges: Vec<(usize, usize)> = (0..40).map(|i| (i, i + 1)).collect();
+        let (out, _focus) = compress_segments_for_display(&ranges, 0);
+        assert_eq!(out.len(), MAX_SEGMENTS);
+        // Slots 0..31 pass through; slot 31 absorbs chars 31..40.
+        assert_eq!(out[0], (0, 1));
+        assert_eq!(out[MAX_SEGMENTS - 2], (30, 31));
+        assert_eq!(out[MAX_SEGMENTS - 1], (31, 40));
+        // Sum of char_len across visible slots covers the full preedit
+        // (0..40) — nothing goes invisible.
+        let total: usize = out.iter().map(|(s, e)| e - s).sum();
+        assert_eq!(total, 40);
+    }
+
+    /// Focus past the cap is clamped to the last visible slot so
+    /// Fcitx5's `i == focus_index` still matches something.
+    #[test]
+    fn compress_clamps_focus_past_max() {
+        let ranges: Vec<(usize, usize)> = (0..40).map(|i| (i, i + 1)).collect();
+        let (_, focus) = compress_segments_for_display(&ranges, 35);
+        assert_eq!(focus, MAX_SEGMENTS - 1);
+    }
+
+    /// Focus inside the visible window stays put even when the total
+    /// exceeds the cap.
+    #[test]
+    fn compress_preserves_focus_when_visible() {
+        let ranges: Vec<(usize, usize)> = (0..40).map(|i| (i, i + 1)).collect();
+        let (_, focus) = compress_segments_for_display(&ranges, 7);
+        assert_eq!(focus, 7);
+    }
+
+    /// Empty input degrades gracefully — no panic, focus stays at 0.
+    #[test]
+    fn compress_empty_input() {
+        let (out, focus) = compress_segments_for_display(&[], 0);
+        assert!(out.is_empty());
+        assert_eq!(focus, 0);
+    }
 }
