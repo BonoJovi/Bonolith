@@ -864,7 +864,19 @@ impl Dictionary {
         // Suffix — がき's 書き (Suffix) tops the group at 4400 thanks to a
         // PRIORITY_OVERRIDE, so returning Suffix here would still fuse
         // もの+がき into 物書き and mask the intended もの+が+き parse.
-        if matches!(dominant, Some(PartOfSpeech::Auxiliary) | Some(PartOfSpeech::Verb)) {
+        //
+        // Predicate-dominant readings (Adjective / Verb / Auxiliary) are
+        // never reclassed to Suffix — they are bunsetsu heads / predicates
+        // and a Suffix homograph (よい → 酔い Suffix 1542 under 良い
+        // Adjective 9158) is always the wrong reading in a bunsetsu
+        // context. Without this, きぶん+よい fuses into 気分酔い (Devin
+        // PR #6 5th round).
+        if matches!(
+            dominant,
+            Some(PartOfSpeech::Auxiliary)
+                | Some(PartOfSpeech::Verb)
+                | Some(PartOfSpeech::Adjective)
+        ) {
             return dominant;
         }
         if matches!(dominant, Some(PartOfSpeech::Suffix)) {
@@ -879,15 +891,20 @@ impl Dictionary {
         // (しん→新 3979 > 心 Suffix 2252). Reclassing it to a weaker Suffix
         // would fuse into the left compound and lose the Prefix reading
         // (bug: しん between 技術的 and 斎院 fusing as 技術的心 instead
-        // of pairing with 斎院). BUT this only matters when a Noun / Prefix
-        // actually follows to form the Prefix+X compound — a trailing
-        // Prefix-dominant segment (会議+ちゅう, ちゅう has Prefix 駐 4832
-        // top but Suffix 中 3528 present, with no next segment) should
-        // reclass to Suffix so 会議中 fuses (Devin PR #6 4th round).
+        // of pairing with 斎院). BUT this only matters when the Prefix
+        // actually has something to modify next — a trailing Prefix-
+        // dominant segment (会議+ちゅう, no next) should reclass to
+        // Suffix so 会議中 fuses (Devin PR #6 4th round). Real Japanese
+        // Prefixes modify Nouns AND predicates (超+面白い, 超+難しい, 超+
+        // 好き) so Adjective / Verb next also protect the Prefix (Devin
+        // PR #6 5th round: 映画+超+面白い was fusing into 映画町).
         if matches!(dominant, Some(PartOfSpeech::Prefix))
             && matches!(
                 next_after_right_dominant,
-                Some(PartOfSpeech::Noun) | Some(PartOfSpeech::Prefix)
+                Some(PartOfSpeech::Noun)
+                    | Some(PartOfSpeech::Prefix)
+                    | Some(PartOfSpeech::Adjective)
+                    | Some(PartOfSpeech::Verb)
             )
         {
             return dominant;
@@ -2505,6 +2522,61 @@ mod tests {
         );
         assert_eq!(segs[0].candidates[0].surface, "技術的");
         assert_eq!(segs[1].candidates[0].surface, "審査委員会");
+    }
+
+    /// Regression: Adjective-dominant right seg must NEVER reclass to a
+    /// weak Suffix homograph, even under a long compound-noun head.
+    /// きぶん+よい (よい dominant 良い Adjective 9158, Suffix 酔い 1542)
+    /// used to fuse into 気分酔い before the Adjective was added to the
+    /// early-block set; the natural bunsetsu boundary must survive
+    /// (Devin PR #6 5th round #1).
+    ///
+    /// Regression: Prefix-dominant right seg must be preserved when the
+    /// following segment is a predicate (Adjective / Verb), not only when
+    /// it is a Noun / Prefix. Japanese prefixes like 超 modify Adjectives
+    /// (超+面白い, 超+難しい) — treating that as a chainable next keeps
+    /// the natural [映画, 超, 面白い] parse instead of fusing the first
+    /// two into 映画町 (Devin PR #6 5th round #2).
+    #[test]
+    fn affix_merge_gate_respects_predicate_boundaries() {
+        let dict = Dictionary::new();
+
+        // きぶん + よい: must split, no 酔い fusion.
+        let segs = dict.segment("きぶんよい");
+        assert_eq!(
+            segs.len(),
+            2,
+            "きぶんよい must split as [気分, 良い], got {:?}",
+            segs.iter()
+                .map(|s| s.candidates[0].surface.as_str())
+                .collect::<Vec<_>>()
+        );
+        for s in &segs {
+            assert!(
+                !s.candidates[0].surface.contains("酔い"),
+                "きぶんよい must never produce 酔い under affix merge; got {:?}",
+                s.candidates[0].surface
+            );
+        }
+
+        // えいが + ちょう + おもしろい: Prefix 超 modifies 面白い; must
+        // stay 3 segments, no fusion into 映画町.
+        let segs = dict.segment("えいがちょうおもしろい");
+        assert_eq!(
+            segs.len(),
+            3,
+            "えいがちょうおもしろい must split as [映画, 超, 面白い], got {:?}",
+            segs.iter()
+                .map(|s| s.candidates[0].surface.as_str())
+                .collect::<Vec<_>>()
+        );
+        for s in &segs {
+            assert!(
+                !s.candidates[0].surface.contains("映画町"),
+                "えいがちょうおもしろい must not fuse into 映画町; got {:?}",
+                s.candidates[0].surface
+            );
+        }
     }
 
     #[test]
