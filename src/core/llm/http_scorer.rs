@@ -82,10 +82,40 @@ struct TokenLogprob {
     logprob: f64,
 }
 
-/// Escape a string into a GBNF double-quoted literal body.
+/// Escape a string into a GBNF double-quoted literal.
+///
+/// GBNF's string literal shares JSON's escape set: `\"`, `\\`, `\n`, `\r`,
+/// `\t`, and `\uXXXX` for anything else non-printable. The prior version only
+/// covered `\\` / `\"`, so a candidate carrying a literal newline (possible
+/// via dictionary import of user-supplied entries) would break the grammar
+/// and either fail the request or leak the raw byte into the parser.
 fn gbnf_string_literal(s: &str) -> String {
-    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("root ::= \"{}\"", escaped)
+    let mut out = String::with_capacity(s.len() + 12);
+    out.push_str("root ::= \"");
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7F => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{:04X}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// True when `c` is a control character the scorer refuses to send as part
+/// of a candidate. Everyday text has none; a leaked control byte from a
+/// user-imported dictionary entry cannot carry a semantic signal anyway.
+fn is_unscorable_control(c: char) -> bool {
+    let n = c as u32;
+    n < 0x20 || n == 0x7F
 }
 
 /// Map a mean per-token log-probability (content tokens only) to the 0.3–0.9
@@ -206,11 +236,25 @@ impl HttpLlamaScorer {
         if candidate.is_empty() {
             return 0.5;
         }
+        // A candidate carrying a control byte (leaked via dictionary import
+        // of user-supplied entries) has no semantic signal to score, and
+        // even with the expanded GBNF escaping it would only confuse the
+        // model. Stay neutral without the round-trip.
+        if candidate.chars().any(is_unscorable_control) {
+            debug!(
+                "HttpLlamaScorer: candidate contains control char, staying neutral"
+            );
+            return 0.5;
+        }
 
         let url = format!("{}/completion", self.endpoint);
         // The grammar stops generation once the literal is complete; this is
-        // just an upper bound. Kanji can take >1 token each, so budget room.
-        let n_predict = (candidate.chars().count() as u32 * 3 + 4).min(48);
+        // just an upper bound. Kanji can take >1 token each, so budget 3
+        // tokens per char plus slack. The prior 48 cap silently truncated
+        // longer surfaces (「取り組みたいと思います」etc.); 256 keeps every
+        // realistic reranker candidate inside the budget while still bounding
+        // a runaway server.
+        let n_predict = (candidate.chars().count() as u32 * 3 + 4).min(256);
 
         let req = CompletionRequest {
             prompt: context.to_string(),
@@ -236,7 +280,16 @@ impl HttpLlamaScorer {
         let body: CompletionResponse = match resp.into_body().read_json() {
             Ok(b) => b,
             Err(e) => {
-                debug!("HttpLlamaScorer: failed to parse response: {}", e);
+                // Body-read / JSON-parse failures leave the caller with no
+                // signal for this candidate. Arm the cooldown so the rest
+                // of the rerank pass sees `is_available() == false` and
+                // falls back to dictionary order rather than mixing real
+                // scores with the neutral fallback (Devin PR #6 #2).
+                if self.mark_failed() {
+                    warn!("HttpLlamaScorer: failed to parse response: {}", e);
+                } else {
+                    debug!("HttpLlamaScorer: failed to parse response: {}", e);
+                }
                 return 0.5;
             }
         };
@@ -253,8 +306,19 @@ impl HttpLlamaScorer {
             .collect();
         if content.is_empty() {
             // Server didn't return per-token probs (n_probs unsupported), or
-            // only the end token came back; stay neutral so we neither help
-            // nor hurt the ranking.
+            // only the end token came back — either way we cannot produce a
+            // real score for this or any subsequent candidate in the pass.
+            // Arm the cooldown so `is_available()` flips false and the
+            // rerank halts to dictionary order (Devin PR #6 #2).
+            if self.mark_failed() {
+                warn!(
+                    "HttpLlamaScorer: response carried no per-token probs; halting rerank",
+                );
+            } else {
+                debug!(
+                    "HttpLlamaScorer: response carried no per-token probs; halting rerank",
+                );
+            }
             return 0.5;
         }
 
@@ -276,6 +340,10 @@ impl HttpLlamaScorer {
 impl LlmScorer for HttpLlamaScorer {
     fn score(&self, context: &str, candidate: &str) -> f64 {
         self.score_by_logprob(context, candidate)
+    }
+
+    fn is_available(&self) -> bool {
+        !self.cooldown_active()
     }
 
     fn warm_cache(&self, context: &str) {
@@ -309,6 +377,33 @@ mod tests {
         assert_eq!(gbnf_string_literal("箸"), "root ::= \"箸\"");
         // Backslashes and quotes must be escaped so the grammar stays valid.
         assert_eq!(gbnf_string_literal("a\"b\\c"), "root ::= \"a\\\"b\\\\c\"");
+    }
+
+    #[test]
+    fn gbnf_literal_escapes_whitespace_controls() {
+        // A stray \n / \r / \t leaked in via dictionary import would otherwise
+        // break the grammar mid-literal; GBNF (JSON-style) accepts these
+        // named escapes.
+        assert_eq!(gbnf_string_literal("a\nb"), "root ::= \"a\\nb\"");
+        assert_eq!(gbnf_string_literal("a\rb"), "root ::= \"a\\rb\"");
+        assert_eq!(gbnf_string_literal("a\tb"), "root ::= \"a\\tb\"");
+    }
+
+    #[test]
+    fn gbnf_literal_escapes_other_control_chars_as_unicode() {
+        // 0x00-0x1F (except the named ones above) and 0x7F fall through to
+        // the \uXXXX form so the grammar still parses.
+        assert_eq!(gbnf_string_literal("\x01"), "root ::= \"\\u0001\"");
+        assert_eq!(gbnf_string_literal("\x7f"), "root ::= \"\\u007F\"");
+    }
+
+    #[test]
+    fn control_char_detector_covers_c0_and_del() {
+        assert!(is_unscorable_control('\x00'));
+        assert!(is_unscorable_control('\x1F'));
+        assert!(is_unscorable_control('\x7F'));
+        assert!(!is_unscorable_control(' '));
+        assert!(!is_unscorable_control('箸'));
     }
 
     #[test]

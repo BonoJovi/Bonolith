@@ -490,26 +490,39 @@ pub unsafe extern "C" fn bonolith_get_ui_state(ctx: *mut BonolithContext, out: *
                     out.has_preedit = true;
                     return;
                 };
-                let cand_count = seg.candidates.len().min(MAX_CANDIDATES);
+                let total = seg.candidates.len();
+                let cand_count = total.min(MAX_CANDIDATES);
                 out.candidate_count = cand_count as i32;
-                // Clamp the selected index into the visible window: if the
-                // real selection is past MAX_CANDIDATES (65+ homophone
-                // segment cycled past 63), the raw index would point into
-                // invisible entries — Fcitx5 range-checks against
-                // candidate_count and displays no cursor, but preedit /
-                // commit still use the real selection, so the panel and
-                // the committed text disagree. Report the last visible
-                // slot instead so the panel shows *some* cursor and stays
-                // consistent with what the engine actually committed
-                // through commit_selected_char / commit_selected_seg.
+                // Sliding window into a homophone segment with > MAX_CANDIDATES
+                // (Fable-5 D-group #20 residue). When the real selection
+                // outruns the visible slot count, shift the window so the
+                // selected candidate stays visible — otherwise Fcitx5 shows
+                // stale candidates 0-63 while preedit / commit use the
+                // out-of-view selected entry, and cycling past #63 leaves
+                // the cursor pinned at the last slot regardless of the true
+                // index.
+                //
+                // Window strategy: keep the selected candidate at the LAST
+                // visible slot when scrolling forward past MAX_CANDIDATES.
+                // For selected in [0, MAX_CANDIDATES) the window starts at
+                // 0 (unchanged). Backward cycling below the window start
+                // shifts the window back symmetrically.
+                let window_start = if cand_count == 0 {
+                    0
+                } else if seg.selected < cand_count {
+                    0
+                } else {
+                    (seg.selected + 1).saturating_sub(cand_count)
+                };
+                let window_end = (window_start + cand_count).min(total);
                 out.selected_index = if cand_count == 0 {
                     0
                 } else {
-                    (seg.selected.min(cand_count - 1)) as i32
+                    (seg.selected.saturating_sub(window_start)).min(cand_count - 1) as i32
                 };
 
                 ctx.cache_candidates.clear();
-                for j in 0..cand_count {
+                for j in window_start..window_end {
                     ctx.cache_candidates.push(
                         CString::new(seg.candidates[j].as_str()).unwrap_or_default()
                     );

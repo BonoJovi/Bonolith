@@ -539,6 +539,15 @@ impl ConversionEngine {
         } else {
             self.romaji.buffer().to_string()
         };
+        // Also snapshot raw_input BEFORE flush — flush invalidates it
+        // whenever the pending buffer is non-empty (VIM leaves "m"
+        // pending), and a stale None here means state.raw_input=None
+        // for the single-segment case below, forcing F9/F10 to derive
+        // from kana and losing case ("VIM" Space → "ゔぃ" reading →
+        // F9 emitted "ＶＩ" instead of "ＶＩＭ"; F10 emitted "vi"
+        // instead of "vim"). Mirrors the pre-flush snapshot in
+        // `start_kana_conversion` (F-key path).
+        let raw_input_snapshot = self.romaji.raw_input().map(str::to_string);
         self.romaji.flush();
         let kana = self.romaji.output().to_string();
         if kana.is_empty() {
@@ -616,10 +625,24 @@ impl ConversionEngine {
         // the segment's reading. Multi-segment conversions would need
         // per-segment raw slices we don't track.
         let raw_input = if segment_states.len() == 1 {
-            self.romaji.raw_input().map(str::to_string)
+            raw_input_snapshot
         } else {
             None
         };
+        // When raw_input is populated for a single-segment conversion,
+        // F9/F10's convert_focused_to bakes the FULL raw string —
+        // including the trailing pending consonant — into the selected
+        // candidate ("SIT" → ＳＩＴ, with the 'T' already in the
+        // committed text). If commit_conversion then also restores the
+        // pending buffer, the 't' surfaces twice: once inside ＳＩＴ,
+        // once as the leading consonant of the next syllable (SIT →
+        // Space → F9 → Enter → a produced ＳＩＴた). Set
+        // `pending_consumed_in_kana=true` so `restore_buffer` skips the
+        // pending injection whenever the raw snapshot covers it. Mirrors
+        // the F-key path (`start_kana_conversion`) which sets the flag
+        // for the same reason (bug [25] in the earlier review).
+        let pending_consumed_in_kana = raw_input.is_some()
+            && !pending_from_romaji.is_empty();
         self.conversion = Some(ConversionState {
             kana,
             segments: segment_states,
@@ -627,10 +650,7 @@ impl ConversionEngine {
             raw_input,
             initial_boundaries,
             pending_from_romaji,
-            // Space path: pending buffer is NOT included in kana (only
-            // `romaji.output()` is), so commit must restore it for the
-            // next syllable.
-            pending_consumed_in_kana: false,
+            pending_consumed_in_kana,
         });
 
         // Trigger LLM reranking in background — results applied on next interaction
@@ -1194,6 +1214,26 @@ impl ConversionEngine {
                 // after).
                 shared.drain_pending_llm_context(&mut llm);
                 let committed_context = llm.context().to_string();
+                // Skip the whole pass when the scorer is in its failure
+                // cooldown: every score() call would return the neutral
+                // fallback and, mixed with any successful score, would
+                // reorder candidates arbitrarily. Keeping dictionary order
+                // is a strictly better answer than a half-informed shuffle
+                // (Devin 2026-08-30 #12).
+                if !llm.is_scorer_available() {
+                    log::debug!(
+                        "LLM rerank skipped: scorer unavailable (cooldown active) — keeping dictionary order",
+                    );
+                    return seg_info
+                        .iter()
+                        .map(|(reading, candidates)| {
+                            (
+                                reading.clone(),
+                                candidates.iter().map(|(s, _)| s.clone()).collect(),
+                            )
+                        })
+                        .collect::<Vec<(String, Vec<String>)>>();
+                }
                 // running_context accumulates chosen candidates as we go through segments.
                 // Start empty — committed_context is passed separately to score_with_context.
                 let mut preceding_text = String::new();
@@ -1223,6 +1263,25 @@ impl ConversionEngine {
                 let mut reranked_segments: Vec<(String, Vec<String>)> = Vec::new();
 
                 for (reading, candidates) in &seg_info {
+                    // A per-segment score() failure inside score_by_logprob
+                    // arms the cooldown; from that point the scorer would
+                    // hand back the neutral fallback for every remaining
+                    // segment. Stop reranking once that happens so the
+                    // subsequent segments stay in their dictionary order
+                    // instead of getting silently shuffled by a mix of real
+                    // and fallback scores.
+                    if !llm.is_scorer_available() {
+                        log::debug!(
+                            "LLM rerank halted mid-pass at segment '{}' — scorer unavailable, keeping dictionary order for remaining",
+                            reading,
+                        );
+                        preceding_text.push_str(&candidates[0].0);
+                        reranked_segments.push((
+                            reading.clone(),
+                            candidates.iter().map(|(s, _)| s.clone()).collect(),
+                        ));
+                        continue;
+                    }
                     if Instant::now() >= deadline {
                         log::debug!(
                             "LLM rerank budget spent ({}ms) — segment '{}' and remaining kept in original order",
@@ -1252,6 +1311,7 @@ impl ConversionEngine {
                         let mut top_with_scores: Vec<(usize, f64)> =
                             Vec::with_capacity(rerank_count);
                         let mut budget_hit = false;
+                        let mut scorer_lost = false;
                         for i in 0..rerank_count {
                             if Instant::now() >= deadline {
                                 budget_hit = true;
@@ -1261,10 +1321,32 @@ impl ConversionEngine {
                             let llm_score = Self::rerank_llm_score(reading, surface, || {
                                 llm.score_with_context(&context, surface)
                             });
+                            // A mid-loop score() that armed the cooldown
+                            // means every remaining candidate for this
+                            // segment would return the neutral fallback,
+                            // ranking real scores against a placeholder.
+                            // Discard the partial and let the segment fall
+                            // through to dictionary order.
+                            if !llm.is_scorer_available() {
+                                scorer_lost = true;
+                                break;
+                            }
                             let rank_base = 1.0 - (i as f64 / rerank_count as f64) * 0.3;
                             let combined =
                                 rank_base * 0.4 + llm_score * 0.6 + user * USER_LEARNING_WEIGHT;
                             top_with_scores.push((i, combined));
+                        }
+                        if scorer_lost {
+                            log::debug!(
+                                "LLM rerank aborted mid-segment '{}' — scorer entered cooldown, keeping dictionary order",
+                                reading,
+                            );
+                            preceding_text.push_str(&candidates[0].0);
+                            reranked_segments.push((
+                                reading.clone(),
+                                candidates.iter().map(|(s, _)| s.clone()).collect(),
+                            ));
+                            continue;
                         }
                         if budget_hit {
                             // Partial scores would order this segment
@@ -1354,7 +1436,27 @@ impl ConversionEngine {
                     // next conversion overwrites it, so the current pass's
                     // poll-refresh loop burns ~2 s waiting for a result the
                     // panicked thread will never produce.
-                    inflight.store(false, Ordering::Relaxed);
+                    //
+                    // Generation guard: only clear the inflight flag while
+                    // we are still the current pass. Without the re-check
+                    // under the (implicit) generation ordering, an older
+                    // panicked worker could clear a newer pass's flag —
+                    // the current-gen check at line 1387 gates the whole
+                    // arm, but a `trigger_llm_rerank` firing between that
+                    // load and this store can still race. Re-load under
+                    // the slot lock (mirror of the Ok arm) so a newer
+                    // pass's inflight stays true (Fable-5 review D-group
+                    // #14 residue).
+                    let slot = result_slot.lock().unwrap_or_else(|e| e.into_inner());
+                    if generation.load(Ordering::Acquire) == my_gen {
+                        inflight.store(false, Ordering::Relaxed);
+                    } else {
+                        log::debug!(
+                            "LLM rerank pass {} panicked but superseded before clear — leaving inflight alone",
+                            my_gen,
+                        );
+                    }
+                    drop(slot);
                 }
             }
         });
@@ -1564,26 +1666,60 @@ impl ConversionEngine {
         // If the top heuristic candidate differs from base, try LLM as tiebreaker
         let heuristic_best = scored[0].0;
         if heuristic_best != 0 {
-            // Try LLM scoring on the top 2 candidates for final decision
+            // Try LLM scoring on the top 2 candidates for final decision.
+            // Both calls must produce a real signal — the LlmScorer
+            // is_available contract flips false the moment a request
+            // fails, and comparing a real score against the neutral 0.5
+            // fallback would let one transient HTTP error tip the
+            // segmentation choice arbitrarily (Devin PR #6 7th round #2).
             if let Ok(llm) = self.shared.llm.try_lock() {
-                let base_llm = Self::score_segmentation_llm(&alternatives[0], &llm);
-                let best_llm = Self::score_segmentation_llm(&alternatives[heuristic_best], &llm);
-                log::debug!(
-                    "Segmentation filter LLM: base={:.3} '{}' vs best={:.3} '{}'",
-                    base_llm,
-                    Self::compose_top_candidates(&alternatives[0]),
-                    best_llm,
-                    Self::compose_top_candidates(&alternatives[heuristic_best]),
-                );
-                // Use LLM result only if it strongly disagrees (base scores much higher)
-                if base_llm > best_llm + 0.15 {
-                    log::info!("Segmentation filter: LLM overrode heuristic, keeping base");
-                    // Invariant: alternatives always includes the base
-                    // segmentation at index 0 (seeded above).
-                    return alternatives
-                        .into_iter()
-                        .next()
-                        .expect("alternatives always contains the base segmentation");
+                // Acquire two real scores or nothing — a partial reading
+                // would compare a real logprob against the neutral 0.5
+                // fallback and pick the wrong segmentation from a
+                // transient HTTP hiccup. Collapsed into a single closure
+                // so the acquire-score-check-score-check flow reads as
+                // a linear pipeline (Fable-5 bug_005).
+                let scores = (|| {
+                    if !llm.is_scorer_available() {
+                        return None;
+                    }
+                    let base = Self::score_segmentation_llm(&alternatives[0], &llm);
+                    if !llm.is_scorer_available() {
+                        return None;
+                    }
+                    let best =
+                        Self::score_segmentation_llm(&alternatives[heuristic_best], &llm);
+                    if !llm.is_scorer_available() {
+                        return None;
+                    }
+                    Some((base, best))
+                })();
+                if let Some((base_llm, best_llm)) = scores {
+                    log::debug!(
+                        "Segmentation filter LLM: base={:.3} '{}' vs best={:.3} '{}'",
+                        base_llm,
+                        Self::compose_top_candidates(&alternatives[0]),
+                        best_llm,
+                        Self::compose_top_candidates(&alternatives[heuristic_best]),
+                    );
+                    // Use LLM result only if it strongly disagrees
+                    // (base scores much higher)
+                    if base_llm > best_llm + 0.15 {
+                        log::info!(
+                            "Segmentation filter: LLM overrode heuristic, keeping base"
+                        );
+                        // Invariant: alternatives always includes the
+                        // base segmentation at index 0 (seeded above).
+                        return alternatives
+                            .into_iter()
+                            .next()
+                            .expect("alternatives always contains the base segmentation");
+                    }
+                } else {
+                    log::debug!(
+                        "Segmentation filter: scorer unavailable at some step; \
+                         dropping LLM tiebreak"
+                    );
                 }
             }
             log::info!(
@@ -2367,6 +2503,86 @@ mod tests {
         // Next keystroke should still complete the syllable.
         engine.process_key('a');
         assert_eq!(engine.preedit(), "か");
+    }
+
+    /// Space + F9 must preserve typed case even when a pending buffer
+    /// forces flush to invalidate raw_input. SIT (→ し + t pending)
+    /// + Space + F9 must surface ＳＩＴ (fullwidth, case preserved) —
+    /// not ＳＩ (case-lost, t-lost). Prior bug: `start_conversion`
+    /// snapshotted raw_input AFTER flush, so the single-segment
+    /// ConversionState always got None and F9 fell back to
+    /// `form.apply(seg.reading)` which loses both case and pending
+    /// spelling.
+    #[test]
+    fn start_conversion_preserves_raw_input_case() {
+        let mut engine = ConversionEngine::new();
+        for c in "SIT".chars() {
+            engine.process_key(c);
+        }
+        // "SI" → し (exact), "T" left pending.
+        assert_eq!(engine.preedit(), "しt");
+        let state = engine
+            .start_conversion()
+            .expect("SIT should convert (し output + t pending)");
+        assert_eq!(state.segments.len(), 1, "single-segment expected for し");
+        assert_eq!(
+            state.raw_input.as_deref(),
+            Some("SIT"),
+            "raw_input snapshot must survive flush of pending 't'",
+        );
+        // F9 (fullwidth romaji) picks up raw_input directly.
+        let state = engine
+            .convert_focused_to(KanaForm::FullwidthRomaji)
+            .expect("F9 form swap should succeed");
+        let seg = &state.segments[0];
+        assert_eq!(
+            seg.candidates[seg.selected], "ＳＩＴ",
+            "F9 must produce fullwidth ＳＩＴ (case + pending preserved)",
+        );
+        // F10 (half-width romaji) mirrors the case-preserved path.
+        let state = engine
+            .convert_focused_to(KanaForm::Romaji)
+            .expect("F10 form swap should succeed");
+        let seg = &state.segments[0];
+        assert_eq!(
+            seg.candidates[seg.selected], "SIT",
+            "F10 must produce case-preserved SIT",
+        );
+    }
+
+    /// Fable-5 bug_002: SIT + Space + F9 + Enter + a used to produce
+    /// ＳＩＴた (4 chars for one physical 'T' press) — the F9 candidate
+    /// baked "T" into ＳＩＴ via raw_input, and then commit_conversion's
+    /// `restore_buffer` re-injected the pending 't', so the next 'a'
+    /// consumed it as "ta" = "た". Fix flags the pending buffer as
+    /// already-consumed whenever raw_input carries it.
+    #[test]
+    fn sit_space_f9_enter_letter_does_not_double_pending() {
+        let mut engine = ConversionEngine::new();
+        for c in "SIT".chars() {
+            engine.process_key(c);
+        }
+        assert_eq!(engine.preedit(), "しt");
+        let state = engine.start_conversion().expect("SIT should convert");
+        // Snapshot has 't' baked in, so flag must fire.
+        assert_eq!(state.pending_from_romaji, "t");
+        assert!(
+            state.pending_consumed_in_kana,
+            "raw_input snapshot covers pending 't' → flag must be true",
+        );
+        engine
+            .convert_focused_to(KanaForm::FullwidthRomaji)
+            .expect("F9 form swap");
+        let commit = engine.commit_conversion().expect("commit");
+        assert_eq!(commit, "ＳＩＴ", "F9 candidate commits");
+        // The critical check: 'a' after commit must NOT combine with a
+        // restored 't' into 'た'. It should produce 'あ' standalone.
+        engine.process_key('a');
+        assert_eq!(
+            engine.preedit(),
+            "あ",
+            "next letter must not resurrect the pending consonant",
+        );
     }
 
     /// A lone "n" in the buffer is the one case where flush produces

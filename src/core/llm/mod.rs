@@ -25,6 +25,16 @@ pub trait LlmScorer: Send + Sync {
 
     /// Pre-warm the cache with confirmed context (called during typing).
     fn warm_cache(&self, context: &str);
+
+    /// True when `score()` is expected to produce a real signal. False when
+    /// the scorer is in a short-term failure cooldown (server unreachable /
+    /// mid-restart) — callers should skip reranking entirely so a pass does
+    /// not mix real logprob scores with the neutral 0.5 fallback and produce
+    /// unstable orderings. Default `true` for scorers with no health notion
+    /// (mock, always-on).
+    fn is_available(&self) -> bool {
+        true
+    }
 }
 
 pub use http_scorer::HttpLlamaScorer;
@@ -121,6 +131,15 @@ impl LlmEngine {
     /// Pre-warm KV cache with confirmed context (called during typing).
     pub fn warm_cache(&self) {
         self.scorer.warm_cache(&self.context);
+    }
+
+    /// True when the underlying scorer is currently expected to produce a
+    /// real signal. Callers driving a rerank pass should check this before
+    /// entering the segment loop and skip the whole pass if false, so a
+    /// scorer that has just entered its failure cooldown does not mix real
+    /// scores with the neutral fallback within one pass.
+    pub fn is_scorer_available(&self) -> bool {
+        self.scorer.is_available()
     }
 
     /// Get current context.

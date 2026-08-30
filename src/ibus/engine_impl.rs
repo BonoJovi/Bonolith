@@ -60,6 +60,19 @@ pub struct BonolithEngine {
     /// injecting the raw char (grave `, Enter, …) into the app. Bounded
     /// implicitly by the number of physical keys the user can hold.
     pending_release: Mutex<HashSet<u32>>,
+    /// Wall-clock timestamp of the most recent transition from enabled=true
+    /// to enabled=false (Muhenkan-off, toggle-off, disable()). Any release
+    /// arriving within `DISABLE_GRACE_MS` after this timestamp is consumed
+    /// even if its keyval was not pre-registered in `pending_release`.
+    ///
+    /// Fable-5 D-group #13 residue: if the user is holding a non-toggle
+    /// key (say Space) when they hit Muhenkan, the press-of-Space was
+    /// consumed while enabled=true and `pending_release` only tracks the
+    /// Muhenkan keyval itself — the trailing release-of-Space then falls
+    /// through to `enabled == false` and leaks to XIM as an orphan release,
+    /// producing a phantom press for that key. The grace window catches
+    /// exactly this race without needing to enumerate every pressed key.
+    disabled_at: Mutex<Option<std::time::Instant>>,
 }
 
 impl BonolithEngine {
@@ -78,7 +91,17 @@ impl BonolithEngine {
             force,
             object_path,
             pending_release: Mutex::new(HashSet::new()),
+            disabled_at: Mutex::new(None),
         }
+    }
+
+    /// Mark the moment we transitioned to enabled=false so any release
+    /// arriving in the next `DISABLE_GRACE_MS` window is consumed even if
+    /// its press-side keyval was not pre-registered (Fable-5 D-group #13
+    /// residue). Callers: Muhenkan handling, toggle-off, `disable()`.
+    fn mark_disabled(&self) {
+        *self.disabled_at.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(std::time::Instant::now());
     }
 
     /// If the word-register dialog has opened a force-on window, flip this
@@ -278,6 +301,30 @@ impl BonolithEngine {
             if enabled {
                 return Ok(true);
             }
+            // Post-disable grace window: any key whose press we consumed
+            // while enabled=true can have its release arrive AFTER a
+            // Muhenkan / toggle-off flipped enabled=false. Consuming it
+            // here prevents XIM clients from synthesising a phantom press
+            // for the still-held key (Fable-5 D-group #13 residue).
+            //
+            // Kept short (80 ms) so a fast typist hitting Muhenkan and
+            // then a letter within the same fingering doesn't have the
+            // fresh letter's release swallowed — 500 ms was wide enough
+            // to eat 2-3 keystrokes at 5 chars/sec, producing phantom
+            // held-key state in XIM/state-tracking clients (games,
+            // browser keyup handlers). Real held-key releases arrive
+            // within one input cycle (< 20 ms), so 80 ms leaves a
+            // comfortable margin on slow systems without exposing the
+            // over-consumption tail (Fable-5 bug_001).
+            const DISABLE_GRACE_MS: u128 = 80;
+            let recently_disabled = self
+                .disabled_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .map_or(false, |t| t.elapsed().as_millis() < DISABLE_GRACE_MS);
+            if recently_disabled {
+                return Ok(true);
+            }
             return Ok(false);
         }
 
@@ -307,6 +354,7 @@ impl BonolithEngine {
             if keyval == IBUS_KEY_MUHENKAN {
                 let _ = self.cancel_input(&emitter).await;
                 *self.enabled.lock().unwrap_or_else(|e| e.into_inner()) = false;
+                self.mark_disabled();
                 info!("Bonolith: Muhenkan → enabled=false (absolute OFF)");
                 // Record so the matching release is consumed even though
                 // enabled just flipped to false.
@@ -324,6 +372,7 @@ impl BonolithEngine {
             if was_enabled {
                 let _ = self.cancel_input(&emitter).await;
                 *self.enabled.lock().unwrap_or_else(|e| e.into_inner()) = false;
+                self.mark_disabled();
             } else {
                 *self.enabled.lock().unwrap_or_else(|e| e.into_inner()) = true;
             }
@@ -504,6 +553,7 @@ impl BonolithEngine {
         info!("Bonolith: Disable");
         let _ = self.cancel_input(&emitter).await;
         *self.enabled.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        self.mark_disabled();
         // Same rationale as focus_out — a release we're owed may
         // never arrive across a disable, and letting stale entries
         // sit would eat the first matching press after re-enable
