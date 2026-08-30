@@ -1,6 +1,6 @@
 [package]
 name = "bonolith"
-version = "3.1.14"
+version = "3.1.15"
 edition = "2024"
 authors = ["Yoshihiro NAKAHARA"]
 description = "Japanese AI-powered Input Method - LLM-based intelligent Japanese input for Linux"
