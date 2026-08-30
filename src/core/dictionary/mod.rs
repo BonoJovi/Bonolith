@@ -860,24 +860,34 @@ impl Dictionary {
         // was fooled by (舞え for まえ, 彫り for えり).
         let left_long = left_reading.chars().count() >= 3
             && !Self::tail_dominant_is_predicate(seg, dict);
-        // Particle-head suppression runs even when dominant is already
-        // Suffix — がき's 書き (Suffix) tops the group at 4400 thanks to a
-        // PRIORITY_OVERRIDE, so returning Suffix here would still fuse
-        // もの+がき into 物書き and mask the intended もの+が+き parse.
-        //
-        // Predicate-dominant readings (Adjective / Verb / Auxiliary) are
-        // never reclassed to Suffix — they are bunsetsu heads / predicates
-        // and a Suffix homograph (よい → 酔い Suffix 1542 under 良い
-        // Adjective 9158) is always the wrong reading in a bunsetsu
-        // context. Without this, きぶん+よい fuses into 気分酔い (Devin
-        // PR #6 5th round).
+        // Auxiliary / Verb dominants are always bunsetsu heads — a Suffix
+        // homograph like がき's 書き would still fuse もの+がき into 物
+        // 書き and mask the intended もの+が+き parse; there is no verbal
+        // form that is really a compound suffix.
         if matches!(
             dominant,
-            Some(PartOfSpeech::Auxiliary)
-                | Some(PartOfSpeech::Verb)
-                | Some(PartOfSpeech::Adjective)
+            Some(PartOfSpeech::Auxiliary) | Some(PartOfSpeech::Verb)
         ) {
             return dominant;
+        }
+        // Adjective dominant: allow the Suffix reclass only when the
+        // Suffix homograph is legitimately compound-forming — the freq
+        // floor 2000 lets ふか (不可 Suffix 2473 under 深 Adjective 6500 —
+        // 使用不可 must fuse) through while keeping よい (酔い Suffix
+        // 1542 under 良い Adjective 9158 — きぶん+よい must stay a
+        // bunsetsu boundary; Devin PR #6 6th round #1).
+        if matches!(dominant, Some(PartOfSpeech::Adjective)) {
+            const ADJ_RECLASS_SUFFIX_MIN: u32 = 2000;
+            let top_suffix_freq = seg
+                .candidates
+                .iter()
+                .filter(|e| e.pos == PartOfSpeech::Suffix)
+                .map(|e| e.frequency)
+                .max()
+                .unwrap_or(0);
+            if top_suffix_freq < ADJ_RECLASS_SUFFIX_MIN {
+                return dominant;
+            }
         }
         if matches!(dominant, Some(PartOfSpeech::Suffix)) {
             if !left_long && Self::right_reading_looks_like_particle_head(seg, dict) {
@@ -891,23 +901,42 @@ impl Dictionary {
         // (しん→新 3979 > 心 Suffix 2252). Reclassing it to a weaker Suffix
         // would fuse into the left compound and lose the Prefix reading
         // (bug: しん between 技術的 and 斎院 fusing as 技術的心 instead
-        // of pairing with 斎院). BUT this only matters when the Prefix
-        // actually has something to modify next — a trailing Prefix-
-        // dominant segment (会議+ちゅう, no next) should reclass to
-        // Suffix so 会議中 fuses (Devin PR #6 4th round). Real Japanese
-        // Prefixes modify Nouns AND predicates (超+面白い, 超+難しい, 超+
-        // 好き) so Adjective / Verb next also protect the Prefix (Devin
-        // PR #6 5th round: 映画+超+面白い was fusing into 映画町).
-        if matches!(dominant, Some(PartOfSpeech::Prefix))
-            && matches!(
-                next_after_right_dominant,
-                Some(PartOfSpeech::Noun)
-                    | Some(PartOfSpeech::Prefix)
-                    | Some(PartOfSpeech::Adjective)
-                    | Some(PartOfSpeech::Verb)
-            )
-        {
-            return dominant;
+        // of pairing with 斎院).
+        //
+        // Preservation policy:
+        //   - Noun / Prefix next: ALWAYS preserve — traditional
+        //     Prefix+Noun compound chain, freq of the Suffix homograph
+        //     is irrelevant (Devin PR #6 4th round).
+        //   - Adjective / Verb next: preserve ONLY if the Suffix
+        //     homograph is weak (< 3000). ちょう (Suffix 町 2029) is
+        //     weak so 超+面白い keeps the Prefix; ちゅう (Suffix 中
+        //     3528) is strong so 期間+中+忙しい reclasses first and
+        //     fuses 期間中 as Noun+Suffix (Devin PR #6 6th round #2).
+        //   - No next: fall through to the Suffix strength check so
+        //     会議+ちゅう / 期間+ちゅう alone also fuse.
+        if matches!(dominant, Some(PartOfSpeech::Prefix)) {
+            match next_after_right_dominant {
+                Some(PartOfSpeech::Noun) | Some(PartOfSpeech::Prefix) => {
+                    return dominant;
+                }
+                Some(PartOfSpeech::Adjective) | Some(PartOfSpeech::Verb) => {
+                    const PREFIX_PROTECT_SUFFIX_MAX: u32 = 3000;
+                    let top_suffix_freq = seg
+                        .candidates
+                        .iter()
+                        .filter(|e| e.pos == PartOfSpeech::Suffix)
+                        .map(|e| e.frequency)
+                        .max()
+                        .unwrap_or(0);
+                    if top_suffix_freq < PREFIX_PROTECT_SUFFIX_MAX {
+                        return dominant;
+                    }
+                    // Suffix is strong enough that the (Noun, Suffix)
+                    // compound wins over the Prefix+predicate chain —
+                    // fall through to Suffix reclass.
+                }
+                _ => {}
+            }
         }
         // All other non-Particle/Noun dominants (Adverb, Adjective,
         // Conjunction, Interjection, Other) fall through to the Suffix
@@ -2577,6 +2606,71 @@ mod tests {
                 s.candidates[0].surface
             );
         }
+    }
+
+    /// Regression: the Adjective early-block must be freq-gated, not a
+    /// blanket ban. しよう+ふか (ふか dominant 深 Adjective 6500, Suffix
+    /// 不可 2473) needs to fuse into 使用不可 — a common compound-suffix
+    /// pattern. きぶん+よい (よい dominant 良い Adjective 9158, Suffix
+    /// 酔い 1542) must still split — 酔い is not a legitimate compound
+    /// suffix in modern Japanese (Devin PR #6 6th round #1).
+    ///
+    /// Regression: the Prefix preservation must consider the Suffix
+    /// homograph's strength when the next segment is a predicate. きかん
+    /// +ちゅう+いそがしい must fuse the first two into 期間中 (Suffix 中
+    /// 3528 is strong), while えいが+ちょう+おもしろい still preserves
+    /// 超 as Prefix (Suffix 町 2029 is weak) (Devin PR #6 6th round #2).
+    #[test]
+    fn affix_merge_gate_freq_gates_predicate_protections() {
+        let dict = Dictionary::new();
+
+        // Adjective + strong Suffix homograph → fuse.
+        for input in ["しようふか", "えつらんふか", "りようふか"] {
+            let segs = dict.segment(input);
+            assert_eq!(
+                segs.len(),
+                1,
+                "{input} must fuse into a single Noun+Suffix compound; got {:?}",
+                segs.iter()
+                    .map(|s| s.candidates[0].surface.as_str())
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                segs[0].candidates.iter().any(|c| c.surface.ends_with("不可")),
+                "{input}: expected a 不可-terminated compound in candidates, \
+                 got top {:?}",
+                segs[0].candidates[0].surface,
+            );
+        }
+
+        // Adjective + weak Suffix homograph → stay split (round 5 guard).
+        let segs = dict.segment("きぶんよい");
+        assert_eq!(segs.len(), 2, "きぶんよい must stay split");
+        for s in &segs {
+            assert!(!s.candidates[0].surface.contains("酔い"));
+        }
+
+        // Prefix + strong Suffix homograph + Adj-next → fuse Noun+Suffix.
+        for input in ["きかんちゅういそがしい", "かいぎちゅういそがしい"] {
+            let segs = dict.segment(input);
+            assert_eq!(
+                segs.len(),
+                2,
+                "{input} must split as [<期間|会議>中, 忙しい]; got {:?}",
+                segs.iter()
+                    .map(|s| s.candidates[0].surface.as_str())
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                segs[0].candidates.iter().any(|c| c.surface.ends_with("中")),
+                "{input}: first segment must include a 中-suffix compound",
+            );
+        }
+
+        // Prefix + weak Suffix homograph + Adj-next → preserve Prefix
+        // (round 5 guard).
+        let segs = dict.segment("えいがちょうおもしろい");
+        assert_eq!(segs.len(), 3, "えいがちょうおもしろい must stay 3 segments");
     }
 
     #[test]
