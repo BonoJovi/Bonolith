@@ -1194,6 +1194,26 @@ impl ConversionEngine {
                 // after).
                 shared.drain_pending_llm_context(&mut llm);
                 let committed_context = llm.context().to_string();
+                // Skip the whole pass when the scorer is in its failure
+                // cooldown: every score() call would return the neutral
+                // fallback and, mixed with any successful score, would
+                // reorder candidates arbitrarily. Keeping dictionary order
+                // is a strictly better answer than a half-informed shuffle
+                // (Devin 2026-08-30 #12).
+                if !llm.is_scorer_available() {
+                    log::debug!(
+                        "LLM rerank skipped: scorer unavailable (cooldown active) — keeping dictionary order",
+                    );
+                    return seg_info
+                        .iter()
+                        .map(|(reading, candidates)| {
+                            (
+                                reading.clone(),
+                                candidates.iter().map(|(s, _)| s.clone()).collect(),
+                            )
+                        })
+                        .collect::<Vec<(String, Vec<String>)>>();
+                }
                 // running_context accumulates chosen candidates as we go through segments.
                 // Start empty — committed_context is passed separately to score_with_context.
                 let mut preceding_text = String::new();
@@ -1223,6 +1243,25 @@ impl ConversionEngine {
                 let mut reranked_segments: Vec<(String, Vec<String>)> = Vec::new();
 
                 for (reading, candidates) in &seg_info {
+                    // A per-segment score() failure inside score_by_logprob
+                    // arms the cooldown; from that point the scorer would
+                    // hand back the neutral fallback for every remaining
+                    // segment. Stop reranking once that happens so the
+                    // subsequent segments stay in their dictionary order
+                    // instead of getting silently shuffled by a mix of real
+                    // and fallback scores.
+                    if !llm.is_scorer_available() {
+                        log::debug!(
+                            "LLM rerank halted mid-pass at segment '{}' — scorer unavailable, keeping dictionary order for remaining",
+                            reading,
+                        );
+                        preceding_text.push_str(&candidates[0].0);
+                        reranked_segments.push((
+                            reading.clone(),
+                            candidates.iter().map(|(s, _)| s.clone()).collect(),
+                        ));
+                        continue;
+                    }
                     if Instant::now() >= deadline {
                         log::debug!(
                             "LLM rerank budget spent ({}ms) — segment '{}' and remaining kept in original order",
@@ -1252,6 +1291,7 @@ impl ConversionEngine {
                         let mut top_with_scores: Vec<(usize, f64)> =
                             Vec::with_capacity(rerank_count);
                         let mut budget_hit = false;
+                        let mut scorer_lost = false;
                         for i in 0..rerank_count {
                             if Instant::now() >= deadline {
                                 budget_hit = true;
@@ -1261,10 +1301,32 @@ impl ConversionEngine {
                             let llm_score = Self::rerank_llm_score(reading, surface, || {
                                 llm.score_with_context(&context, surface)
                             });
+                            // A mid-loop score() that armed the cooldown
+                            // means every remaining candidate for this
+                            // segment would return the neutral fallback,
+                            // ranking real scores against a placeholder.
+                            // Discard the partial and let the segment fall
+                            // through to dictionary order.
+                            if !llm.is_scorer_available() {
+                                scorer_lost = true;
+                                break;
+                            }
                             let rank_base = 1.0 - (i as f64 / rerank_count as f64) * 0.3;
                             let combined =
                                 rank_base * 0.4 + llm_score * 0.6 + user * USER_LEARNING_WEIGHT;
                             top_with_scores.push((i, combined));
+                        }
+                        if scorer_lost {
+                            log::debug!(
+                                "LLM rerank aborted mid-segment '{}' — scorer entered cooldown, keeping dictionary order",
+                                reading,
+                            );
+                            preceding_text.push_str(&candidates[0].0);
+                            reranked_segments.push((
+                                reading.clone(),
+                                candidates.iter().map(|(s, _)| s.clone()).collect(),
+                            ));
+                            continue;
                         }
                         if budget_hit {
                             // Partial scores would order this segment
