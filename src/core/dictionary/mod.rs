@@ -794,6 +794,7 @@ impl Dictionary {
         seg: &Segment,
         dominant: Option<PartOfSpeech>,
         left_pos: Option<PartOfSpeech>,
+        left_reading: &str,
         dict: &Dictionary,
     ) -> Option<PartOfSpeech> {
         const SUFFIX_MERGE_THRESHOLD: u32 = 1500;
@@ -803,6 +804,14 @@ impl Dictionary {
         ) {
             return dominant;
         }
+        // Long left → treat as a compound-noun head. The Particle-head veto
+        // is aimed at 2-char stand-alone nouns (もの+がき, 部+はい) where the
+        // right-hand kana genuinely reads as Particle+content; once the left
+        // is 3+ chars it is almost always a compound term (いいん+かい →
+        // 委員会, てんらん+かい → 展覧会, しんさいいん+かい → 審査委員会),
+        // and the trailing kai/sa/ka/nin reads as a Suffix, not a bunsetsu
+        // boundary.
+        let left_long = left_reading.chars().count() >= 3;
         // Particle-head suppression runs even when dominant is already
         // Suffix — がき's 書き (Suffix) tops the group at 4400 thanks to a
         // PRIORITY_OVERRIDE, so returning Suffix here would still fuse
@@ -811,11 +820,25 @@ impl Dictionary {
             return dominant;
         }
         if matches!(dominant, Some(PartOfSpeech::Suffix)) {
-            if Self::right_reading_looks_like_particle_head(seg, dict) {
+            if !left_long && Self::right_reading_looks_like_particle_head(seg, dict) {
                 // Downgrade to Noun so the (Noun, Noun) branch skips the
                 // merge; the natural Particle-headed parse survives.
                 return Some(PartOfSpeech::Noun);
             }
+            return dominant;
+        }
+        // Reclass-to-Suffix only makes sense for readings whose dominant POS
+        // misrecognises a compound suffix as a bunsetsu head (Particle) or a
+        // stand-alone noun. Dominant Prefix means the reading has a real
+        // Prefix role (しん→新 3979 > 心 Suffix 2252), which is about to
+        // drive a Prefix+Noun merge with the next segment — swapping to a
+        // weak Suffix candidate would fuse into the left compound instead
+        // and lose the Prefix reading (bug: しん between 技術的 and 斎院
+        // getting fused as 技術的心 rather than pairing with 斎院).
+        if !matches!(
+            dominant,
+            Some(PartOfSpeech::Particle) | Some(PartOfSpeech::Noun)
+        ) {
             return dominant;
         }
         let has_strong_suffix = seg.candidates.iter().any(|e| {
@@ -824,7 +847,7 @@ impl Dictionary {
         if !has_strong_suffix {
             return dominant;
         }
-        if Self::right_reading_looks_like_particle_head(seg, dict) {
+        if !left_long && Self::right_reading_looks_like_particle_head(seg, dict) {
             return dominant;
         }
         // Particle-dominant readings whose Suffix homograph is a niche
@@ -939,7 +962,13 @@ impl Dictionary {
             // Noun+Noun cases where BOTH sides need reclassification (さい+
             // かくにん where 再 Prefix is buried under 際 Noun and 確認 is a
             // straight Noun) still fire as Prefix+Noun.
-            let nxt = Self::effective_right_merge_pos(&segs[i + 1], raw_nxt, raw_cur, self);
+            let nxt = Self::effective_right_merge_pos(
+                &segs[i + 1],
+                raw_nxt,
+                raw_cur,
+                &segs[i].reading,
+                self,
+            );
             let cur = Self::effective_left_merge_pos(&segs[i], raw_cur, nxt);
             let is_noun_particle = matches!(
                 (cur, nxt),
