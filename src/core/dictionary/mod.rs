@@ -671,6 +671,42 @@ impl Dictionary {
         let mut out: Vec<Segment> = Vec::with_capacity(segs.len());
         for seg in segs {
             let chars: Vec<char> = seg.reading.chars().collect();
+            // 3+ char particle+predicate case: がよい (Suffix 通い 2769)
+            // whose head が is a strong Particle and whose tail よい is
+            // dominantly a predicate (良い Adjective 9158). A learning
+            // boost on 通い can flip the DP into picking this 3-char
+            // segment as the tail of a long compound-noun input like
+            // てんき+がよい, at which point the visible surface would
+            // become 天気通い. Splitting into が + よい lets the natural
+            // 天気+が+よい parse survive (Devin PR #6 3rd round).
+            if chars.len() >= 3
+                && matches!(Self::dominant_pos(&seg), Some(PartOfSpeech::Suffix))
+                && Self::tail_dominant_is_predicate(&seg, self)
+            {
+                let head_r = chars[0].to_string();
+                let tail_r: String = chars[1..].iter().collect();
+                let head_cands: Vec<DictionaryEntry> =
+                    self.lookup(&head_r).into_iter().cloned().collect();
+                let tail_cands: Vec<DictionaryEntry> =
+                    self.lookup(&tail_r).into_iter().cloned().collect();
+                if !head_cands.is_empty() && !tail_cands.is_empty() {
+                    let head_start = seg.start;
+                    let tail_char_len = chars.len() - 1;
+                    out.push(Segment {
+                        reading: head_r,
+                        start: head_start,
+                        len: 1,
+                        candidates: head_cands,
+                    });
+                    out.push(Segment {
+                        reading: tail_r,
+                        start: head_start + 1,
+                        len: tail_char_len,
+                        candidates: tail_cands,
+                    });
+                    continue;
+                }
+            }
             if chars.len() != 2 {
                 out.push(seg);
                 continue;
@@ -810,14 +846,19 @@ impl Dictionary {
         // is 3+ chars it is almost always a compound term (いいん+かい →
         // 委員会, てんらん+かい → 展覧会, しんさいいん+かい → 審査委員会,
         // きほん+がまえ → 基本構え, ぼうぎょ+がまえ → 防御構え), and the
-        // trailing kai/sa/ka/nin/mae/eri reads as a Suffix, not a bunsetsu
-        // boundary. The DP itself handles the genuine bunsetsu case (「天気が
-        // よい」→ [てんきが, よい] via the Noun+Particle merge path, so
-        // we never reach this branch with `よい` on the right anyway) — no
-        // extra tail-predicate veto is needed here, and adding one gets
-        // fooled by Verb homographs like 舞え(4137) for まえ and blocks
-        // the very compounds this gate exists to restore.
-        let left_long = left_reading.chars().count() >= 3;
+        // trailing kai/sa/ka/nin/mae/eri reads as a Suffix.
+        //
+        // Exception: keep the veto firing when the right seg's tail is
+        // dominantly a predicate (top-freq entry is Adjective / Verb).
+        // よい's top is 良い Adjective 9158 → keep veto → 天気+がよい never
+        // fuses into 天気通い even if learning-boost pushes the DP into
+        // [てんき, がよい] (Devin PR #6 follow-up). Meanwhile まえ's top
+        // is 前 Noun 7397 (舞え is only #2) so 基本+がまえ still merges
+        // into 基本構え. Using the tail's dominant POS distinguishes real
+        // predicates from Verb-homograph noise the previous `any` check
+        // was fooled by (舞え for まえ, 彫り for えり).
+        let left_long = left_reading.chars().count() >= 3
+            && !Self::tail_dominant_is_predicate(seg, dict);
         // Particle-head suppression runs even when dominant is already
         // Suffix — がき's 書き (Suffix) tops the group at 4400 thanks to a
         // PRIORITY_OVERRIDE, so returning Suffix here would still fuse
@@ -926,7 +967,47 @@ impl Dictionary {
         })
     }
 
-/// Reclassify the left segment's POS when a strong Prefix candidate would
+    /// True when the right segment's reading decomposes as (strong Particle
+    /// single char) + (multi-char tail whose top-frequency lookup entry is
+    /// Adjective or Verb). Distinguishes real predicate tails (よい → 良い
+    /// Adjective 9158 top; ある → 有る Verb; いる → 居る Verb) from
+    /// Noun-dominant tails whose Verb homograph is a lower-freq imperative /
+    /// gerund noise (まえ → 前 Noun 7397 tops 舞え Verb 4137; えり → 衿
+    /// Noun 4283 tops 彫り Verb 2160). Used inside the `left_long` gate
+    /// so `てんき+がよい` under a learning boost cannot fuse into 天気通い
+    /// while `きほん+がまえ` → 基本構え still does (Devin PR #6 follow-up).
+    ///
+    /// `dict.lookup` returns entries pre-sorted by frequency, so the first
+    /// entry is the dominant reading.
+    fn tail_dominant_is_predicate(seg: &Segment, dict: &Dictionary) -> bool {
+        const HEAD_PARTICLE_MIN: u32 = 7000;
+        let mut it = seg.reading.chars();
+        let first = match it.next() {
+            Some(c) => c,
+            None => return false,
+        };
+        let tail: String = it.collect();
+        // Single-char tails ('い', etc.) never carry a meaningful standalone
+        // predicate reading in this context — 委員+かい must always be
+        // free to merge into 委員会.
+        if tail.chars().count() < 2 {
+            return false;
+        }
+        let head_r = first.to_string();
+        let head_ents = dict.lookup(&head_r);
+        let head_strong = head_ents.iter().any(|e| {
+            e.pos == PartOfSpeech::Particle && e.frequency >= HEAD_PARTICLE_MIN
+        });
+        if !head_strong {
+            return false;
+        }
+        let tail_ents = dict.lookup(&tail);
+        tail_ents.first().map_or(false, |top| {
+            matches!(top.pos, PartOfSpeech::Adjective | PartOfSpeech::Verb)
+        })
+    }
+
+    /// Reclassify the left segment's POS when a strong Prefix candidate would
     /// let the pair merge into an affix compound. IPADIC often has both a
     /// Prefix and a Noun surface for the same reading (さい: 際 Noun 4950 /
     /// 再 Prefix 4213; ふ: 歩 Noun 4764 / 不 Prefix 4503), and dominant_pos
@@ -2225,6 +2306,88 @@ mod tests {
     fn builtin_dictionary_loads() {
         let dict = Dictionary::new();
         assert!(dict.len() > 100);
+    }
+
+    /// Regression: the `left_long` gate that re-opens Noun+Suffix affix
+    /// compounds under a 3+ char head must NOT fuse across a real bunsetsu
+    /// boundary whose tail is a predicate (よい / ある / いる …).
+    ///
+    /// The DP alone splits 「てんきがよい」 as [てんきが, よい] via the
+    /// Noun+Particle merge path, but a modest learning boost on the
+    /// `がよい → 通い` Suffix reading (~1 point, i.e. one prior selection)
+    /// can flip the DP into picking [てんき, がよい] as 2 segs — at which
+    /// point the affix-merge gate is what stands between the user and the
+    /// wrong 天気通い surface. `tail_dominant_is_predicate` fires on よい
+    /// (dominant 良い Adjective 9158) and keeps the veto engaged.
+    ///
+    /// The mirror case: まえ / えり are Noun-dominant despite having a
+    /// Verb homograph in the same reading (舞え 4137 under 前 7397; 彫り
+    /// 2160 under 衿 4283). The gate must still allow those compounds to
+    /// fuse (基本+構え, 学校+帰り).
+    #[test]
+    fn affix_merge_gate_survives_learning_boost() {
+        let dict = Dictionary::new();
+        let boost = |reading: &str, _: &[&DictionaryEntry]| -> f64 {
+            match reading {
+                "がよい" | "がまえ" | "がえり" => 2.0,
+                _ => 0.0,
+            }
+        };
+
+        // Predicate tail: must stay split even under boost.
+        for input in ["てんきがよい", "がっこうがよい"] {
+            let segs = dict.segment_with_boost(input, boost);
+            let surfaces: Vec<&str> =
+                segs.iter().map(|s| s.candidates[0].surface.as_str()).collect();
+            assert!(
+                segs.len() >= 2,
+                "{input} must not fuse into a single compound-noun \
+                 segment: got {surfaces:?}"
+            );
+            for s in &segs {
+                assert!(
+                    !s.candidates[0].surface.contains("通い"),
+                    "{input} must never produce 通い under the affix \
+                     merge (would drop the natural よい predicate): \
+                     got {:?}",
+                    s.candidates[0].surface
+                );
+            }
+        }
+
+        // Noun-dominant tail: must fuse into the intended compound.
+        for (input, want) in [
+            ("きほんがまえ", "基本構え"),
+            ("ぼうぎょがまえ", "防御構え"),
+            ("ななめがまえ", "斜め構え"),
+            ("がっこうがえり", "学校帰り"),
+        ] {
+            let segs = dict.segment_with_boost(input, boost);
+            assert_eq!(
+                segs.len(),
+                1,
+                "{input} must fuse into a single compound; got {:?}",
+                segs.iter()
+                    .map(|s| s.candidates[0].surface.as_str())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                segs[0].candidates[0].surface, want,
+                "{input} top candidate should be {want}, got {}",
+                segs[0].candidates[0].surface
+            );
+        }
+
+        // Single-char tail sanity: 委員会 group must remain single-segment
+        // (the gate exists to restore these) regardless of boost state.
+        for (input, want) in [
+            ("いいんかい", "委員会"),
+            ("しんさいいんかい", "審査委員会"),
+        ] {
+            let segs = dict.segment_with_boost(input, boost);
+            assert_eq!(segs.len(), 1, "{input}: {:?}", segs);
+            assert_eq!(segs[0].candidates[0].surface, want);
+        }
     }
 
     #[test]
