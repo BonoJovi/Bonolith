@@ -539,6 +539,15 @@ impl ConversionEngine {
         } else {
             self.romaji.buffer().to_string()
         };
+        // Also snapshot raw_input BEFORE flush — flush invalidates it
+        // whenever the pending buffer is non-empty (VIM leaves "m"
+        // pending), and a stale None here means state.raw_input=None
+        // for the single-segment case below, forcing F9/F10 to derive
+        // from kana and losing case ("VIM" Space → "ゔぃ" reading →
+        // F9 emitted "ＶＩ" instead of "ＶＩＭ"; F10 emitted "vi"
+        // instead of "vim"). Mirrors the pre-flush snapshot in
+        // `start_kana_conversion` (F-key path).
+        let raw_input_snapshot = self.romaji.raw_input().map(str::to_string);
         self.romaji.flush();
         let kana = self.romaji.output().to_string();
         if kana.is_empty() {
@@ -616,7 +625,7 @@ impl ConversionEngine {
         // the segment's reading. Multi-segment conversions would need
         // per-segment raw slices we don't track.
         let raw_input = if segment_states.len() == 1 {
-            self.romaji.raw_input().map(str::to_string)
+            raw_input_snapshot
         } else {
             None
         };
@@ -2478,6 +2487,51 @@ mod tests {
         // Next keystroke should still complete the syllable.
         engine.process_key('a');
         assert_eq!(engine.preedit(), "か");
+    }
+
+    /// Space + F9 must preserve typed case even when a pending buffer
+    /// forces flush to invalidate raw_input. SIT (→ し + t pending)
+    /// + Space + F9 must surface ＳＩＴ (fullwidth, case preserved) —
+    /// not ＳＩ (case-lost, t-lost). Prior bug: `start_conversion`
+    /// snapshotted raw_input AFTER flush, so the single-segment
+    /// ConversionState always got None and F9 fell back to
+    /// `form.apply(seg.reading)` which loses both case and pending
+    /// spelling.
+    #[test]
+    fn start_conversion_preserves_raw_input_case() {
+        let mut engine = ConversionEngine::new();
+        for c in "SIT".chars() {
+            engine.process_key(c);
+        }
+        // "SI" → し (exact), "T" left pending.
+        assert_eq!(engine.preedit(), "しt");
+        let state = engine
+            .start_conversion()
+            .expect("SIT should convert (し output + t pending)");
+        assert_eq!(state.segments.len(), 1, "single-segment expected for し");
+        assert_eq!(
+            state.raw_input.as_deref(),
+            Some("SIT"),
+            "raw_input snapshot must survive flush of pending 't'",
+        );
+        // F9 (fullwidth romaji) picks up raw_input directly.
+        let state = engine
+            .convert_focused_to(KanaForm::FullwidthRomaji)
+            .expect("F9 form swap should succeed");
+        let seg = &state.segments[0];
+        assert_eq!(
+            seg.candidates[seg.selected], "ＳＩＴ",
+            "F9 must produce fullwidth ＳＩＴ (case + pending preserved)",
+        );
+        // F10 (half-width romaji) mirrors the case-preserved path.
+        let state = engine
+            .convert_focused_to(KanaForm::Romaji)
+            .expect("F10 form swap should succeed");
+        let seg = &state.segments[0];
+        assert_eq!(
+            seg.candidates[seg.selected], "SIT",
+            "F10 must produce case-preserved SIT",
+        );
     }
 
     /// A lone "n" in the buffer is the one case where flush produces
