@@ -681,23 +681,42 @@ impl Dictionary {
             // become 天気通い. Splitting into が + よい lets the natural
             // 天気+が+よい parse survive (Devin PR #6 3rd round).
             //
-            // 3+ char Particle+Noun-tail case (がまえ, がえり) has a
-            // genuinely ambiguous parse — both the compound reading
-            // (基本+構え, 学校+帰り) and the bunsetsu reading (子供+
-            // が+前, 犬+が+襟) are structurally valid Japanese. Devin
-            // PR #6 flip-flopped between rounds asking for opposite
-            // fixes — 7th round wanted the bunsetsu split for
-            // こども/校長/社長+がまえ+に+いる, 8th round wanted the
-            // compound preserved for 基本/防御+がまえ+に+する. Without
-            // a semantic signal (dict has no whole-compound entry for
-            // either), no context-free rule separates them. Default
-            // to preserving the compound merge — users typing the
-            // bunsetsu case can Shift+Left resize to force splits;
-            // users typing a valid compound would otherwise lose it
-            // entirely from the candidate list.
+            // 3+ char Particle+Noun-tail case (がまえ, がえり) is
+            // structurally ambiguous — both the compound reading
+            // (基本+構え, 学校+帰り) and the bunsetsu reading
+            // (子供+が+前, 犬+が+襟) are valid Japanese with no dict
+            // signal to separate them. Devin PR #6 rounds 7-8 asked
+            // for opposite fixes on the same shape. The disambiguating
+            // context is what follows: an existential-verb bunsetsu
+            // tail (…+に+いる / …+に+ある / …+で+ある) means the
+            // whole thing is a "X is at Y" location sentence, not a
+            // compound. Action-verb tails (…+に+する, …+を+とる) keep
+            // the compound intact so 基本構えにする / 防御構えをとる
+            // still fuse.
+            let followed_by_existential_bunsetsu = segs
+                .get(i + 1)
+                .zip(segs.get(i + 2))
+                .map_or(false, |(nx, nx2)| {
+                    let nx_top = nx.candidates.first();
+                    let nx2_top = nx2.candidates.first();
+                    let nx_is_locative_particle = nx_top
+                        .map_or(false, |e| {
+                            e.pos == PartOfSpeech::Particle
+                                && matches!(e.surface.as_str(), "に" | "で")
+                        });
+                    let nx2_is_existence_verb = nx2_top.map_or(false, |e| {
+                        e.pos == PartOfSpeech::Verb
+                            && matches!(
+                                e.surface.as_str(),
+                                "居る" | "有る" | "在る" | "いる" | "ある"
+                            )
+                    });
+                    nx_is_locative_particle && nx2_is_existence_verb
+                });
             if chars.len() >= 3
                 && matches!(Self::dominant_pos(seg), Some(PartOfSpeech::Suffix))
-                && Self::tail_dominant_is_predicate(seg, self)
+                && (Self::tail_dominant_is_predicate(seg, self)
+                    || followed_by_existential_bunsetsu)
             {
                 let head_r = chars[0].to_string();
                 let tail_r: String = chars[1..].iter().collect();
@@ -2690,26 +2709,49 @@ mod tests {
     }
 
     /// Regression: a 3+ char Particle-headed Suffix segment (がまえ /
-    /// がえり) has a genuinely ambiguous parse — 基本+がまえ →
-    /// 基本構え (compound) and 子供+が+前 (bunsetsu) are structurally
-    /// identical from the tokenizer's viewpoint. Devin PR #6 rounds 7
-    /// and 8 flip-flopped on which side to favor; without a semantic
-    /// signal we default to preserving the compound merge, and users
-    /// typing the bunsetsu form can Shift+Left-resize to force the
-    /// split.
-    ///
-    /// This test pins both directions of the trade-off so a future
-    /// change knows what it's giving up: the compound is preserved
-    /// as the top candidate, the bunsetsu path stays reachable via
-    /// candidate cycling / manual resizing, and the tail-predicate
-    /// split (がよい → が + よい) still fires because Adjectives are
-    /// unambiguous predicates.
+    /// がえり) is structurally ambiguous — 基本+がまえ → 基本構え
+    /// (compound) and 子供+が+前 (bunsetsu) look identical to the
+    /// tokenizer. Devin PR #6 rounds 7-8 asked for opposite fixes on
+    /// the same shape. The disambiguator (per user suggestion,
+    /// 2026-08-31) is the trailing predicate class: an existential
+    /// verb (居る / 有る / いる / ある) plus a locative particle (に /
+    /// で) is a location predicate — "X is at Y" — and forces the
+    /// bunsetsu split. Action-verb tails (する, 取る, …) keep the
+    /// compound intact so 基本構えにする / 防御構えをとる still fuse.
     #[test]
-    fn particle_headed_suffix_prefers_compound_merge() {
+    fn particle_headed_suffix_disambiguated_by_predicate_class() {
         let dict = Dictionary::new();
 
-        // Compound preservation: 基本 / 防御 + がまえ → 基本構え /
-        // 防御構え remain single segments even followed by a Particle.
+        // Bunsetsu case: (locative Particle + existential Verb) tail
+        // forces split of the Particle-headed Suffix segment.
+        for input in [
+            "こどもがまえにいる",
+            "こうちょうがまえにいる",
+            "しゃちょうがまえにいる",
+            "ねこがまえにある",
+        ] {
+            let segs = dict.segment(input);
+            let surfaces: Vec<&str> = segs
+                .iter()
+                .map(|s| s.candidates[0].surface.as_str())
+                .collect();
+            assert!(
+                !surfaces.iter().any(|s| s.contains("構え")),
+                "{input}: existential-tail bunsetsu must NOT surface 構え; \
+                 got {surfaces:?}"
+            );
+            assert!(
+                segs.iter().any(|s| s
+                    .candidates
+                    .iter()
+                    .any(|c| c.surface.contains("前"))),
+                "{input}: expected 前 to appear as a segment surface; \
+                 got {surfaces:?}"
+            );
+        }
+
+        // Compound + action-verb tail: existential-verb rule does NOT
+        // fire, so 基本構え / 防御構え remain fused.
         for (input, expected) in [
             ("きほんがまえ", "基本構え"),
             ("ぼうぎょがまえ", "防御構え"),
@@ -2725,19 +2767,8 @@ mod tests {
             );
         }
 
-        // Bunsetsu-form input (こども+が+前) accepts that the top-1
-        // will show 子供構え; this is documented as a known trade-off,
-        // not a bug — the correct 子供が前 parse remains reachable via
-        // Shift+Left resize.
-        let segs = dict.segment("こどもがまえにいる");
-        assert!(
-            !segs.is_empty(),
-            "こどもがまえにいる must produce at least one segment",
-        );
-
-        // Tail-predicate split (Adjective/Verb tail) still fires
-        // because Adjective is an unambiguous predicate. がよい must
-        // continue to split from Adjective-headed contexts.
+        // Tail-predicate split (Adjective/Verb tail) still fires for
+        // がよい etc. because Adjectives are unambiguous predicates.
         let segs = dict.segment("がっこうがよい");
         let surfaces: Vec<&str> = segs
             .iter()
