@@ -1626,26 +1626,55 @@ impl ConversionEngine {
         // If the top heuristic candidate differs from base, try LLM as tiebreaker
         let heuristic_best = scored[0].0;
         if heuristic_best != 0 {
-            // Try LLM scoring on the top 2 candidates for final decision
+            // Try LLM scoring on the top 2 candidates for final decision.
+            // Both calls must produce a real signal — the LlmScorer
+            // is_available contract flips false the moment a request
+            // fails, and comparing a real score against the neutral 0.5
+            // fallback would let one transient HTTP error tip the
+            // segmentation choice arbitrarily (Devin PR #6 7th round #2).
             if let Ok(llm) = self.shared.llm.try_lock() {
-                let base_llm = Self::score_segmentation_llm(&alternatives[0], &llm);
-                let best_llm = Self::score_segmentation_llm(&alternatives[heuristic_best], &llm);
-                log::debug!(
-                    "Segmentation filter LLM: base={:.3} '{}' vs best={:.3} '{}'",
-                    base_llm,
-                    Self::compose_top_candidates(&alternatives[0]),
-                    best_llm,
-                    Self::compose_top_candidates(&alternatives[heuristic_best]),
-                );
-                // Use LLM result only if it strongly disagrees (base scores much higher)
-                if base_llm > best_llm + 0.15 {
-                    log::info!("Segmentation filter: LLM overrode heuristic, keeping base");
-                    // Invariant: alternatives always includes the base
-                    // segmentation at index 0 (seeded above).
-                    return alternatives
-                        .into_iter()
-                        .next()
-                        .expect("alternatives always contains the base segmentation");
+                if llm.is_scorer_available() {
+                    let base_llm = Self::score_segmentation_llm(&alternatives[0], &llm);
+                    if llm.is_scorer_available() {
+                        let best_llm =
+                            Self::score_segmentation_llm(&alternatives[heuristic_best], &llm);
+                        if llm.is_scorer_available() {
+                            log::debug!(
+                                "Segmentation filter LLM: base={:.3} '{}' vs best={:.3} '{}'",
+                                base_llm,
+                                Self::compose_top_candidates(&alternatives[0]),
+                                best_llm,
+                                Self::compose_top_candidates(&alternatives[heuristic_best]),
+                            );
+                            // Use LLM result only if it strongly disagrees
+                            // (base scores much higher)
+                            if base_llm > best_llm + 0.15 {
+                                log::info!(
+                                    "Segmentation filter: LLM overrode heuristic, keeping base"
+                                );
+                                // Invariant: alternatives always includes the
+                                // base segmentation at index 0 (seeded above).
+                                return alternatives
+                                    .into_iter()
+                                    .next()
+                                    .expect("alternatives always contains the base segmentation");
+                            }
+                        } else {
+                            log::debug!(
+                                "Segmentation filter: scorer entered cooldown after 2nd score; \
+                                 discarding partial LLM comparison"
+                            );
+                        }
+                    } else {
+                        log::debug!(
+                            "Segmentation filter: scorer entered cooldown after 1st score; \
+                             discarding partial LLM comparison"
+                        );
+                    }
+                } else {
+                    log::debug!(
+                        "Segmentation filter: skipping LLM tiebreak — scorer unavailable"
+                    );
                 }
             }
             log::info!(

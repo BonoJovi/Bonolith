@@ -669,7 +669,8 @@ impl Dictionary {
         // the がき→物書き Noun+Suffix rebuild firing.
         const CONTENT_RUNNER_UP_MIN: u32 = 4500;
         let mut out: Vec<Segment> = Vec::with_capacity(segs.len());
-        for seg in segs {
+        for i in 0..segs.len() {
+            let seg = &segs[i];
             let chars: Vec<char> = seg.reading.chars().collect();
             // 3+ char particle+predicate case: がよい (Suffix 通い 2769)
             // whose head が is a strong Particle and whose tail よい is
@@ -679,9 +680,29 @@ impl Dictionary {
             // てんき+がよい, at which point the visible surface would
             // become 天気通い. Splitting into が + よい lets the natural
             // 天気+が+よい parse survive (Devin PR #6 3rd round).
+            //
+            // 3+ char particle+Noun WITH a Particle-neighbor on the right:
+            // がまえ (Suffix 構え 4422) whose head が is a strong Particle
+            // and whose tail まえ is dominantly Noun 前 (7397). Alone this
+            // is a real compound suffix (基本+がまえ → 基本構え), but when
+            // the next segment is another Particle (こども+がまえ+に+いる
+            // = 子供が前にいる) the whole thing is bunsetsu structure, not
+            // a compound. Splitting only in the bunsetsu-context case
+            // preserves 基本構え while restoring 子供が前に (Devin PR #6
+            // 7th round #1). Same reasoning covers がえり / がしゅ / etc.
+            let next_seg_is_particle = segs
+                .get(i + 1)
+                .and_then(|n| Self::dominant_pos(n))
+                .map_or(false, |p| p == PartOfSpeech::Particle);
+            let head_is_strong_particle = chars.first().map_or(false, |c| {
+                self.lookup(&c.to_string())
+                    .iter()
+                    .any(|e| e.pos == PartOfSpeech::Particle && e.frequency >= 7000)
+            });
             if chars.len() >= 3
-                && matches!(Self::dominant_pos(&seg), Some(PartOfSpeech::Suffix))
-                && Self::tail_dominant_is_predicate(&seg, self)
+                && matches!(Self::dominant_pos(seg), Some(PartOfSpeech::Suffix))
+                && (Self::tail_dominant_is_predicate(seg, self)
+                    || (next_seg_is_particle && head_is_strong_particle))
             {
                 let head_r = chars[0].to_string();
                 let tail_r: String = chars[1..].iter().collect();
@@ -708,11 +729,11 @@ impl Dictionary {
                 }
             }
             if chars.len() != 2 {
-                out.push(seg);
+                out.push(seg.clone());
                 continue;
             }
-            if !matches!(Self::dominant_pos(&seg), Some(PartOfSpeech::Suffix)) {
-                out.push(seg);
+            if !matches!(Self::dominant_pos(seg), Some(PartOfSpeech::Suffix)) {
+                out.push(seg.clone());
                 continue;
             }
             // Suffix wins on freq, but is there a strong content-word
@@ -727,11 +748,11 @@ impl Dictionary {
                 ) && e.frequency >= CONTENT_RUNNER_UP_MIN
             });
             if has_strong_content {
-                out.push(seg);
+                out.push(seg.clone());
                 continue;
             }
-            if !Self::right_reading_looks_like_particle_head(&seg, self) {
-                out.push(seg);
+            if !Self::right_reading_looks_like_particle_head(seg, self) {
+                out.push(seg.clone());
                 continue;
             }
             let head_r = chars[0].to_string();
@@ -741,7 +762,7 @@ impl Dictionary {
             let tail_cands: Vec<DictionaryEntry> =
                 self.lookup(&tail_r).into_iter().cloned().collect();
             if head_cands.is_empty() || tail_cands.is_empty() {
-                out.push(seg);
+                out.push(seg.clone());
                 continue;
             }
             let head_start = seg.start;
@@ -2671,6 +2692,46 @@ mod tests {
         // (round 5 guard).
         let segs = dict.segment("えいがちょうおもしろい");
         assert_eq!(segs.len(), 3, "えいがちょうおもしろい must stay 3 segments");
+    }
+
+    /// Regression: a Particle-headed 3+ char Suffix segment (がまえ, がえり,
+    /// がしゅ …) inside a bunsetsu chain (…+Particle+…) must split into
+    /// [Particle, tail] rather than fuse with the previous Noun. Without
+    /// this, こども+がまえ+に+いる collapses into 子供構えに+居る instead
+    /// of 子供が+前に+居る (Devin PR #6 7th round #1). The standalone
+    /// compound 基本+がまえ → 基本構え still fires because there is no
+    /// Particle-neighbor on the right to trigger the split.
+    #[test]
+    fn particle_headed_suffix_splits_inside_bunsetsu_chain() {
+        let dict = Dictionary::new();
+
+        for input in [
+            "こどもがまえにいる",
+            "こうちょうがまえにいる",
+            "しゃちょうがまえにいる",
+        ] {
+            let segs = dict.segment(input);
+            let surfaces: Vec<&str> = segs
+                .iter()
+                .map(|s| s.candidates[0].surface.as_str())
+                .collect();
+            assert!(
+                !surfaces.iter().any(|s| s.contains("構え")),
+                "{input}: bunsetsu chain must not surface 構え; got {surfaces:?}"
+            );
+            assert!(
+                segs.iter().any(|s| s
+                    .candidates
+                    .iter()
+                    .any(|c| c.surface.contains("前"))),
+                "{input}: expected 前 to appear as a segment surface; got {surfaces:?}"
+            );
+        }
+
+        // Standalone compound must still merge (no Particle-neighbor).
+        let segs = dict.segment("きほんがまえ");
+        assert_eq!(segs.len(), 1, "きほんがまえ must still merge to 基本構え");
+        assert_eq!(segs[0].candidates[0].surface, "基本構え");
     }
 
     #[test]
