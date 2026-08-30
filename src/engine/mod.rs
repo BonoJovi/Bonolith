@@ -664,7 +664,15 @@ impl ConversionEngine {
     /// Cycle the candidate for the focused segment. delta: +1 = next, -1 = previous.
     pub fn cycle_candidate(&mut self, delta: i32) -> Option<&ConversionState> {
         let state = self.conversion.as_mut()?;
-        let seg = &mut state.segments[state.focus];
+        // Devin PR #3 review #7: defensive `.get_mut` instead of `[]`
+        // so a stale focus that lands past `segments.len()` cannot
+        // panic — the D-Bus handler that owns this call would take
+        // its whole input context down with it (Fcitx5 catches it
+        // via `ffi_boundary`, but IBus does not).
+        let focus = state.focus;
+        let Some(seg) = state.segments.get_mut(focus) else {
+            return self.conversion.as_ref();
+        };
         let len = seg.candidates.len();
         if len == 0 {
             return self.conversion.as_ref();
@@ -805,6 +813,10 @@ impl ConversionEngine {
         // on multi-segment entry and resize_segment nulls it out on any
         // subsequent split, so the invariant "raw_input is Some ⇒
         // segments.len() == 1" holds without an explicit len guard.
+        // Same defensive `.get` as `cycle_candidate` (Devin PR #3 #7):
+        // the invariants keep `state.focus` in bounds, but a bug that
+        // ever broke them would panic in the IBus D-Bus handler.
+        let focus = state.focus;
         let text = match (form, state.raw_input.as_deref()) {
             (KanaForm::Romaji, Some(raw)) if !raw.is_empty() => raw.to_string(),
             (KanaForm::FullwidthRomaji, Some(raw)) if !raw.is_empty() => raw
@@ -812,11 +824,11 @@ impl ConversionEngine {
                 .map(|c| crate::core::romaji::to_fullwidth_char(c).unwrap_or(c))
                 .collect(),
             _ => {
-                let seg = &state.segments[state.focus];
+                let seg = state.segments.get(focus)?;
                 form.apply(&seg.reading)
             }
         };
-        let seg = &mut state.segments[state.focus];
+        let seg = state.segments.get_mut(focus)?;
         seg.selected = match seg.candidates.iter().position(|c| c == &text) {
             Some(p) => p,
             None => {
@@ -3240,5 +3252,60 @@ mod tests {
             "sentinel must be last (called after joins), got {ctx:?}",
         );
         assert!(shared.pending_llm_context.lock().unwrap().is_empty());
+    }
+
+    /// Devin PR #3 review #7: cycle_candidate must never panic on a
+    /// stale focus. The invariants keep focus in bounds in normal
+    /// flow, but defensive `.get_mut` returns None (a no-op) if a
+    /// bug ever broke them — instead of panicking inside the IBus
+    /// zbus handler and taking the input context down.
+    #[test]
+    fn cycle_candidate_no_panic_on_stale_focus() {
+        let mut engine = ConversionEngine::with_shared(SharedCore::new_hermetic());
+        for ch in "kyou".chars() {
+            engine.process_key(ch);
+        }
+        engine.start_conversion().expect("start_conversion");
+        // Corrupt focus to point past segments.
+        if let Some(state) = engine.conversion.as_mut() {
+            state.focus = 999;
+        }
+        // Must not panic; returns state without modification.
+        let _ = engine.cycle_candidate(1);
+    }
+
+    /// Devin PR #3 review #11: after apply_llm_rerank consumes a
+    /// matching result (whether it reordered candidates or not),
+    /// rerank_inflight MUST be false so the Fcitx5 poll loop stops.
+    /// Prior code left the flag latched when the return was "false"
+    /// (no reorder), burning the whole 2s poll budget.
+    #[test]
+    fn apply_llm_rerank_clears_inflight_even_when_no_change() {
+        use crate::core::llm::LlmScorer;
+        // Scorer that returns a constant score → no candidate reorder.
+        struct FlatScorer;
+        impl LlmScorer for FlatScorer {
+            fn score(&self, _c: &str, _cand: &str) -> f64 { 0.5 }
+            fn warm_cache(&self, _c: &str) {}
+        }
+        let mut engine = ConversionEngine::with_shared(SharedCore::new_eval(Box::new(FlatScorer)));
+        for ch in "kyou".chars() {
+            engine.process_key(ch);
+        }
+        engine.start_conversion().expect("start_conversion");
+        assert!(engine.rerank_inflight(), "trigger arms inflight");
+        // Drain the background worker.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline && !engine.has_llm_rerank_result() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(engine.has_llm_rerank_result(), "result must arrive");
+        // Apply — with FlatScorer the returned bool is false (no reorder).
+        engine.apply_llm_rerank();
+        // Contract: inflight false regardless of applied-change bool.
+        assert!(
+            !engine.rerank_inflight(),
+            "apply must clear inflight so the Fcitx5 poll loop can stop",
+        );
     }
 }

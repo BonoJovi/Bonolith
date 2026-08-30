@@ -178,12 +178,25 @@ pub unsafe extern "C" fn bonolith_handle_key(
     ffi_boundary(false, || {
         let Some(ctx) = (unsafe { ctx.as_mut() }) else { return false; };
 
-        // Consume releases for F6–F10 while composing so GTK apps don't open
-        // menus on F10-release. All other releases pass through.
+        // Consume ALL releases while composing — mirrors IBus's
+        // "when enabled, eat every release" behaviour (Devin PR #3
+        // review #9). The prior implementation only ate F6–F10
+        // releases, so a release we should have consumed for
+        // symmetry (Space, Enter, Tab, Escape, any letter whose
+        // press we accepted) leaked through and let a client key
+        // handler observe half of an event pair. Composing =
+        // preedit non-empty OR active conversion; when idle we let
+        // every release through so app shortcuts (Ctrl+C after a
+        // consumed Ctrl+C press we didn't process) still see them.
         if state & dispatch::RELEASE_MASK != 0 {
-            if matches!(keyval, KEY_F6 | KEY_F7 | KEY_F8 | KEY_F9 | KEY_F10)
-                && (!ctx.engine.preedit().is_empty() || ctx.converting)
-            {
+            if !ctx.engine.preedit().is_empty() || ctx.converting {
+                return true;
+            }
+            // Keep the F6–F10 fallback for the "release lands after
+            // preedit was cleared" edge case (F10 press converts &
+            // commits, its release still needs eating so GTK doesn't
+            // open the menubar).
+            if matches!(keyval, KEY_F6 | KEY_F7 | KEY_F8 | KEY_F9 | KEY_F10) {
                 return true;
             }
             return false;
@@ -464,8 +477,19 @@ pub unsafe extern "C" fn bonolith_get_ui_state(ctx: *mut BonolithContext, out: *
                 // Candidates for focused segment — always the real
                 // focus, even when the rendered focus_index above was
                 // clamped for display: candidate cycling / commit
-                // operates on the true segment index.
-                let seg = &state.segments[state.focus];
+                // operates on the true segment index. Defensive
+                // `.get` guards against a stale focus that outran
+                // resize (Devin PR #3 #7); an out-of-bounds panic
+                // here would be caught by ffi_boundary but degrade
+                // to an empty candidate window anyway.
+                let Some(seg) = state.segments.get(state.focus) else {
+                    out.candidate_count = 0;
+                    out.selected_index = 0;
+                    ctx.cache_composed = CString::new(composed).unwrap_or_default();
+                    out.preedit = ctx.cache_composed.as_ptr();
+                    out.has_preedit = true;
+                    return;
+                };
                 let cand_count = seg.candidates.len().min(MAX_CANDIDATES);
                 out.candidate_count = cand_count as i32;
                 // Clamp the selected index into the visible window: if the
