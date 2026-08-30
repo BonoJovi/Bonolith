@@ -109,15 +109,18 @@ impl RomajiConverter {
             }
         }
 
-        // 6. No match — discard buffer. Invalidate raw_input the same
-        // way delete_last does when it can no longer preserve parity:
-        // the discarded chars are already in raw_input but produced no
-        // output, so a later F9/F10 that reached back into raw_input
-        // would replay them as ghost text (kq + ka → preedit "か" but
-        // raw_input "kqka", F10 → "kqka").
-        if !self.buffer.is_empty() {
-            self.raw_input = None;
-        }
+        // 6. No match — discard buffer. Keep raw_input intact: a user
+        // typing an English word ("apple", "help", "chocolate") threads
+        // discarded consonants through mid-word ("pl" in apple, "lp"
+        // in help), and nuking raw_input the moment one appears means
+        // F10 can never recover the typed spelling — the derived path
+        // is limited to whatever kana was produced ("あっえ" → "axtue"
+        // for "apple"). Preserving raw_input lets F10 round-trip the
+        // literal typing, which is what users hitting F10 on English
+        // input actually want. The old "ghost text" concern (kq + ka
+        // → F10 shows "kqka") is treated as a feature: F10 mirrors
+        // the exact keystroke history, and typo-cleaning callers can
+        // Escape+retype if they need a cleaner form.
         self.buffer.clear();
         None
     }
@@ -130,12 +133,11 @@ impl RomajiConverter {
             return Some("ん".to_string());
         }
         if !self.buffer.is_empty() {
-            // Same story as rule-6 discard: the pending buffer never
-            // produced kana, so raw_input's trailing chars are ghost
-            // input that must not resurface via F9/F10. (saky + Space
-            // → converted "さ", raw_input drops "ky" instead of
-            // pasting "saky" back into F10.)
-            self.raw_input = None;
+            // Keep raw_input intact through flush — matches the rule-6
+            // policy (English-input round-trip). "saky" + Space →
+            // converted "さ", raw_input stays "saky" so F10 can round-
+            // trip to "saky" verbatim rather than derive "sa" from
+            // just the produced kana.
             self.buffer.clear();
         }
         None
@@ -874,32 +876,39 @@ mod tests {
         assert!(cho == "tyo" || cho == "cho", "got: {}", cho);
     }
 
-    /// Regression (bug_list_fable_5_review_2026-08-28 #6a): a rule-6
-    /// discard of an unmatched buffer prefix ("kq") must invalidate
-    /// raw_input so a later F9/F10 does not replay the discarded chars
-    /// as ghost text. Before the fix, `kq` + `ka` left output "か" but
-    /// raw_input "kqka", so F10 rendered "kqka".
+    /// English-input round-trip: rule-6 discard must PRESERVE raw_input.
+    ///
+    /// Prior behaviour nuked raw_input on any rule-6 discard to avoid
+    /// "ghost text" ("kq" + "ka" replaying "kqka" via F10). But that
+    /// policy also broke every English word that threads discarded
+    /// consonants ("apple", "help", "chocolate", URLs) — F10 could
+    /// only ever derive from produced kana, so "apple" → "axtue".
+    /// Preserving raw_input makes F10 mirror what the user actually
+    /// typed, which is the intended F10 semantic for English input.
+    /// Users hitting a typo they want to hide can Escape and retype.
     #[test]
-    fn rule6_discard_invalidates_raw_input() {
+    fn rule6_discard_preserves_raw_input_for_english_roundtrip() {
         let mut conv = RomajiConverter::new();
-        conv.process_key('k');
-        conv.process_key('q'); // rule-6 discard: "kq" has no prefix
-        conv.process_key('k');
-        conv.process_key('a'); // → か
-        assert_eq!(conv.output(), "か");
-        assert!(
-            conv.raw_input().is_none(),
-            "rule-6 discard should have invalidated raw_input; got {:?}",
+        for ch in "apple".chars() {
+            conv.process_key(ch);
+        }
+        // "app" → "あっ" via geminate; "pl" hits rule-6 discard; "e" → え.
+        assert_eq!(conv.output(), "あっえ");
+        assert_eq!(
             conv.raw_input(),
+            Some("apple"),
+            "rule-6 discard must NOT nuke raw_input — F10 needs it \
+             to round-trip English input"
         );
     }
 
-    /// Regression (bug_list_fable_5_review_2026-08-28 #6b): flush with
-    /// a non-"n" pending buffer must invalidate raw_input the same way
-    /// rule-6 discard does. Before the fix, `saky` + flush left output
-    /// "さ" but raw_input "saky", so F10 rendered "saky".
+    /// Same policy for flush with a non-"n" pending buffer: "saky" +
+    /// flush leaves output "さ", and raw_input stays "saky" so F10 can
+    /// round-trip the typed form. Prior behaviour nuked it to prevent
+    /// "ghost" F10 output; we accept the "ghost" as the price of
+    /// English-input round-trip.
     #[test]
-    fn flush_non_n_discard_invalidates_raw_input() {
+    fn flush_non_n_preserves_raw_input_for_english_roundtrip() {
         let mut conv = RomajiConverter::new();
         for ch in "saky".chars() {
             conv.process_key(ch);
@@ -907,10 +916,11 @@ mod tests {
         assert_eq!(conv.output(), "さ");
         assert_eq!(conv.buffer(), "ky");
         conv.flush();
-        assert!(
-            conv.raw_input().is_none(),
-            "flush with non-n buffer should invalidate raw_input; got {:?}",
+        assert_eq!(
             conv.raw_input(),
+            Some("saky"),
+            "flush with non-n buffer must preserve raw_input for \
+             F10 English-input round-trip",
         );
     }
 
