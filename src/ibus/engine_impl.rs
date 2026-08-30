@@ -306,7 +306,17 @@ impl BonolithEngine {
             // Muhenkan / toggle-off flipped enabled=false. Consuming it
             // here prevents XIM clients from synthesising a phantom press
             // for the still-held key (Fable-5 D-group #13 residue).
-            const DISABLE_GRACE_MS: u128 = 500;
+            //
+            // Kept short (80 ms) so a fast typist hitting Muhenkan and
+            // then a letter within the same fingering doesn't have the
+            // fresh letter's release swallowed — 500 ms was wide enough
+            // to eat 2-3 keystrokes at 5 chars/sec, producing phantom
+            // held-key state in XIM/state-tracking clients (games,
+            // browser keyup handlers). Real held-key releases arrive
+            // within one input cycle (< 20 ms), so 80 ms leaves a
+            // comfortable margin on slow systems without exposing the
+            // over-consumption tail (Fable-5 bug_001).
+            const DISABLE_GRACE_MS: u128 = 80;
             let recently_disabled = self
                 .disabled_at
                 .lock()

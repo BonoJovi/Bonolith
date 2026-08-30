@@ -629,6 +629,20 @@ impl ConversionEngine {
         } else {
             None
         };
+        // When raw_input is populated for a single-segment conversion,
+        // F9/F10's convert_focused_to bakes the FULL raw string —
+        // including the trailing pending consonant — into the selected
+        // candidate ("SIT" → ＳＩＴ, with the 'T' already in the
+        // committed text). If commit_conversion then also restores the
+        // pending buffer, the 't' surfaces twice: once inside ＳＩＴ,
+        // once as the leading consonant of the next syllable (SIT →
+        // Space → F9 → Enter → a produced ＳＩＴた). Set
+        // `pending_consumed_in_kana=true` so `restore_buffer` skips the
+        // pending injection whenever the raw snapshot covers it. Mirrors
+        // the F-key path (`start_kana_conversion`) which sets the flag
+        // for the same reason (bug [25] in the earlier review).
+        let pending_consumed_in_kana = raw_input.is_some()
+            && !pending_from_romaji.is_empty();
         self.conversion = Some(ConversionState {
             kana,
             segments: segment_states,
@@ -636,10 +650,7 @@ impl ConversionEngine {
             raw_input,
             initial_boundaries,
             pending_from_romaji,
-            // Space path: pending buffer is NOT included in kana (only
-            // `romaji.output()` is), so commit must restore it for the
-            // next syllable.
-            pending_consumed_in_kana: false,
+            pending_consumed_in_kana,
         });
 
         // Trigger LLM reranking in background — results applied on next interaction
@@ -1662,47 +1673,52 @@ impl ConversionEngine {
             // fallback would let one transient HTTP error tip the
             // segmentation choice arbitrarily (Devin PR #6 7th round #2).
             if let Ok(llm) = self.shared.llm.try_lock() {
-                if llm.is_scorer_available() {
-                    let base_llm = Self::score_segmentation_llm(&alternatives[0], &llm);
-                    if llm.is_scorer_available() {
-                        let best_llm =
-                            Self::score_segmentation_llm(&alternatives[heuristic_best], &llm);
-                        if llm.is_scorer_available() {
-                            log::debug!(
-                                "Segmentation filter LLM: base={:.3} '{}' vs best={:.3} '{}'",
-                                base_llm,
-                                Self::compose_top_candidates(&alternatives[0]),
-                                best_llm,
-                                Self::compose_top_candidates(&alternatives[heuristic_best]),
-                            );
-                            // Use LLM result only if it strongly disagrees
-                            // (base scores much higher)
-                            if base_llm > best_llm + 0.15 {
-                                log::info!(
-                                    "Segmentation filter: LLM overrode heuristic, keeping base"
-                                );
-                                // Invariant: alternatives always includes the
-                                // base segmentation at index 0 (seeded above).
-                                return alternatives
-                                    .into_iter()
-                                    .next()
-                                    .expect("alternatives always contains the base segmentation");
-                            }
-                        } else {
-                            log::debug!(
-                                "Segmentation filter: scorer entered cooldown after 2nd score; \
-                                 discarding partial LLM comparison"
-                            );
-                        }
-                    } else {
-                        log::debug!(
-                            "Segmentation filter: scorer entered cooldown after 1st score; \
-                             discarding partial LLM comparison"
+                // Acquire two real scores or nothing — a partial reading
+                // would compare a real logprob against the neutral 0.5
+                // fallback and pick the wrong segmentation from a
+                // transient HTTP hiccup. Collapsed into a single closure
+                // so the acquire-score-check-score-check flow reads as
+                // a linear pipeline (Fable-5 bug_005).
+                let scores = (|| {
+                    if !llm.is_scorer_available() {
+                        return None;
+                    }
+                    let base = Self::score_segmentation_llm(&alternatives[0], &llm);
+                    if !llm.is_scorer_available() {
+                        return None;
+                    }
+                    let best =
+                        Self::score_segmentation_llm(&alternatives[heuristic_best], &llm);
+                    if !llm.is_scorer_available() {
+                        return None;
+                    }
+                    Some((base, best))
+                })();
+                if let Some((base_llm, best_llm)) = scores {
+                    log::debug!(
+                        "Segmentation filter LLM: base={:.3} '{}' vs best={:.3} '{}'",
+                        base_llm,
+                        Self::compose_top_candidates(&alternatives[0]),
+                        best_llm,
+                        Self::compose_top_candidates(&alternatives[heuristic_best]),
+                    );
+                    // Use LLM result only if it strongly disagrees
+                    // (base scores much higher)
+                    if base_llm > best_llm + 0.15 {
+                        log::info!(
+                            "Segmentation filter: LLM overrode heuristic, keeping base"
                         );
+                        // Invariant: alternatives always includes the
+                        // base segmentation at index 0 (seeded above).
+                        return alternatives
+                            .into_iter()
+                            .next()
+                            .expect("alternatives always contains the base segmentation");
                     }
                 } else {
                     log::debug!(
-                        "Segmentation filter: skipping LLM tiebreak — scorer unavailable"
+                        "Segmentation filter: scorer unavailable at some step; \
+                         dropping LLM tiebreak"
                     );
                 }
             }
@@ -2531,6 +2547,41 @@ mod tests {
         assert_eq!(
             seg.candidates[seg.selected], "SIT",
             "F10 must produce case-preserved SIT",
+        );
+    }
+
+    /// Fable-5 bug_002: SIT + Space + F9 + Enter + a used to produce
+    /// ＳＩＴた (4 chars for one physical 'T' press) — the F9 candidate
+    /// baked "T" into ＳＩＴ via raw_input, and then commit_conversion's
+    /// `restore_buffer` re-injected the pending 't', so the next 'a'
+    /// consumed it as "ta" = "た". Fix flags the pending buffer as
+    /// already-consumed whenever raw_input carries it.
+    #[test]
+    fn sit_space_f9_enter_letter_does_not_double_pending() {
+        let mut engine = ConversionEngine::new();
+        for c in "SIT".chars() {
+            engine.process_key(c);
+        }
+        assert_eq!(engine.preedit(), "しt");
+        let state = engine.start_conversion().expect("SIT should convert");
+        // Snapshot has 't' baked in, so flag must fire.
+        assert_eq!(state.pending_from_romaji, "t");
+        assert!(
+            state.pending_consumed_in_kana,
+            "raw_input snapshot covers pending 't' → flag must be true",
+        );
+        engine
+            .convert_focused_to(KanaForm::FullwidthRomaji)
+            .expect("F9 form swap");
+        let commit = engine.commit_conversion().expect("commit");
+        assert_eq!(commit, "ＳＩＴ", "F9 candidate commits");
+        // The critical check: 'a' after commit must NOT combine with a
+        // restored 't' into 'た'. It should produce 'あ' standalone.
+        engine.process_key('a');
+        assert_eq!(
+            engine.preedit(),
+            "あ",
+            "next letter must not resurrect the pending consonant",
         );
     }
 

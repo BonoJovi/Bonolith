@@ -704,19 +704,23 @@ impl Dictionary {
                 .zip(segs.get(i + 2))
                 .map_or(false, |(nx, nx2)| {
                     let nx_top = nx.candidates.first();
-                    let nx2_top = nx2.candidates.first();
                     let nx_is_locative_particle = nx_top
                         .map_or(false, |e| {
                             e.pos == PartOfSpeech::Particle
                                 && matches!(e.surface.as_str(), "に" | "で")
                         });
-                    let nx2_is_existence_verb = nx2_top.map_or(false, |e| {
-                        e.pos == PartOfSpeech::Verb
-                            && matches!(
-                                e.surface.as_str(),
-                                "居る" | "有る" | "在る" | "いる" | "ある"
-                            )
-                    });
+                    // Match on the segment's READING (kana) rather than
+                    // top surface: IPADIC lists each conjugation as a
+                    // distinct entry, and past/negative/polite forms
+                    // (居た, いない, いました, あった, ありません…) often
+                    // lose the top slot to a homophone (いない → 以内
+                    // Noun 7631, いた → 板 Noun, etc.). Fable-5 bug_004:
+                    // the original surface-whitelist only caught
+                    // present-tense forms, so こどもがまえにいた still
+                    // fused into 子供構えにいた. The reading string is
+                    // stable across all IPADIC conjugations.
+                    let nx2_is_existence_verb =
+                        is_existential_reading(&nx2.reading);
                     nx_is_locative_particle && nx2_is_existence_verb
                 });
             if chars.len() >= 3
@@ -2272,6 +2276,26 @@ impl Dictionary {
 /// Lower cost = better.  The char_len multiplier makes longer words accumulate
 /// more frequency benefit, while the +1.0 per-segment penalty discourages
 /// excessive splitting.
+/// True when `reading` is one of the common kana readings for the
+/// existential-verb families (居る / 有る), covering the conjugation
+/// paradigm used in modern Japanese narrative and dialogue. Used by
+/// `split_particle_head_segments` to detect "…+に+existential" bunsetsu
+/// chains that must NOT fuse a Particle-headed suffix (がまえ / がえり)
+/// into a compound with the preceding noun.
+fn is_existential_reading(reading: &str) -> bool {
+    matches!(
+        reading,
+        // 居る family
+        "いる" | "いた" | "いて" | "いない" | "いなかった" | "いれば"
+        | "います" | "いました" | "いません" | "いませんでした"
+        // 有る family
+        | "ある" | "あった" | "あって" | "あれば"
+        | "あります" | "ありました" | "ありません" | "ありませんでした"
+        // ある-negative (adjective conjugation of ない)
+        | "ない" | "なかった"
+    )
+}
+
 fn segment_cost(char_len: usize, frequency: u32) -> f64 {
     (char_len as f64) * -(frequency as f64).ln() + 1.0
 }
@@ -2729,12 +2753,21 @@ mod tests {
         let dict = Dictionary::new();
 
         // Bunsetsu case: (locative Particle + existential Verb) tail
-        // forces split of the Particle-headed Suffix segment.
+        // forces split of the Particle-headed Suffix segment. Coverage
+        // must include past / negative / polite conjugations — IPADIC
+        // lists each as a distinct top surface (居た / いない → 以内
+        // Noun 7631 / いました / あった / …), so a naive surface-only
+        // whitelist misses them (Fable-5 bug_004).
         for input in [
             "こどもがまえにいる",
             "こうちょうがまえにいる",
             "しゃちょうがまえにいる",
             "ねこがまえにある",
+            // Past / negative / polite forms — Fable-5 bug_004 coverage.
+            "こどもがまえにいた",
+            "こどもがまえにあった",
+            "こどもがまえにいない",
+            "こどもがまえにいました",
         ] {
             let segs = dict.segment(input);
             let surfaces: Vec<&str> = segs
