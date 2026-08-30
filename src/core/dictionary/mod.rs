@@ -810,8 +810,12 @@ impl Dictionary {
         // is 3+ chars it is almost always a compound term (いいん+かい →
         // 委員会, てんらん+かい → 展覧会, しんさいいん+かい → 審査委員会),
         // and the trailing kai/sa/ka/nin reads as a Suffix, not a bunsetsu
-        // boundary.
-        let left_long = left_reading.chars().count() >= 3;
+        // boundary. But even under a long head, a tail that reads as a
+        // predicate (よい/ある/いる) is a real bunsetsu boundary — 「天気
+        // が よい」must never fuse into 天気+通い (Devin PR #6 #1). Keep
+        // the veto in that specific case via the predicate-tail check.
+        let left_long = left_reading.chars().count() >= 3
+            && !Self::right_reading_looks_like_predicate_bunsetsu(seg, dict);
         // Particle-head suppression runs even when dominant is already
         // Suffix — がき's 書き (Suffix) tops the group at 4400 thanks to a
         // PRIORITY_OVERRIDE, so returning Suffix here would still fuse
@@ -917,6 +921,52 @@ impl Dictionary {
                 e.pos,
                 PartOfSpeech::Noun | PartOfSpeech::Verb | PartOfSpeech::Adjective
             ) && e.frequency >= TAIL_CONTENT_MIN
+        })
+    }
+
+    /// A stricter cousin of `right_reading_looks_like_particle_head` used to
+    /// veto Noun+Suffix reclass even under a long compound-noun head. The
+    /// broad `left_long` gate correctly re-opens 委員+会 / 審査委員+会
+    /// (tail = 「い」, Noun 胃 dominant → the "particle boundary" reading is
+    /// a stretch), but must not fuse across a real bunsetsu boundary whose
+    /// tail is a predicate (Adjective / Verb) like よい/ある/いる — 「天気
+    /// が よい」 must never become 天気+通い (Devin PR #6 #1). Predicates
+    /// are the strongest signal that the segment is a bunsetsu tail rather
+    /// than a compound suffix. Verb-that-is-actually-a-particle homographs
+    /// like さ/だ Verb 1 are filtered by the `≥ TAIL_CONTENT_MIN` freq floor.
+    fn right_reading_looks_like_predicate_bunsetsu(
+        seg: &Segment,
+        dict: &Dictionary,
+    ) -> bool {
+        const HEAD_PARTICLE_MIN: u32 = 7000;
+        const TAIL_CONTENT_MIN: u32 = 2000;
+        let mut it = seg.reading.chars();
+        let first = match it.next() {
+            Some(c) => c,
+            None => return false,
+        };
+        let tail: String = it.collect();
+        // Multi-char tail only — real predicate bunsetsu tails (よい, ある,
+        // いる, ない, きた …) are ≥2 chars. Single-char tails ('い' etc.)
+        // reach a Verb homograph like 居(2160) at low freq that would
+        // spuriously trip the check and re-block the compound-suffix
+        // reclass (かい → 会 for 委員会). The single-char case never
+        // corresponds to a natural predicate bunsetsu boundary anyway.
+        if tail.chars().count() < 2 {
+            return false;
+        }
+        let head_r = first.to_string();
+        let head_ents = dict.lookup(&head_r);
+        let head_strong = head_ents.iter().any(|e| {
+            e.pos == PartOfSpeech::Particle && e.frequency >= HEAD_PARTICLE_MIN
+        });
+        if !head_strong {
+            return false;
+        }
+        let tail_ents = dict.lookup(&tail);
+        tail_ents.iter().any(|e| {
+            matches!(e.pos, PartOfSpeech::Verb | PartOfSpeech::Adjective)
+                && e.frequency >= TAIL_CONTENT_MIN
         })
     }
 

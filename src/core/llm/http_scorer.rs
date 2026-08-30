@@ -280,7 +280,16 @@ impl HttpLlamaScorer {
         let body: CompletionResponse = match resp.into_body().read_json() {
             Ok(b) => b,
             Err(e) => {
-                debug!("HttpLlamaScorer: failed to parse response: {}", e);
+                // Body-read / JSON-parse failures leave the caller with no
+                // signal for this candidate. Arm the cooldown so the rest
+                // of the rerank pass sees `is_available() == false` and
+                // falls back to dictionary order rather than mixing real
+                // scores with the neutral fallback (Devin PR #6 #2).
+                if self.mark_failed() {
+                    warn!("HttpLlamaScorer: failed to parse response: {}", e);
+                } else {
+                    debug!("HttpLlamaScorer: failed to parse response: {}", e);
+                }
                 return 0.5;
             }
         };
@@ -297,8 +306,19 @@ impl HttpLlamaScorer {
             .collect();
         if content.is_empty() {
             // Server didn't return per-token probs (n_probs unsupported), or
-            // only the end token came back; stay neutral so we neither help
-            // nor hurt the ranking.
+            // only the end token came back — either way we cannot produce a
+            // real score for this or any subsequent candidate in the pass.
+            // Arm the cooldown so `is_available()` flips false and the
+            // rerank halts to dictionary order (Devin PR #6 #2).
+            if self.mark_failed() {
+                warn!(
+                    "HttpLlamaScorer: response carried no per-token probs; halting rerank",
+                );
+            } else {
+                debug!(
+                    "HttpLlamaScorer: response carried no per-token probs; halting rerank",
+                );
+            }
             return 0.5;
         }
 
