@@ -367,14 +367,13 @@ pub fn hiragana_to_romaji(s: &str) -> String {
             if let Some(romaji) = kana_to_romaji_lookup(&slice) {
                 result.push_str(romaji);
                 i += len;
-                // ん + vowel / y-row needs an explicit "n'" so a later
-                // kana→romaji reader can't re-parse "kani" as か+に
-                // instead of か+ん+い. `kana_to_romaji_lookup` returns
-                // bare "n" only for ん, so a bare "n" here means
-                // slice == "ん". ん+ん stays "nn" — the Hepburn "nn"
-                // convention for ん would be ambiguous either way, and
-                // this branch is round-tripped via `hiragana_to_romaji`
-                // for F9/F10, not fed back into the segmenter.
+                // ん + vowel / y-row / な-row needs an explicit "n'" so
+                // a later kana→romaji reader can't merge it with the
+                // following mora. `kana_to_romaji_lookup` returns bare
+                // "n" only for ん, so a bare "n" here means slice=="ん".
+                // ん+ん stays "nn" — the converter's "nn"→ん rule
+                // absorbs it identically either way, and this branch is
+                // round-tripped via `hiragana_to_romaji` for F9/F10.
                 if romaji == "n" && needs_n_apostrophe(chars.get(i).copied()) {
                     result.push('\'');
                 }
@@ -498,17 +497,23 @@ pub fn hiragana_to_fullwidth_romaji(s: &str) -> String {
 
 /// True if a bare "n" (from ん) needs an apostrophe before `next` so a
 /// later kana→romaji reader can't merge it with the following mora.
-/// The ambiguous cases are a following vowel (a/i/u/e/o) or a y-row
-/// mora (や/ゆ/よ + small ゃ/ゅ/ょ) — "kani" would otherwise read as
-/// か+に instead of か+ん+い. Follows Mozc / Hepburn convention;
-/// deliberately does not cover ん+な行 (which the bug report and the
-/// convention both leave as bare "n"; anna reads unambiguously as ん+な).
+///
+/// Ambiguity classes for Bonolith's converter (rule-1 exact_lookup treats
+/// "nn" as ん, rule-4 breaks "n" + non-matching-consonant into ん + next):
+///   - Vowel next (あいうえお): "kani" → か+に vs か+ん+い
+///   - Y-row next (や/ゆ/よ/small ゃ/ゅ/ょ): "kanya" → か+にゃ vs か+ん+や
+///   - N-row next (な/に/ぬ/ね/の): "kanna" → か+ん+な vs か+んな (since
+///     the converter reads "nn" as ん, "kanna" collapses to か+ん+あ,
+///     never producing か+んな). Was omitted before; the docstring
+///     claimed "anna reads unambiguously" but the converter's own "nn"→
+///     ん rule broke round-tripping for hiragana_to_romaji(んな)="nna".
 fn needs_n_apostrophe(next: Option<char>) -> bool {
     match next {
         Some(c) => matches!(
             c,
             'あ' | 'い' | 'う' | 'え' | 'お'
             | 'や' | 'ゆ' | 'よ' | 'ゃ' | 'ゅ' | 'ょ'
+            | 'な' | 'に' | 'ぬ' | 'ね' | 'の'
         ),
         None => false,
     }
@@ -830,8 +835,12 @@ mod tests {
         assert_eq!(hiragana_to_romaji("かんい"), "kan'i");
         assert_eq!(hiragana_to_romaji("ほんや"), "hon'ya");
         assert_eq!(hiragana_to_romaji("ぜんいん"), "zen'in");
-        // ん + な行 stays bare "n" — anna is unambiguously ん+な.
-        assert_eq!(hiragana_to_romaji("あんない"), "annai");
+        // ん + な-row: apostrophe REQUIRED for round-trip. The converter's
+        // "nn"→ん rule reads bare "nna" as ん+あ, so an unapostrophed
+        // "annai" (from あんない) would round-trip back as あんあい, not
+        // あんない. Prior docstring incorrectly claimed anna is unambiguous.
+        assert_eq!(hiragana_to_romaji("あんない"), "an'nai");
+        assert_eq!(hiragana_to_romaji("こんにちは"), "kon'nitiha");
         // ん before a non-n consonant is still bare "n".
         assert_eq!(hiragana_to_romaji("かんじ"), "kanzi");
         // Trailing ん stays bare "n".

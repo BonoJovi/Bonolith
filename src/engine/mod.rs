@@ -1416,7 +1416,27 @@ impl ConversionEngine {
                     // next conversion overwrites it, so the current pass's
                     // poll-refresh loop burns ~2 s waiting for a result the
                     // panicked thread will never produce.
-                    inflight.store(false, Ordering::Relaxed);
+                    //
+                    // Generation guard: only clear the inflight flag while
+                    // we are still the current pass. Without the re-check
+                    // under the (implicit) generation ordering, an older
+                    // panicked worker could clear a newer pass's flag —
+                    // the current-gen check at line 1387 gates the whole
+                    // arm, but a `trigger_llm_rerank` firing between that
+                    // load and this store can still race. Re-load under
+                    // the slot lock (mirror of the Ok arm) so a newer
+                    // pass's inflight stays true (Fable-5 review D-group
+                    // #14 residue).
+                    let slot = result_slot.lock().unwrap_or_else(|e| e.into_inner());
+                    if generation.load(Ordering::Acquire) == my_gen {
+                        inflight.store(false, Ordering::Relaxed);
+                    } else {
+                        log::debug!(
+                            "LLM rerank pass {} panicked but superseded before clear — leaving inflight alone",
+                            my_gen,
+                        );
+                    }
+                    drop(slot);
                 }
             }
         });
