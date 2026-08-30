@@ -153,6 +153,12 @@ const PRIORITY_OVERRIDES: &[(&str, &str, u32)] = &[
     ("する", "スる", 800),  // was 6520, slangy katakana stylization
     ("する", "する", 2800), // was 1306, below 摺る/擦る 2632
     ("ところ", "所", 4200), // was 1685, below 野老 3755 (rare plant/surname) / 処 2978
+    // しよう: 至要 (4-5 stroke Chinese-style compound "extremely important", archaic)
+    // beats the everyday 使用 in IPADIC by raw freq (5294 vs 4645). The rank shows up
+    // as-is on lone しよう and, worse, propagates through the Noun+Suffix Cartesian
+    // for しようふか (all products collapse to freq 2473 = 不可 Suffix cap, so the
+    // left order decides top-1 → 至要不可 instead of 使用不可).
+    ("しよう", "使用", 5500), // was 4645, below 至要 5294 (archaic literary)
     // 書き (連用/compound tail: 下書き, 落書き) is far more common as input than
     // 餓鬼; IPADIC buried it (Suffix 3635 < 餓鬼 4353), so がき defaulted to 餓鬼
     // and, worse, its Noun POS suppressed the Noun+Suffix compound merge.
@@ -2806,6 +2812,7 @@ mod tests {
             ("ひと", "人"),   // beats 匪徒/費途
             ("こと", "事"),   // beats 古都/糊塗/殊/琴
             ("じしょ", "辞書"), // beats 字書/自署/地所
+            ("しよう", "使用"), // beats 至要 (archaic literary compound)
             // verbs
             ("みる", "見る"),     // beats 海松/水松
             ("いのる", "祈る"),   // beats 祷る
