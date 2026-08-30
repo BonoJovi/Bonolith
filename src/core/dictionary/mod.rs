@@ -831,6 +831,7 @@ impl Dictionary {
         dominant: Option<PartOfSpeech>,
         left_pos: Option<PartOfSpeech>,
         left_reading: &str,
+        next_after_right_dominant: Option<PartOfSpeech>,
         dict: &Dictionary,
     ) -> Option<PartOfSpeech> {
         const SUFFIX_MERGE_THRESHOLD: u32 = 1500;
@@ -874,20 +875,28 @@ impl Dictionary {
             }
             return dominant;
         }
-        // Reclass-to-Suffix only makes sense for readings whose dominant POS
-        // misrecognises a compound suffix as a bunsetsu head (Particle) or a
-        // stand-alone noun. Dominant Prefix means the reading has a real
-        // Prefix role (しん→新 3979 > 心 Suffix 2252), which is about to
-        // drive a Prefix+Noun merge with the next segment — swapping to a
-        // weak Suffix candidate would fuse into the left compound instead
-        // and lose the Prefix reading (bug: しん between 技術的 and 斎院
-        // getting fused as 技術的心 rather than pairing with 斎院).
-        if !matches!(
-            dominant,
-            Some(PartOfSpeech::Particle) | Some(PartOfSpeech::Noun)
-        ) {
+        // Dominant Prefix means the reading has a real Prefix role
+        // (しん→新 3979 > 心 Suffix 2252). Reclassing it to a weaker Suffix
+        // would fuse into the left compound and lose the Prefix reading
+        // (bug: しん between 技術的 and 斎院 fusing as 技術的心 instead
+        // of pairing with 斎院). BUT this only matters when a Noun / Prefix
+        // actually follows to form the Prefix+X compound — a trailing
+        // Prefix-dominant segment (会議+ちゅう, ちゅう has Prefix 駐 4832
+        // top but Suffix 中 3528 present, with no next segment) should
+        // reclass to Suffix so 会議中 fuses (Devin PR #6 4th round).
+        if matches!(dominant, Some(PartOfSpeech::Prefix))
+            && matches!(
+                next_after_right_dominant,
+                Some(PartOfSpeech::Noun) | Some(PartOfSpeech::Prefix)
+            )
+        {
             return dominant;
         }
+        // All other non-Particle/Noun dominants (Adverb, Adjective,
+        // Conjunction, Interjection, Other) fall through to the Suffix
+        // strength check below — 最新版's ばん is Adverb-dominant バン
+        // (8530) but has Suffix 版 (3549), and there is no Adverb chain
+        // to preserve, so the Suffix reclass should still fire.
         let has_strong_suffix = seg.candidates.iter().any(|e| {
             e.pos == PartOfSpeech::Suffix && e.frequency >= SUFFIX_MERGE_THRESHOLD
         });
@@ -1049,11 +1058,20 @@ impl Dictionary {
             // Noun+Noun cases where BOTH sides need reclassification (さい+
             // かくにん where 再 Prefix is buried under 際 Noun and 確認 is a
             // straight Noun) still fire as Prefix+Noun.
+            // Peek at the segment beyond the right (segs[i+2]). Used to
+            // decide whether a Prefix-dominant right seg should keep its
+            // Prefix role (a Noun follows → chainable) or be reclassed to
+            // its Suffix homograph (nothing to chain into → fuse into the
+            // left).
+            let next_after_right_dominant = segs
+                .get(i + 2)
+                .and_then(|s| Self::dominant_pos(s));
             let nxt = Self::effective_right_merge_pos(
                 &segs[i + 1],
                 raw_nxt,
                 raw_cur,
                 &segs[i].reading,
+                next_after_right_dominant,
                 self,
             );
             let cur = Self::effective_left_merge_pos(&segs[i], raw_cur, nxt);
@@ -1211,7 +1229,9 @@ impl Dictionary {
                                 })
                             })
                             .collect();
-                        cands.extend(self.probe_2piece_alternatives(&merged_reading));
+                        cands.extend(
+                            self.probe_2piece_alternatives(&merged_reading, r_role),
+                        );
                         // Sort highest-freq first, then drop duplicate
                         // surfaces globally (not just adjacent — same-surface
                         // entries land far apart when many surfaces share the
@@ -1250,7 +1270,11 @@ impl Dictionary {
     /// かくにん = 再/際 + 確認 at ≥4213). Merging the alternative splits into
     /// the candidate pool keeps those forms discoverable without needing a
     /// bespoke dict entry per compound.
-    fn probe_2piece_alternatives(&self, reading: &str) -> Vec<DictionaryEntry> {
+    fn probe_2piece_alternatives(
+        &self,
+        reading: &str,
+        intent_right_role: Option<PartOfSpeech>,
+    ) -> Vec<DictionaryEntry> {
         let chars: Vec<char> = reading.chars().collect();
         if chars.len() < 3 {
             // 2-char readings can only split as 1+1; the merge already
@@ -1296,6 +1320,32 @@ impl Dictionary {
                         && (right_char_count < 2 || r.frequency < 5000)
                     {
                         continue;
+                    }
+                    // Intent-based filter for Noun+Suffix merges: when the
+                    // alt's right piece is not itself a Suffix, require BOTH
+                    // (a) the right piece's dominant POS is Noun AND
+                    // (b) the alt's Noun surface freq is ≥ 5000.
+                    // Rationale (Devin PR #6 4th round):
+                    //   - 最新+晩 for さいしんばん: 晩 is Noun 5892 ≥ 5000,
+                    //     BUT ばん's dominant POS is バン Adverb, so (a)
+                    //     fails → skip. Keeps 最新版 on top.
+                    //   - 再+新盤 for さいしんばん: しんばん's dominant is
+                    //     新盤 Noun (a passes), BUT 新盤 freq 4378 < 5000,
+                    //     so (b) fails → skip. Keeps 最新版 on top.
+                    //   - 何+時間 for なんじかん: じかん's dominant is 時間
+                    //     Noun (a) AND 時間 freq 9523 ≥ 5000 (b) → keep.
+                    //     Prior test `affix_merge_survives_user_scorer_boost`
+                    //     still passes.
+                    // Non-Suffix intents keep the full alternatives.
+                    if matches!(intent_right_role, Some(PartOfSpeech::Suffix))
+                        && r.pos != PartOfSpeech::Suffix
+                    {
+                        let right_dominant_is_noun = r_ents
+                            .first()
+                            .map_or(false, |top| top.pos == PartOfSpeech::Noun);
+                        if !right_dominant_is_noun || r.frequency < 5000 {
+                            continue;
+                        }
                     }
                     // Guard against 1-char Prefix+Noun where the "Prefix"
                     // is a weak homograph — same reasoning as the Noun+Noun
@@ -2388,6 +2438,73 @@ mod tests {
             assert_eq!(segs.len(), 1, "{input}: {:?}", segs);
             assert_eq!(segs[0].candidates[0].surface, want);
         }
+    }
+
+    /// Regression: Adverb-dominant Suffix homographs (ばん → バン Adverb
+    /// 8530 with 版 Suffix 3549) and Prefix-dominant trailing Suffix
+    /// homographs (ちゅう → 駐 Prefix 4832 with 中 Suffix 3528 as the last
+    /// segment, so no Prefix+Noun chain is possible) must reclass to
+    /// Suffix and fuse into 最新版 / 限定版 / 会議中 / 期間中. But しん
+    /// (Prefix 3979) followed by a Noun (斎院) still preserves its Prefix
+    /// role so 技術的+審査委員会 keeps working — the next-after-right
+    /// peek distinguishes the two cases (Devin PR #6 4th round).
+    #[test]
+    fn affix_merge_gate_promotes_suffix_at_tail() {
+        let dict = Dictionary::new();
+        // Unambiguous left readings: top-1 must be the intended compound.
+        for (input, want) in [
+            ("さいしんばん", "最新版"),
+            ("げんていばん", "限定版"),
+            ("かいぎちゅう", "会議中"),
+        ] {
+            let segs = dict.segment(input);
+            assert_eq!(
+                segs.len(),
+                1,
+                "{input} must fuse into a single compound; got {:?}",
+                segs.iter()
+                    .map(|s| s.candidates[0].surface.as_str())
+                    .collect::<Vec<_>>()
+            );
+            let top_surface = &segs[0].candidates[0].surface;
+            assert_eq!(
+                top_surface, want,
+                "{input}: top candidate should be {want}, got {top_surface}"
+            );
+        }
+
+        // Ambiguous left reading (きかん → 期間 / 機関 / 器官 all valid):
+        // the merge must fire and the Suffix-role right (中) must produce
+        // the intended candidates, but which of 期間中 / 機関中 tops is a
+        // ranking concern outside this test's scope.
+        let segs = dict.segment("きかんちゅう");
+        assert_eq!(segs.len(), 1);
+        let surfaces: Vec<&str> = segs[0]
+            .candidates
+            .iter()
+            .take(6)
+            .map(|c| c.surface.as_str())
+            .collect();
+        assert!(
+            surfaces.contains(&"期間中") && surfaces.contains(&"機関中"),
+            "きかんちゅう must surface both 期間中 and 機関中 in the \
+             top-6, got {surfaces:?}"
+        );
+
+        // Prefix chain preserved: しん between 技術的 and 斎院 must NOT
+        // reclass to Suffix (would fuse into 技術的心 and strand 斎院).
+        let segs = dict.segment("ぎじゅつてきしんさいいんかい");
+        assert_eq!(
+            segs.len(),
+            2,
+            "ぎじゅつてきしんさいいんかい must split as 技術的 + 審査委員会, \
+             got {:?}",
+            segs.iter()
+                .map(|s| s.candidates[0].surface.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(segs[0].candidates[0].surface, "技術的");
+        assert_eq!(segs[1].candidates[0].surface, "審査委員会");
     }
 
     #[test]
