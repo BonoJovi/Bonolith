@@ -344,8 +344,19 @@ static std::string runProcessCaptureStdout(
     const std::vector<std::string> &extra_args,
     const std::vector<std::string> &env_overrides = {})
 {
+    // O_CLOEXEC on both pipe fds is essential: fcitx5's dictionary
+    // menu actions run on detached threads, so two dialogs can be
+    // spawning concurrently. Without close-on-exec, the second
+    // spawn's child would inherit the first pipe's write end, and
+    // the first `read(pipefd[0])` never sees EOF even after the
+    // first zenity exits — the first thread stalls until the second
+    // dialog is dismissed. posix_spawn's file_actions closes the fd
+    // in the direct child, but the O_CLOEXEC flag is what keeps
+    // unrelated concurrent spawns from picking it up (Devin PR #7
+    // [R3-9]). posix_spawn_file_actions_adddup2 clears CLOEXEC on
+    // the duplicated stdout fd, so the child's stdout still works.
     int pipefd[2];
-    if (pipe(pipefd) != 0) return "";
+    if (pipe2(pipefd, O_CLOEXEC) != 0) return "";
 
     // Build argv: [path, extra_args..., NULL]. Each entry is passed as a
     // literal byte string; the child sees exactly what we put here, with

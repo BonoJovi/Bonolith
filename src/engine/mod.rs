@@ -2407,8 +2407,19 @@ mod tests {
     fn commit_bumps_segmentation_count_on_rehit_store_backed() {
         use crate::core::store::DictStore;
         use std::sync::RwLock;
+        use std::time::{SystemTime, UNIX_EPOCH};
 
-        let dir = std::env::temp_dir().join("bonolith_test_segcount_rehit");
+        // Per-invocation temp dir so parallel `cargo test` processes
+        // don't stomp on each other's SQLite (Devin PR #7 [R3-11]).
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "bonolith_test_segcount_rehit_{}_{}",
+            std::process::id(),
+            stamp
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("dict.sqlite");

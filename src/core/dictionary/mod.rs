@@ -2517,6 +2517,25 @@ fn strip_trailing_commas(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Build a per-invocation temp directory keyed off the PID and a
+    /// nanosecond-precision timestamp so parallel test processes never
+    /// share the same path. Devin PR #7 [R3-11] flagged that fixed
+    /// `bonolith_test_*` paths raced when two `cargo test` invocations
+    /// ran the same binary concurrently.
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "{}_{}_{}",
+            prefix,
+            std::process::id(),
+            stamp
+        ))
+    }
+
     #[test]
     fn builtin_dictionary_loads() {
         let dict = Dictionary::new();
@@ -4172,7 +4191,7 @@ mod tests {
     #[test]
     fn row_level_persist_preserves_concurrent_frontend_entries() {
         use crate::core::store::DictStore;
-        let dir = std::env::temp_dir().join("bonolith_test_row_level_persist");
+        let dir = unique_temp_dir("bonolith_test_row_level_persist");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("dict.sqlite");
@@ -4223,7 +4242,7 @@ mod tests {
     #[test]
     fn update_persist_preserves_concurrent_frontend_entries() {
         use crate::core::store::DictStore;
-        let dir = std::env::temp_dir().join("bonolith_test_update_persist");
+        let dir = unique_temp_dir("bonolith_test_update_persist");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("dict.sqlite");
@@ -4305,7 +4324,7 @@ mod tests {
     #[test]
     fn re_add_user_entry_upserts_metadata_in_memory_and_store() {
         use crate::core::store::DictStore;
-        let dir = std::env::temp_dir().join("bonolith_test_re_add_upsert_metadata");
+        let dir = unique_temp_dir("bonolith_test_re_add_upsert_metadata");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("dict.sqlite");
@@ -4357,8 +4376,7 @@ mod tests {
     #[test]
     fn update_user_entry_to_collision_adopts_new_metadata() {
         use crate::core::store::DictStore;
-        let dir = std::env::temp_dir()
-            .join("bonolith_test_update_collision_adopts");
+        let dir = unique_temp_dir("bonolith_test_update_collision_adopts");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("dict.sqlite");
