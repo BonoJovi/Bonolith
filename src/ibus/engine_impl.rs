@@ -1102,6 +1102,20 @@ impl BonolithEngine {
                         .spawn();
                     return;
                 }
+                // Reject readings containing '|': the register-dialog IPC
+                // format is `reading|surface`, first-'|' split, so a
+                // pipe in reading would silently redraw the boundary
+                // and the row would be saved with a truncated reading
+                // (Devin PR #7 [D6]). Reading is expected to be
+                // hiragana anyway; refuse the input rather than
+                // guessing.
+                if reading.contains('|') {
+                    let _ = std::process::Command::new("zenity")
+                        .args(["--error", "--title=Bonolith",
+                               "--text=よみに '|' を含めることはできません"])
+                        .spawn();
+                    return;
+                }
 
                 let entry = DictionaryEntry {
                     reading: reading.to_string(),
@@ -1335,6 +1349,15 @@ impl BonolithEngine {
         let new_reading = text[..sep].trim();
         let new_surface = text[sep + 1..].trim();
         if new_reading.is_empty() || new_surface.is_empty() {
+            return;
+        }
+        // Reject '|' in reading — see the register-path comment
+        // above for rationale (Devin PR #7 [D6]).
+        if new_reading.contains('|') {
+            let _ = std::process::Command::new("zenity")
+                .args(["--error", "--title=Bonolith",
+                       "--text=よみに '|' を含めることはできません"])
+                .spawn();
             return;
         }
         if new_reading == old_reading && new_surface == old_surface {

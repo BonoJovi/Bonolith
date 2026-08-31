@@ -616,27 +616,49 @@ impl ConversionEngine {
                 .iter()
                 .all(|&b| b > 0 && b < kana_char_len)
                 && learned.windows(2).all(|w| w[0] < w[1]);
-            // Self-clean compares the learned layout against the
-            // heuristic-only DP output (LLM tiebreak stripped) so
-            // llama-server availability cannot silently forget a row
-            // during a session where the LLM happened to veto (bug [8]).
+            // Track three boundary layouts (Devin PR #7 [D3]):
+            //   - `chosen_boundaries`: what filter_segmentation actually
+            //     picked (may be base after an LLM veto).
+            //   - `heuristic_boundaries`: what the DP would output with
+            //     LLM off — deterministic w.r.t. llama-server state.
+            //   - `learned`: the user's saved preference.
+            //
+            // Override: apply learned whenever it differs from the
+            // chosen layout (the layout the user is about to see). The
+            // learned preference wins over both heuristic and LLM
+            // veto — [8]'s "heuristic_only != learned" gate silently
+            // ignored learned in the LLM-veto-agrees-with-learned
+            // case, so the user's preference was neither applied nor
+            // preserved (Devin [D3]).
+            //
+            // Self-clean: only when learned == chosen AND chosen ==
+            // heuristic_only. Both conditions together keep it (a)
+            // safe — learned is truly redundant, matches what would
+            // be picked with or without LLM — and (b) deterministic —
+            // the forget doesn't hinge on the LLM's per-session mood.
+            let chosen_boundaries = boundaries_of(&segment_states);
             let heuristic_boundaries = heuristic_only_segments
                 .iter()
                 .skip(1)
                 .map(|s| s.start)
                 .collect::<Vec<_>>();
-            if valid && heuristic_boundaries != learned {
+            if valid && learned != chosen_boundaries {
                 if let Some(rebuilt) = segments_from_boundaries(&kana, &learned, &dict) {
                     segment_states = self.build_segment_states(&rebuilt);
                     initial_from_learned = true;
                 }
-            } else if heuristic_boundaries == learned {
-                // Self-cleaning (bug [23]): the learned layout now matches
-                // what the DP segmenter would produce on its own —
-                // either the dictionary caught up, or the user resized
-                // back to the default and committed. The row would sit
-                // in the store forever, contributing to reload cost at
-                // engine start, so drop it now.
+            } else if learned == chosen_boundaries
+                && chosen_boundaries == heuristic_boundaries
+            {
+                // Self-cleaning (bug [23]): the learned layout now
+                // matches what the DP segmenter would produce on its
+                // own — the dictionary caught up, or the user resized
+                // back to the default and committed. Gated on
+                // heuristic-only agreement so the forget stays
+                // deterministic across llama-server up/down (bug [8]),
+                // AND on chosen agreement so a session where LLM
+                // pushed us to learned doesn't drop the row that made
+                // that outcome match (Devin [D3]).
                 let mut scorer = self
                     .shared
                     .user_scorer
@@ -1736,15 +1758,23 @@ impl ConversionEngine {
             if let Ok(llm) = self.shared.llm.try_lock() {
                 // Total wall-clock budget for the two blocking HTTP
                 // scoring calls. `http_scorer::SCORE_GLOBAL_TIMEOUT`
-                // caps each individual request at 1.5 s, so before this
-                // deadline the tiebreak could stack up to ~3 s on Space
-                // when llama-server was warm-but-slow (cold KV, GPU
-                // driver swap) — Space blocks the frontend main loop
-                // (bug [3] in Fable-5 review 2026-08-31). 400 ms keeps
-                // the happy path (~50-100 ms per call) intact while
-                // dropping the pathological case to one stalled call
-                // plus a skip, not two stalled calls.
-                let deadline = Instant::now() + Duration::from_millis(400);
+                // caps each individual request at 1.5 s, so before
+                // this deadline the tiebreak could stack up to ~3 s on
+                // Space when llama-server was warm-but-slow (cold KV,
+                // GPU driver swap) — Space blocks the frontend main
+                // loop (bug [3] in Fable-5 review 2026-08-31). 250 ms
+                // keeps the happy path (~50–100 ms per call) intact
+                // while dropping the pathological case to at most one
+                // stalled call plus a skip, not two stalled calls.
+                //
+                // This is a soft cap (Devin PR #7 [D4]): the per-call
+                // 1.5 s HTTP ceiling still applies to any request
+                // already in flight when the budget elapses, so the
+                // absolute worst case is ~1.5 s in the frontend key
+                // path (one stalled call, then skip). A hard cap
+                // requires plumbing the deadline into HttpLlamaScorer,
+                // which needs a trait signature change we defer here.
+                let deadline = Instant::now() + Duration::from_millis(250);
                 // Acquire two real scores or nothing — a partial reading
                 // would compare a real logprob against the neutral 0.5
                 // fallback and pick the wrong segmentation from a
@@ -1752,7 +1782,11 @@ impl ConversionEngine {
                 // so the acquire-score-check-score-check flow reads as
                 // a linear pipeline (Fable-5 bug_005).
                 let scores = (|| {
-                    if !llm.is_scorer_available() {
+                    // Guard against a caller that entered the tiebreak
+                    // late (e.g. a slow lock acquisition), so we skip
+                    // before ever sending the first request when there
+                    // is already no budget left (Devin PR #7 [D4]).
+                    if !llm.is_scorer_available() || Instant::now() >= deadline {
                         return None;
                     }
                     let base = Self::score_segmentation_llm(&alternatives[0], &llm);

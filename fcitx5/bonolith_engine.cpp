@@ -383,6 +383,14 @@ void BonolithEngine::runWordRegister() {
                    "--text=よみと単語の両方を入力してください"});
         return;
     }
+    // Reject '|' in reading: the IPC format is `reading|surface` on the
+    // first pipe, so a pipe in reading silently truncates the row
+    // (Devin PR #7 [D6]). Reading is hiragana; refuse rather than guess.
+    if (reading.find('|') != std::string::npos) {
+        runZenity({"--error", "--title=Bonolith",
+                   "--text=よみに '|' を含めることはできません"});
+        return;
+    }
 
     if (bonolith_dict_add_entry(reading.c_str(), surface.c_str())) {
         runZenity({"--info", "--title=Bonolith",
@@ -401,22 +409,49 @@ void BonolithEngine::runManageDict() {
         return;
     }
 
-    // Linux caps a single argv string (`sh -c "…"` here) at MAX_ARG_STRLEN
-    // = 128 KiB. Each user entry contributes roughly 60–80 bytes of
-    // quoted UTF-8 to the concatenated zenity command; at ~2000+ entries
-    // the whole cmd exceeds the cap and `popen` silently fails, so the
-    // menu becomes an unresponsive no-op with no visible error. Mirror
-    // the IBus side's MAX_DISPLAY cap so the dialog stays functional
-    // for large user dictionaries (bug [4] in Fable-5 review 2026-08-31).
+    // Linux caps a single argv string (`sh -c "…"` here) at
+    // MAX_ARG_STRLEN = 128 KiB. Each user entry contributes roughly
+    // 60–80 bytes of quoted UTF-8 to the concatenated zenity command;
+    // at ~2000+ entries the whole cmd exceeds the cap and `popen`
+    // silently fails, so the menu becomes an unresponsive no-op with
+    // no visible error. Mirror the IBus side's MAX_DISPLAY cap
+    // (bug [4] in Fable-5 review 2026-08-31) AND cut at a byte budget
+    // (Devin PR #7 [D5]): a single entry has no length limit, so 500
+    // entries can still overflow if the reading/surface strings are
+    // large — the byte budget bounds the actual shell string length.
     constexpr int MAX_DISPLAY = 500;
+    // Budget for the concatenated argv payload, well under
+    // MAX_ARG_STRLEN so the argv header, base zenity flags, and
+    // shell quoting overhead all fit comfortably.
+    constexpr size_t MAX_ARG_BYTES = 96 * 1024;
     int display_count = dict.count;
-    if (dict.count > MAX_DISPLAY) {
+    // First pass: bytes-only truncation. Each row adds the index
+    // literal + reading + surface + a fixed quoting overhead
+    // (~8 bytes per arg for the surrounding `''` and inter-arg
+    // padding runZenity adds). Track a conservative running total.
+    size_t running_bytes = 0;
+    int byte_truncate_at = dict.count;
+    for (int i = 0; i < dict.count; i++) {
+        constexpr size_t PER_ARG_OVERHEAD = 8;
+        size_t row_bytes =
+            std::to_string(i).size() + PER_ARG_OVERHEAD +
+            std::string(dict.entries[i].reading).size() + PER_ARG_OVERHEAD +
+            std::string(dict.entries[i].surface).size() + PER_ARG_OVERHEAD;
+        if (running_bytes + row_bytes > MAX_ARG_BYTES) {
+            byte_truncate_at = i;
+            break;
+        }
+        running_bytes += row_bytes;
+    }
+    // Take the tighter of the two caps.
+    int effective_cap = std::min(MAX_DISPLAY, byte_truncate_at);
+    if (effective_cap < dict.count) {
         runZenity({"--warning", "--title=Bonolith",
-                   "--text=ユーザー辞書のエントリが" + std::to_string(MAX_DISPLAY) +
-                   "件を超えています (" + std::to_string(dict.count) +
-                   " 件)。\n先頭 " + std::to_string(MAX_DISPLAY) +
+                   "--text=ユーザー辞書のエントリ量が表示上限を超えています ("
+                   + std::to_string(dict.count) + " 件)。\n先頭 "
+                   + std::to_string(effective_cap) +
                    " 件のみ表示します。\nエクスポートして内容を確認してください。"});
-        display_count = MAX_DISPLAY;
+        display_count = effective_cap;
     }
 
     // Step 1: Show list
@@ -517,6 +552,13 @@ void BonolithEngine::runManageDict() {
         std::string newReading = result.substr(0, sep);
         std::string newSurface = result.substr(sep + 1);
         if (newReading.empty() || newSurface.empty()) return;
+        // Reject '|' in reading — see the register-path comment above
+        // for rationale (Devin PR #7 [D6]).
+        if (newReading.find('|') != std::string::npos) {
+            runZenity({"--error", "--title=Bonolith",
+                       "--text=よみに '|' を含めることはできません"});
+            return;
+        }
         if (newReading == selReading && newSurface == selSurface) return;
 
         // Apply by (old_reading, old_surface) identity — same rationale
