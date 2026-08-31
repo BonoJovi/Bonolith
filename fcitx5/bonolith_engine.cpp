@@ -7,9 +7,17 @@
 #include <ctime>
 #include <thread>
 
+#include <errno.h>
+#include <fcntl.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <fcitx-utils/utf8.h>
 #include <fcitx/candidatelist.h>
 #include <fcitx/inputpanel.h>
+
+extern char **environ;
 
 namespace bonolith {
 
@@ -315,64 +323,152 @@ void BonolithEngine::reset(const fcitx::InputMethodEntry & /*entry*/,
 
 // ── Dictionary management (zenity dialogs) ─────────────────────────────
 
-/// Helper: shell-quote a value so it survives `popen`/shell expansion intact.
-static std::string shellQuote(const std::string &s) {
-    std::string out = "'";
-    for (char c : s) {
-        if (c == '\'') out += "'\\''";
-        else out += c;
-    }
-    out += "'";
-    return out;
-}
+/// Helper: spawn `path` with the given argv (path is argv[0] verbatim, plus
+/// each `extra_args` element), read its stdout, and return the stdout as a
+/// string with any trailing newline trimmed. Returns empty string on
+/// spawn failure or non-zero exit. `env_overrides` prepends `KEY=VALUE`
+/// pairs onto the child's environment (later duplicates on the same key
+/// are ignored per POSIX).
+///
+/// Uses posix_spawn + pipe instead of popen("sh -c …") so there is no
+/// shell in the loop: entries carrying any characters — apostrophes,
+/// backslashes, dollar signs — are delivered to the child as literal
+/// bytes in argv without expansion or quoting, and the concatenated
+/// command line's MAX_ARG_STRLEN limit no longer applies (each argv
+/// element is bounded independently). Fixes fcitx5 side of bug [4]
+/// (Fable-5 review 2026-08-31) and Devin PR #7 [R2-6]: the previous
+/// popen path burst the 128 KiB shell-arg cap once quoted, so entries
+/// with many apostrophes silently killed the dialog.
+static std::string runProcessCaptureStdout(
+    const std::string &path,
+    const std::vector<std::string> &extra_args,
+    const std::vector<std::string> &env_overrides = {})
+{
+    // O_CLOEXEC on both pipe fds is essential: fcitx5's dictionary
+    // menu actions run on detached threads, so two dialogs can be
+    // spawning concurrently. Without close-on-exec, the second
+    // spawn's child would inherit the first pipe's write end, and
+    // the first `read(pipefd[0])` never sees EOF even after the
+    // first zenity exits — the first thread stalls until the second
+    // dialog is dismissed. posix_spawn's file_actions closes the fd
+    // in the direct child, but the O_CLOEXEC flag is what keeps
+    // unrelated concurrent spawns from picking it up (Devin PR #7
+    // [R3-9]). posix_spawn_file_actions_adddup2 clears CLOEXEC on
+    // the duplicated stdout fd, so the child's stdout still works.
+    int pipefd[2];
+    if (pipe2(pipefd, O_CLOEXEC) != 0) return "";
 
-/// Helper: run a command and capture stdout. Returns empty string on failure.
-static std::string runZenity(const std::vector<std::string> &args) {
-    std::string cmd = "zenity";
-    for (auto &a : args) {
-        cmd += " '";
-        // Simple quoting — replace ' with '\'' inside the argument
-        std::string escaped = a;
-        size_t pos = 0;
-        while ((pos = escaped.find('\'', pos)) != std::string::npos) {
-            escaped.replace(pos, 1, "'\\''");
-            pos += 4;
+    // Build argv: [path, extra_args..., NULL]. Each entry is passed as a
+    // literal byte string; the child sees exactly what we put here, with
+    // no quoting, splitting, or word expansion.
+    std::vector<char *> argv;
+    argv.reserve(extra_args.size() + 2);
+    argv.push_back(const_cast<char *>(path.c_str()));
+    for (const auto &a : extra_args) {
+        argv.push_back(const_cast<char *>(a.c_str()));
+    }
+    argv.push_back(nullptr);
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addclose(&actions, pipefd[0]);
+    posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addclose(&actions, pipefd[1]);
+
+    // Build envp: env_overrides first (so posix_spawn's search stops at
+    // the override), then the parent env passthrough.
+    std::vector<char *> envp;
+    if (!env_overrides.empty()) {
+        envp.reserve(env_overrides.size() + 1);
+        for (const auto &e : env_overrides) {
+            envp.push_back(const_cast<char *>(e.c_str()));
         }
-        cmd += escaped;
-        cmd += "'";
+        for (char **p = environ; *p; ++p) envp.push_back(*p);
+        envp.push_back(nullptr);
     }
-    FILE *fp = popen(cmd.c_str(), "r");
-    if (!fp) return "";
+    char **child_env = env_overrides.empty() ? environ : envp.data();
+
+    pid_t pid = 0;
+    int rc = posix_spawnp(&pid, path.c_str(), &actions, nullptr,
+                          argv.data(), child_env);
+    posix_spawn_file_actions_destroy(&actions);
+    close(pipefd[1]);
+
+    if (rc != 0) {
+        close(pipefd[0]);
+        return "";
+    }
+
     std::string result;
-    char buf[256];
-    while (fgets(buf, sizeof(buf), fp)) {
-        result += buf;
+    char buf[512];
+    for (;;) {
+        ssize_t n = read(pipefd[0], buf, sizeof(buf));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) break;
+        result.append(buf, n);
     }
-    int status = pclose(fp);
-    if (status != 0) return "";
-    // Trim trailing newline
+    close(pipefd[0]);
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) break;
+    }
+    // Non-zero exit (including "user cancelled" from zenity) collapses
+    // to an empty result — callers use empty-string as their cancel /
+    // failure signal.
+    bool ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (!ok) return "";
+
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
         result.pop_back();
     return result;
 }
 
+/// Helper: run zenity with `args`. See runProcessCaptureStdout for the
+/// shell-free spawn contract.
+static std::string runZenity(const std::vector<std::string> &args) {
+    return runProcessCaptureStdout("zenity", args);
+}
+
+/// Helper: run a command and return true on exit-0. Used for the
+/// delete-confirmation path where we want the boolean, not the stdout.
+static bool runProcessCheckExit(
+    const std::string &path,
+    const std::vector<std::string> &extra_args)
+{
+    std::vector<char *> argv;
+    argv.reserve(extra_args.size() + 2);
+    argv.push_back(const_cast<char *>(path.c_str()));
+    for (const auto &a : extra_args) {
+        argv.push_back(const_cast<char *>(a.c_str()));
+    }
+    argv.push_back(nullptr);
+
+    pid_t pid = 0;
+    int rc = posix_spawnp(&pid, path.c_str(), nullptr, nullptr,
+                          argv.data(), environ);
+    if (rc != 0) return false;
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) break;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
 void BonolithEngine::runWordRegister() {
     // Custom GTK dialog that re-activates Fcitx5 on every entry focus-in,
     // so 単語 stays 日本語ON even after Tab. Output: "<reading>|<surface>".
-    FILE *fp = popen("GDK_BACKEND=x11 /usr/bin/python3 "
-                     "/usr/share/bonolith/scripts/bonolith_word_register.py "
-                     "fcitx5",
-                     "r");
-    if (!fp) return;
-    std::string result;
-    char buf[256];
-    while (fgets(buf, sizeof(buf), fp)) {
-        result += buf;
-    }
-    int status = pclose(fp);
-    while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
-        result.pop_back();
-    if (status != 0 || result.empty()) return;
+    // GDK_BACKEND=x11 forces XWayland on Wayland sessions so the D-Bus
+    // activate can reach fcitx5-remote.
+    std::string result = runProcessCaptureStdout(
+        "/usr/bin/python3",
+        {"/usr/share/bonolith/scripts/bonolith_word_register.py", "fcitx5"},
+        {"GDK_BACKEND=x11"});
+    if (result.empty()) return;
 
     auto sep = result.find('|');
     if (sep == std::string::npos) return;
@@ -381,6 +477,14 @@ void BonolithEngine::runWordRegister() {
     if (reading.empty() || surface.empty()) {
         runZenity({"--error", "--title=Bonolith",
                    "--text=よみと単語の両方を入力してください"});
+        return;
+    }
+    // Reject '|' in reading: the IPC format is `reading|surface` on the
+    // first pipe, so a pipe in reading silently truncates the row
+    // (Devin PR #7 [D6]). Reading is hiragana; refuse rather than guess.
+    if (reading.find('|') != std::string::npos) {
+        runZenity({"--error", "--title=Bonolith",
+                   "--text=よみに '|' を含めることはできません"});
         return;
     }
 
@@ -401,6 +505,27 @@ void BonolithEngine::runManageDict() {
         return;
     }
 
+    // Runtime cap on how many rows to render in one zenity list.
+    // With runZenity now going through posix_spawn + pipe (no shell),
+    // each argv element is bounded independently by ARG_MAX and the
+    // combined-string MAX_ARG_STRLEN cap does not apply — a large user
+    // dictionary no longer silently kills the dialog (bug [4] in
+    // Fable-5 review 2026-08-31, and Devin PR #7 [R2-6] closed the
+    // shell-quoting escape hatch [D5] tried to bound with a byte
+    // budget). MAX_DISPLAY is kept as a UX guard so the list stays
+    // legible; export/import cover the rest.
+    constexpr int MAX_DISPLAY = 500;
+    int display_count = dict.count;
+    if (dict.count > MAX_DISPLAY) {
+        runZenity({"--warning", "--title=Bonolith",
+                   "--text=ユーザー辞書のエントリ数が" +
+                   std::to_string(MAX_DISPLAY) + "件を超えています ("
+                   + std::to_string(dict.count) + " 件)。\n先頭 "
+                   + std::to_string(MAX_DISPLAY) +
+                   " 件のみ表示します。\nエクスポートして内容を確認してください。"});
+        display_count = MAX_DISPLAY;
+    }
+
     // Step 1: Show list
     std::vector<std::string> args = {
         "--list",
@@ -413,7 +538,7 @@ void BonolithEngine::runManageDict() {
         "--width=500",
         "--height=400",
     };
-    for (int i = 0; i < dict.count; i++) {
+    for (int i = 0; i < display_count; i++) {
         args.push_back(std::to_string(i));
         args.push_back(dict.entries[i].reading);
         args.push_back(dict.entries[i].surface);
@@ -425,8 +550,15 @@ void BonolithEngine::runManageDict() {
         return;
     }
 
-    int idx = std::atoi(selected.c_str());
-    if (idx < 0 || idx >= dict.count) {
+    // zenity emits "N|N" when the user double-clicks a row (see the
+    // IBus side's parse for the same case, bug [7]); take the first
+    // pipe-delimited field so both single-click ("3") and double-click
+    // ("3|3") gestures parse to the same index.
+    auto pipe = selected.find('|');
+    std::string idx_str =
+        (pipe == std::string::npos) ? selected : selected.substr(0, pipe);
+    int idx = std::atoi(idx_str.c_str());
+    if (idx < 0 || idx >= display_count) {
         bonolith_dict_free_entries(dict);
         return;
     }
@@ -446,17 +578,16 @@ void BonolithEngine::runManageDict() {
     });
 
     if (action == "削除") {
-        // zenity --question returns exit code 0 for OK, non-0 for cancel.
-        // Use system() since runZenity() treats non-zero exit as failure (empty string).
-        // shellQuote the --text arg so a registered word containing '
-        // (English contractions like "it's") does not break the quoting —
-        // an unquoted ' used to make zenity fail with non-zero exit, which
-        // system() then read as "user cancelled" so the delete silently
-        // no-op'd. A malicious registered word could also inject shell
-        // commands the fcitx5 process would then execute.
+        // zenity --question returns exit code 0 for OK, non-0 for
+        // cancel. Go through runProcessCheckExit — same shell-free
+        // spawn as the rest, so an apostrophe in the confirmation
+        // text no longer breaks the dialog and there is nothing to
+        // shell-inject through a hostile registered word.
         std::string textArg = "--text=「" + selReading + "」→「" + selSurface + "」を削除しますか？";
-        std::string cmd = "zenity --question '--title=Bonolith: 削除の確認' " + shellQuote(textArg);
-        if (system(cmd.c_str()) == 0) {
+        if (runProcessCheckExit("zenity",
+                                {"--question",
+                                 "--title=Bonolith: 削除の確認",
+                                 textArg})) {
             // Apply by (reading, surface) identity captured above rather
             // than the display-time index: another dialog / process may
             // have added or reordered entries between showing the list
@@ -468,30 +599,30 @@ void BonolithEngine::runManageDict() {
             }
         }
     } else if (action == "編集") {
-        // Reuse the GTK register dialog in edit mode (prefilled). GDK_BACKEND=x11
-        // forces XWayland on Wayland sessions so xdotool key delivery works.
-        std::string cmd = "GDK_BACKEND=x11 /usr/bin/python3 "
-                          "/usr/share/bonolith/scripts/bonolith_word_register.py "
-                          "fcitx5 --mode edit "
-                          "--reading " + shellQuote(selReading) + " "
-                          "--surface " + shellQuote(selSurface);
-        FILE *fp = popen(cmd.c_str(), "r");
-        if (!fp) return;
-        std::string result;
-        char buf[256];
-        while (fgets(buf, sizeof(buf), fp)) {
-            result += buf;
-        }
-        int status = pclose(fp);
-        while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
-            result.pop_back();
-        if (status != 0 || result.empty()) return;
+        // Reuse the GTK register dialog in edit mode (prefilled).
+        // GDK_BACKEND=x11 forces XWayland on Wayland so the D-Bus
+        // activate reaches fcitx5-remote.
+        std::string result = runProcessCaptureStdout(
+            "/usr/bin/python3",
+            {"/usr/share/bonolith/scripts/bonolith_word_register.py",
+             "fcitx5", "--mode", "edit",
+             "--reading", selReading,
+             "--surface", selSurface},
+            {"GDK_BACKEND=x11"});
+        if (result.empty()) return;
 
         auto sep = result.find('|');
         if (sep == std::string::npos) return;
         std::string newReading = result.substr(0, sep);
         std::string newSurface = result.substr(sep + 1);
         if (newReading.empty() || newSurface.empty()) return;
+        // Reject '|' in reading — see the register-path comment above
+        // for rationale (Devin PR #7 [D6]).
+        if (newReading.find('|') != std::string::npos) {
+            runZenity({"--error", "--title=Bonolith",
+                       "--text=よみに '|' を含めることはできません"});
+            return;
+        }
         if (newReading == selReading && newSurface == selSurface) return;
 
         // Apply by (old_reading, old_surface) identity — same rationale
@@ -541,14 +672,15 @@ void BonolithEngine::runImportDict() {
 
 void BonolithEngine::runClearLearning() {
     // zenity --question returns exit code 0 for OK, non-0 for cancel.
-    // runZenity() treats non-zero exit as failure (empty stdout), so use system() here.
-    std::string cmd = "zenity --question "
-                      "'--title=Bonolith 学習履歴クリア' "
-                      "'--text=変換の学習履歴をすべて消去します。\n"
-                      "この操作は元に戻せません。よろしいですか？' "
-                      "'--ok-label=クリア' "
-                      "'--cancel-label=キャンセル'";
-    if (system(cmd.c_str()) != 0) {
+    // runProcessCheckExit is the shell-free equivalent of the old
+    // system() call (Devin PR #7 [R2-6]).
+    if (!runProcessCheckExit("zenity",
+                             {"--question",
+                              "--title=Bonolith 学習履歴クリア",
+                              "--text=変換の学習履歴をすべて消去します。\n"
+                              "この操作は元に戻せません。よろしいですか？",
+                              "--ok-label=クリア",
+                              "--cancel-label=キャンセル"})) {
         return;
     }
 

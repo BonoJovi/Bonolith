@@ -319,11 +319,44 @@ impl Dictionary {
     /// this does NOT replace the whole `user_entries` table, so rows
     /// the other frontend added since our startup are preserved
     /// (Devin PR #3 #2).
+    ///
+    /// When an entry with the same (reading, surface) is already in
+    /// memory, the DB upsert still runs so frequency/POS on the row is
+    /// refreshed, but the in-memory `entries` vec is NOT re-appended.
+    /// The prior unconditional append made re-registering the same
+    /// word show up twice in the dictionary-manager list until the
+    /// daemon restarted (SQLite deduped, memory didn't — bug [6] in
+    /// Fable-5 review 2026-08-31).
     pub fn add_user_entry_and_persist(&mut self, entry: DictionaryEntry) -> io::Result<()> {
         if let Some(store) = self.store.as_ref() {
             store.upsert_user_entry(&entry)?;
         }
-        self.add_entry(entry);
+        // Upsert into memory: append if new, else overwrite pos and
+        // frequency on the existing row so memory stays in sync with
+        // the DB (Devin PR #7 [D1]). Using `has_entry` here would
+        // conflate a builtin collision with a user duplicate, silently
+        // leaving the user without their own row for a word that
+        // happens to share identity with a builtin — so gate on the
+        // user portion only via `has_user_entry`. Trie posting-list
+        // order tracks entry.frequency, so a frequency change also
+        // needs a per-node resort or the ranking stays at the old value.
+        let existing_idx = self.entries[self.user_start..]
+            .iter()
+            .position(|e| e.reading == entry.reading && e.surface == entry.surface)
+            .map(|p| self.user_start + p);
+        match existing_idx {
+            Some(idx) => {
+                let freq_changed = self.entries[idx].frequency != entry.frequency;
+                let reading = self.entries[idx].reading.clone();
+                self.entries[idx].pos = entry.pos;
+                self.entries[idx].frequency = entry.frequency;
+                if freq_changed && self.sorted {
+                    let entries = &self.entries;
+                    self.trie.resort_node(&reading, |i| entries[i].frequency);
+                }
+            }
+            None => self.add_entry(entry),
+        }
         Ok(())
     }
 
@@ -394,13 +427,34 @@ impl Dictionary {
         if let Some(store) = self.store.as_ref() {
             store.update_user_entry_by_identity(old_reading, old_surface, &new_entry)?;
         }
-        // Memory rebuild.
-        let kept: Vec<DictionaryEntry> = self.entries[self.user_start..]
+        // Memory rebuild. Drop the old row, then reconcile against
+        // any pre-existing row that already holds the new identity:
+        //   - none present → append the new row.
+        //   - present → overwrite pos/frequency on the pre-existing
+        //     kept row with new_entry's values. `store.update_...`
+        //     performed a DELETE-old + UPSERT-new, so the DB row is
+        //     already at new_entry's metadata; silently dropping
+        //     new_entry here would leave memory with the pre-existing
+        //     kept row's stale pos/frequency (Devin PR #7 [D2]).
+        // Prevents the two copies of the new identity the earlier fix
+        // targeted, while keeping memory and SQLite in agreement on
+        // metadata (bug [6] in Fable-5 review 2026-08-31 + [D2] on
+        // top).
+        let mut kept: Vec<DictionaryEntry> = self.entries[self.user_start..]
             .iter()
             .filter(|e| !(e.reading == old_reading && e.surface == old_surface))
             .cloned()
-            .chain(std::iter::once(new_entry))
             .collect();
+        let existing = kept.iter_mut().find(|e| {
+            e.reading == new_entry.reading && e.surface == new_entry.surface
+        });
+        match existing {
+            Some(row) => {
+                row.pos = new_entry.pos;
+                row.frequency = new_entry.frequency;
+            }
+            None => kept.push(new_entry),
+        }
         self.replace_user_entries(kept);
         Ok(true)
     }
@@ -2463,6 +2517,25 @@ fn strip_trailing_commas(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Build a per-invocation temp directory keyed off the PID and a
+    /// nanosecond-precision timestamp so parallel test processes never
+    /// share the same path. Devin PR #7 [R3-11] flagged that fixed
+    /// `bonolith_test_*` paths raced when two `cargo test` invocations
+    /// ran the same binary concurrently.
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "{}_{}_{}",
+            prefix,
+            std::process::id(),
+            stamp
+        ))
+    }
+
     #[test]
     fn builtin_dictionary_loads() {
         let dict = Dictionary::new();
@@ -4118,7 +4191,7 @@ mod tests {
     #[test]
     fn row_level_persist_preserves_concurrent_frontend_entries() {
         use crate::core::store::DictStore;
-        let dir = std::env::temp_dir().join("bonolith_test_row_level_persist");
+        let dir = unique_temp_dir("bonolith_test_row_level_persist");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("dict.sqlite");
@@ -4169,7 +4242,7 @@ mod tests {
     #[test]
     fn update_persist_preserves_concurrent_frontend_entries() {
         use crate::core::store::DictStore;
-        let dir = std::env::temp_dir().join("bonolith_test_update_persist");
+        let dir = unique_temp_dir("bonolith_test_update_persist");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("dict.sqlite");
@@ -4211,6 +4284,191 @@ mod tests {
         assert!(!readings.contains(&"old"), "old row survived: {loaded:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (bug [6] in Fable-5 review 2026-08-31):
+    /// re-registering an identical (reading, surface) via
+    /// `add_user_entry_and_persist` must not create an in-memory
+    /// duplicate row. SQLite dedupes via upsert; the prior code
+    /// unconditionally appended to the memory Vec, so the dictionary
+    /// manager listed the same word twice until daemon restart.
+    #[test]
+    fn re_add_same_user_entry_does_not_duplicate_in_memory() {
+        let mut dict = Dictionary::new();
+        let entry = DictionaryEntry {
+            reading: "てすと".to_string(),
+            surface: "テスト".to_string(),
+            pos: PartOfSpeech::Noun,
+            frequency: 8000,
+        };
+        dict.add_user_entry_and_persist(entry.clone()).unwrap();
+        dict.add_user_entry_and_persist(entry.clone()).unwrap();
+
+        let matches = dict
+            .user_entries()
+            .iter()
+            .filter(|e| e.reading == "てすと" && e.surface == "テスト")
+            .count();
+        assert_eq!(
+            matches, 1,
+            "re-register must upsert in memory too, got {matches} copies of the same row",
+        );
+    }
+
+    /// Regression (Devin PR #7 [D1] + [D7]): re-registering the same
+    /// (reading, surface) with a DIFFERENT pos or frequency must
+    /// bring memory in line with what SQLite upsert wrote, not keep
+    /// the pre-existing stale row. Verifies memory and store agree
+    /// after the second register, and that a fresh reload of the
+    /// store returns the same metadata memory reports.
+    #[test]
+    fn re_add_user_entry_upserts_metadata_in_memory_and_store() {
+        use crate::core::store::DictStore;
+        let dir = unique_temp_dir("bonolith_test_re_add_upsert_metadata");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("dict.sqlite");
+        let store = Arc::new(DictStore::open(&db_path).unwrap());
+
+        let mut dict = Dictionary::new();
+        dict.attach_store(store.clone());
+        dict.add_user_entry_and_persist(DictionaryEntry {
+            reading: "zzz-reading".to_string(),
+            surface: "ZZZ".to_string(),
+            pos: PartOfSpeech::Noun,
+            frequency: 3000,
+        })
+        .unwrap();
+        // Re-register with a different pos AND frequency.
+        dict.add_user_entry_and_persist(DictionaryEntry {
+            reading: "zzz-reading".to_string(),
+            surface: "ZZZ".to_string(),
+            pos: PartOfSpeech::Verb,
+            frequency: 9500,
+        })
+        .unwrap();
+
+        let mem_matches: Vec<&DictionaryEntry> = dict
+            .user_entries()
+            .iter()
+            .filter(|e| e.reading == "zzz-reading" && e.surface == "ZZZ")
+            .collect();
+        assert_eq!(mem_matches.len(), 1, "memory must dedupe re-register");
+        assert_eq!(mem_matches[0].pos, PartOfSpeech::Verb);
+        assert_eq!(mem_matches[0].frequency, 9500);
+
+        // Fresh reload from SQLite must return the new metadata too.
+        let loaded = store.load_user_entries().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].reading, "zzz-reading");
+        assert_eq!(loaded[0].surface, "ZZZ");
+        assert_eq!(loaded[0].pos, PartOfSpeech::Verb);
+        assert_eq!(loaded[0].frequency, 9500);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (Devin PR #7 [D2] + [D7]): editing a row so its
+    /// new identity collides with a pre-existing row must adopt the
+    /// new_entry's pos and frequency (matching what SQLite's UPSERT
+    /// writes), not silently keep the pre-existing row's stale
+    /// metadata. Verifies memory-vs-store parity across the edit.
+    #[test]
+    fn update_user_entry_to_collision_adopts_new_metadata() {
+        use crate::core::store::DictStore;
+        let dir = unique_temp_dir("bonolith_test_update_collision_adopts");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("dict.sqlite");
+        let store = Arc::new(DictStore::open(&db_path).unwrap());
+
+        let mut dict = Dictionary::new();
+        dict.attach_store(store.clone());
+        // Row A (Noun, freq 4000) will be renamed onto row B's identity.
+        dict.add_user_entry_and_persist(DictionaryEntry {
+            reading: "aa-reading".to_string(),
+            surface: "AA".to_string(),
+            pos: PartOfSpeech::Noun,
+            frequency: 4000,
+        })
+        .unwrap();
+        // Row B (Verb, freq 5000) — will be collided into by the edit.
+        dict.add_user_entry_and_persist(DictionaryEntry {
+            reading: "bb-reading".to_string(),
+            surface: "BB".to_string(),
+            pos: PartOfSpeech::Verb,
+            frequency: 5000,
+        })
+        .unwrap();
+
+        // Rename row A onto (bb-reading, BB). update_user_entry_by_identity
+        // carries A's pos/freq into new_entry.
+        let updated = dict
+            .update_user_entry_and_persist("aa-reading", "AA", "bb-reading", "BB")
+            .unwrap();
+        assert!(updated);
+
+        let mem_matches: Vec<&DictionaryEntry> = dict
+            .user_entries()
+            .iter()
+            .filter(|e| e.reading == "bb-reading" && e.surface == "BB")
+            .collect();
+        assert_eq!(mem_matches.len(), 1, "collision must not duplicate memory");
+        // new_entry's metadata (from row A: Noun / 4000) wins in both
+        // memory and store — that's the SQLite upsert semantics.
+        assert_eq!(mem_matches[0].pos, PartOfSpeech::Noun);
+        assert_eq!(mem_matches[0].frequency, 4000);
+
+        let loaded = store.load_user_entries().unwrap();
+        let bb: Vec<&DictionaryEntry> = loaded
+            .iter()
+            .filter(|e| e.reading == "bb-reading" && e.surface == "BB")
+            .collect();
+        assert_eq!(bb.len(), 1);
+        assert_eq!(bb[0].pos, PartOfSpeech::Noun);
+        assert_eq!(bb[0].frequency, 4000);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (bug [6] continued): editing a row so its new
+    /// identity collides with a pre-existing row must not leave two
+    /// memory copies of the new identity. `replace_user_entries`
+    /// filters the old row out, then the new row is appended only if
+    /// nothing else already carries the same identity.
+    #[test]
+    fn edit_to_existing_identity_does_not_duplicate_in_memory() {
+        let mut dict = Dictionary::new();
+        dict.add_user_entry_and_persist(DictionaryEntry {
+            reading: "あ".to_string(),
+            surface: "A".to_string(),
+            pos: PartOfSpeech::Noun,
+            frequency: 8000,
+        })
+        .unwrap();
+        dict.add_user_entry_and_persist(DictionaryEntry {
+            reading: "い".to_string(),
+            surface: "I".to_string(),
+            pos: PartOfSpeech::Noun,
+            frequency: 8000,
+        })
+        .unwrap();
+
+        // Rename "あ→A" onto the pre-existing (い, I) identity.
+        let updated = dict
+            .update_user_entry_and_persist("あ", "A", "い", "I")
+            .unwrap();
+        assert!(updated);
+
+        let matches = dict
+            .user_entries()
+            .iter()
+            .filter(|e| e.reading == "い" && e.surface == "I")
+            .count();
+        assert_eq!(
+            matches, 1,
+            "edit onto an existing identity must not create a memory duplicate",
+        );
     }
 }
 
