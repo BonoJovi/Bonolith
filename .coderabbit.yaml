@@ -107,9 +107,12 @@ reviews:
     drafts: false
     auto_incremental_review: true
     auto_pause_after_reviewed_commits: 0
+    # `ignore_title_keywords` uses case-insensitive SUBSTRING match,
+    # so bare `wip` matches `feat: add swipe gesture`. Use bracketed
+    # / punctuated forms only.
     ignore_title_keywords:
-      - "wip"
-      - "WIP"
+      - "[wip]"
+      - "wip:"
       - "[skip review]"
     base_branches:
       - "main"
