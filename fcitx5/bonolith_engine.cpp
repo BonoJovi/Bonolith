@@ -401,6 +401,24 @@ void BonolithEngine::runManageDict() {
         return;
     }
 
+    // Linux caps a single argv string (`sh -c "…"` here) at MAX_ARG_STRLEN
+    // = 128 KiB. Each user entry contributes roughly 60–80 bytes of
+    // quoted UTF-8 to the concatenated zenity command; at ~2000+ entries
+    // the whole cmd exceeds the cap and `popen` silently fails, so the
+    // menu becomes an unresponsive no-op with no visible error. Mirror
+    // the IBus side's MAX_DISPLAY cap so the dialog stays functional
+    // for large user dictionaries (bug [4] in Fable-5 review 2026-08-31).
+    constexpr int MAX_DISPLAY = 500;
+    int display_count = dict.count;
+    if (dict.count > MAX_DISPLAY) {
+        runZenity({"--warning", "--title=Bonolith",
+                   "--text=ユーザー辞書のエントリが" + std::to_string(MAX_DISPLAY) +
+                   "件を超えています (" + std::to_string(dict.count) +
+                   " 件)。\n先頭 " + std::to_string(MAX_DISPLAY) +
+                   " 件のみ表示します。\nエクスポートして内容を確認してください。"});
+        display_count = MAX_DISPLAY;
+    }
+
     // Step 1: Show list
     std::vector<std::string> args = {
         "--list",
@@ -413,7 +431,7 @@ void BonolithEngine::runManageDict() {
         "--width=500",
         "--height=400",
     };
-    for (int i = 0; i < dict.count; i++) {
+    for (int i = 0; i < display_count; i++) {
         args.push_back(std::to_string(i));
         args.push_back(dict.entries[i].reading);
         args.push_back(dict.entries[i].surface);
@@ -425,8 +443,15 @@ void BonolithEngine::runManageDict() {
         return;
     }
 
-    int idx = std::atoi(selected.c_str());
-    if (idx < 0 || idx >= dict.count) {
+    // zenity emits "N|N" when the user double-clicks a row (see the
+    // IBus side's parse for the same case, bug [7]); take the first
+    // pipe-delimited field so both single-click ("3") and double-click
+    // ("3|3") gestures parse to the same index.
+    auto pipe = selected.find('|');
+    std::string idx_str =
+        (pipe == std::string::npos) ? selected : selected.substr(0, pipe);
+    int idx = std::atoi(idx_str.c_str());
+    if (idx < 0 || idx >= display_count) {
         bonolith_dict_free_entries(dict);
         return;
     }

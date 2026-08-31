@@ -1084,12 +1084,17 @@ impl BonolithEngine {
         match output {
             Ok(out) if out.status.success() => {
                 let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                let parts: Vec<&str> = text.split('|').collect();
-                if parts.len() < 2 {
-                    return;
-                }
-                let reading = parts[0].trim();
-                let surface = parts[1].trim();
+                // Split on the FIRST '|' only so a surface carrying a
+                // literal '|' (e.g. "a|b") is preserved verbatim. The
+                // prior `split('|').collect()[1]` dropped everything
+                // past the second pipe, silently truncating "a|b" to
+                // "a" on the IBus side while Fcitx5 (which does
+                // `find('|') + substr`) kept it — the two frontends
+                // then diverged on the same user input. Bug [5] in
+                // Fable-5 review 2026-08-31.
+                let Some(sep) = text.find('|') else { return; };
+                let reading = text[..sep].trim();
+                let surface = text[sep + 1..].trim();
                 if reading.is_empty() || surface.is_empty() {
                     let _ = std::process::Command::new("zenity")
                         .args(["--error", "--title=Bonolith",
@@ -1224,7 +1229,14 @@ impl BonolithEngine {
         let idx: usize = match output {
             Ok(out) if out.status.success() => {
                 let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                match stdout.parse() {
+                // zenity --list emits the selected value twice, pipe-joined
+                // ("3|3"), when the user double-clicks a row — the most
+                // natural gesture for picking from a list. Taking the
+                // first pipe-delimited field keeps the single-click
+                // ("3") case working while surviving the double-click
+                // one (bug [7] in Fable-5 review 2026-08-31).
+                let first = stdout.split('|').next().unwrap_or("");
+                match first.parse() {
                     Ok(i) if i < user_entries.len() => i,
                     _ => return,
                 }
@@ -1317,12 +1329,11 @@ impl BonolithEngine {
             _ => return,
         };
         let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let parts: Vec<&str> = text.split('|').collect();
-        if parts.len() < 2 {
-            return;
-        }
-        let new_reading = parts[0].trim();
-        let new_surface = parts[1].trim();
+        // First '|' only — see the register-path comment above for
+        // rationale (bug [5]).
+        let Some(sep) = text.find('|') else { return; };
+        let new_reading = text[..sep].trim();
+        let new_surface = text[sep + 1..].trim();
         if new_reading.is_empty() || new_surface.is_empty() {
             return;
         }

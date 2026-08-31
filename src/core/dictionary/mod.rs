@@ -319,11 +319,27 @@ impl Dictionary {
     /// this does NOT replace the whole `user_entries` table, so rows
     /// the other frontend added since our startup are preserved
     /// (Devin PR #3 #2).
+    ///
+    /// When an entry with the same (reading, surface) is already in
+    /// memory, the DB upsert still runs so frequency/POS on the row is
+    /// refreshed, but the in-memory `entries` vec is NOT re-appended.
+    /// The prior unconditional append made re-registering the same
+    /// word show up twice in the dictionary-manager list until the
+    /// daemon restarted (SQLite deduped, memory didn't — bug [6] in
+    /// Fable-5 review 2026-08-31).
     pub fn add_user_entry_and_persist(&mut self, entry: DictionaryEntry) -> io::Result<()> {
         if let Some(store) = self.store.as_ref() {
             store.upsert_user_entry(&entry)?;
         }
-        self.add_entry(entry);
+        // Only skip the memory add when the same identity is already in
+        // the USER portion — a builtin collision is not a duplicate
+        // (the user still gets their own row). `has_entry` would look
+        // at both layers and refuse the add, silently leaving the user
+        // with no user_entries row for a word that happens to share
+        // identity with a builtin entry.
+        if !self.has_user_entry(&entry.reading, &entry.surface) {
+            self.add_entry(entry);
+        }
         Ok(())
     }
 
@@ -394,13 +410,23 @@ impl Dictionary {
         if let Some(store) = self.store.as_ref() {
             store.update_user_entry_by_identity(old_reading, old_surface, &new_entry)?;
         }
-        // Memory rebuild.
-        let kept: Vec<DictionaryEntry> = self.entries[self.user_start..]
+        // Memory rebuild. Drop the old row, then append the new one
+        // only when its identity is not already carried by another
+        // kept row — otherwise re-targeting an edit onto a pre-existing
+        // (reading, surface) leaves memory holding two copies of the
+        // new identity even though SQLite (upsert) has exactly one
+        // (bug [6] in Fable-5 review 2026-08-31).
+        let mut kept: Vec<DictionaryEntry> = self.entries[self.user_start..]
             .iter()
             .filter(|e| !(e.reading == old_reading && e.surface == old_surface))
             .cloned()
-            .chain(std::iter::once(new_entry))
             .collect();
+        let already_present = kept.iter().any(|e| {
+            e.reading == new_entry.reading && e.surface == new_entry.surface
+        });
+        if !already_present {
+            kept.push(new_entry);
+        }
         self.replace_user_entries(kept);
         Ok(true)
     }
@@ -1595,6 +1621,17 @@ impl Dictionary {
     /// Check if an entry with the given reading and surface already exists.
     fn has_entry(&self, reading: &str, surface: &str) -> bool {
         self.lookup(reading).iter().any(|e| e.surface == surface)
+    }
+
+    /// Check whether the user portion (not builtin) already contains a row
+    /// with this exact (reading, surface). Used by add/update paths where
+    /// the concern is "would a second insert make memory diverge from
+    /// SQLite's upsert semantics" — a builtin collision is not a duplicate
+    /// because it doesn't add a second user row.
+    fn has_user_entry(&self, reading: &str, surface: &str) -> bool {
+        self.entries[self.user_start..]
+            .iter()
+            .any(|e| e.reading == reading && e.surface == surface)
     }
 
     fn load_builtin(&mut self) {
@@ -4211,6 +4248,75 @@ mod tests {
         assert!(!readings.contains(&"old"), "old row survived: {loaded:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (bug [6] in Fable-5 review 2026-08-31):
+    /// re-registering an identical (reading, surface) via
+    /// `add_user_entry_and_persist` must not create an in-memory
+    /// duplicate row. SQLite dedupes via upsert; the prior code
+    /// unconditionally appended to the memory Vec, so the dictionary
+    /// manager listed the same word twice until daemon restart.
+    #[test]
+    fn re_add_same_user_entry_does_not_duplicate_in_memory() {
+        let mut dict = Dictionary::new();
+        let entry = DictionaryEntry {
+            reading: "てすと".to_string(),
+            surface: "テスト".to_string(),
+            pos: PartOfSpeech::Noun,
+            frequency: 8000,
+        };
+        dict.add_user_entry_and_persist(entry.clone()).unwrap();
+        dict.add_user_entry_and_persist(entry.clone()).unwrap();
+
+        let matches = dict
+            .user_entries()
+            .iter()
+            .filter(|e| e.reading == "てすと" && e.surface == "テスト")
+            .count();
+        assert_eq!(
+            matches, 1,
+            "re-register must upsert in memory too, got {matches} copies of the same row",
+        );
+    }
+
+    /// Regression (bug [6] continued): editing a row so its new
+    /// identity collides with a pre-existing row must not leave two
+    /// memory copies of the new identity. `replace_user_entries`
+    /// filters the old row out, then the new row is appended only if
+    /// nothing else already carries the same identity.
+    #[test]
+    fn edit_to_existing_identity_does_not_duplicate_in_memory() {
+        let mut dict = Dictionary::new();
+        dict.add_user_entry_and_persist(DictionaryEntry {
+            reading: "あ".to_string(),
+            surface: "A".to_string(),
+            pos: PartOfSpeech::Noun,
+            frequency: 8000,
+        })
+        .unwrap();
+        dict.add_user_entry_and_persist(DictionaryEntry {
+            reading: "い".to_string(),
+            surface: "I".to_string(),
+            pos: PartOfSpeech::Noun,
+            frequency: 8000,
+        })
+        .unwrap();
+
+        // Rename "あ→A" onto the pre-existing (い, I) identity.
+        let updated = dict
+            .update_user_entry_and_persist("あ", "A", "い", "I")
+            .unwrap();
+        assert!(updated);
+
+        let matches = dict
+            .user_entries()
+            .iter()
+            .filter(|e| e.reading == "い" && e.surface == "I")
+            .count();
+        assert_eq!(
+            matches, 1,
+            "edit onto an existing identity must not create a memory duplicate",
+        );
     }
 }
 

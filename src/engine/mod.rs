@@ -89,6 +89,14 @@ pub struct ConversionState {
     /// "vim → F7 → Enter → a" → "ヴィムま"). False for the Space path,
     /// whose kana excludes the pending buffer by design.
     pub pending_consumed_in_kana: bool,
+    /// True when `initial_boundaries` came from a learned
+    /// segmentation applied at `start_conversion` time (rather than
+    /// from the DP segmenter's own output). `commit_conversion` uses
+    /// this to reinforce the learned row's count on a re-hit even
+    /// when `final == initial`, so `user_segmentations` LRU-by-usage
+    /// eviction actually reflects usage instead of behaving as
+    /// FIFO — bug [2] in Fable-5 review 2026-08-31.
+    pub initial_from_learned: bool,
 }
 
 /// Extract segment start positions (excluding 0) from a segment list.
@@ -575,8 +583,10 @@ impl ConversionEngine {
             return None;
         }
 
-        // Apply AI segmentation filter: try alternative segmentations and pick the best
-        let segments = self.filter_segmentation(segments, &kana, &dict);
+        // Apply AI segmentation filter: try alternative segmentations and pick the best.
+        // Also get the heuristic-only pick so the self-clean below stays
+        // deterministic across llama-server up/down states (bug [8]).
+        let (segments, heuristic_only_segments) = self.filter_segmentation(segments, &kana, &dict);
 
         let mut segment_states = self.build_segment_states(&segments);
 
@@ -592,17 +602,35 @@ impl ConversionEngine {
             let scorer = self.shared.user_scorer.lock().unwrap_or_else(|e| e.into_inner());
             scorer.lookup_segmentation(&kana).map(|v| v.to_vec())
         };
+        // Track whether the initial layout the user is about to see
+        // came from a learned segmentation — commit_conversion needs
+        // this so a re-hit that leaves the layout unchanged still
+        // reinforces the count on `user_segmentations`. Without the
+        // signal, `final == initial` looked identical to "no learn
+        // applied" and record_segmentation never fired again after
+        // the very first record → cap eviction ordered rows by an
+        // effectively-FIFO key (bug [2] in Fable-5 review 2026-08-31).
+        let mut initial_from_learned = false;
         if let Some(learned) = learned {
             let valid = learned
                 .iter()
                 .all(|&b| b > 0 && b < kana_char_len)
                 && learned.windows(2).all(|w| w[0] < w[1]);
-            let dp_boundaries = boundaries_of(&segment_states);
-            if valid && dp_boundaries != learned {
+            // Self-clean compares the learned layout against the
+            // heuristic-only DP output (LLM tiebreak stripped) so
+            // llama-server availability cannot silently forget a row
+            // during a session where the LLM happened to veto (bug [8]).
+            let heuristic_boundaries = heuristic_only_segments
+                .iter()
+                .skip(1)
+                .map(|s| s.start)
+                .collect::<Vec<_>>();
+            if valid && heuristic_boundaries != learned {
                 if let Some(rebuilt) = segments_from_boundaries(&kana, &learned, &dict) {
                     segment_states = self.build_segment_states(&rebuilt);
+                    initial_from_learned = true;
                 }
-            } else if dp_boundaries == learned {
+            } else if heuristic_boundaries == learned {
                 // Self-cleaning (bug [23]): the learned layout now matches
                 // what the DP segmenter would produce on its own —
                 // either the dictionary caught up, or the user resized
@@ -651,6 +679,7 @@ impl ConversionEngine {
             initial_boundaries,
             pending_from_romaji,
             pending_consumed_in_kana,
+            initial_from_learned,
         });
 
         // Trigger LLM reranking in background — results applied on next interaction
@@ -954,6 +983,11 @@ impl ConversionEngine {
             // romaji buffer for the next keystroke — bug [25]:
             // "vim → F7 → Enter → a" produced "ヴィムま".
             pending_consumed_in_kana: true,
+            // F-key path never carries a user_segmentations row —
+            // its single "segment" is the whole kana with no
+            // learnable boundary layout — so re-hit reinforcement
+            // does not apply here.
+            initial_from_learned: false,
         });
         self.conversion.as_ref()
     }
@@ -1050,6 +1084,16 @@ impl ConversionEngine {
             }
             let final_boundaries = boundaries_of(&state.segments);
             if final_boundaries != state.initial_boundaries {
+                let _ = user_scorer.record_segmentation(&state.kana, final_boundaries);
+            } else if state.initial_from_learned {
+                // Re-record so the row's count on `user_segmentations`
+                // is bumped even though the user didn't change the
+                // layout this time. Without this bump, count stays at
+                // 1 forever for daily-use entries and the ORDER BY
+                // count ASC eviction policy becomes effectively FIFO —
+                // a heavily-used old entry loses to a one-off from
+                // last week just because it was recorded first
+                // (bug [2] in Fable-5 review 2026-08-31).
                 let _ = user_scorer.record_segmentation(&state.kana, final_boundaries);
             }
         }
@@ -1639,20 +1683,31 @@ impl ConversionEngine {
     /// Uses a two-stage scoring approach:
     /// 1. Heuristic score based on dictionary frequency and segment quality (always available)
     /// 2. LLM score for naturalness check (when available, used as tiebreaker)
+    ///
+    /// Returns `(chosen, heuristic_only)`:
+    /// - `chosen` is the segmentation actually used downstream.
+    /// - `heuristic_only` is what the DP would output *without* LLM
+    ///   tiebreak. It equals `chosen` unless the LLM vetoed the top
+    ///   heuristic pick and reverted to base. `start_conversion` uses
+    ///   it for the learned-layout self-clean comparison so the
+    ///   forget decision doesn't flip with llama-server state
+    ///   (bug [8] in Fable-5 review 2026-08-31).
     fn filter_segmentation(
         &self,
         base_segments: Vec<Segment>,
         kana: &str,
         dict: &Dictionary,
-    ) -> Vec<Segment> {
+    ) -> (Vec<Segment>, Vec<Segment>) {
         // Skip if too few segments to have meaningful alternatives
         if base_segments.len() <= 1 {
-            return base_segments;
+            let clone = base_segments.clone();
+            return (base_segments, clone);
         }
 
         let alternatives = self.generate_alternative_segmentations(&base_segments, kana, dict);
         if alternatives.len() <= 1 {
-            return base_segments;
+            let clone = base_segments.clone();
+            return (base_segments, clone);
         }
 
         // Score each alternative with heuristic
@@ -1663,8 +1718,14 @@ impl ConversionEngine {
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
+        // The heuristic-only pick — what DP would output with LLM off.
+        // Kept as a separate return so self-clean stays deterministic
+        // regardless of llama-server state (bug [8]).
+        let heuristic_only_idx = scored[0].0;
+
         // If the top heuristic candidate differs from base, try LLM as tiebreaker
         let heuristic_best = scored[0].0;
+        let mut chosen_idx = heuristic_best;
         if heuristic_best != 0 {
             // Try LLM scoring on the top 2 candidates for final decision.
             // Both calls must produce a real signal — the LlmScorer
@@ -1673,6 +1734,17 @@ impl ConversionEngine {
             // fallback would let one transient HTTP error tip the
             // segmentation choice arbitrarily (Devin PR #6 7th round #2).
             if let Ok(llm) = self.shared.llm.try_lock() {
+                // Total wall-clock budget for the two blocking HTTP
+                // scoring calls. `http_scorer::SCORE_GLOBAL_TIMEOUT`
+                // caps each individual request at 1.5 s, so before this
+                // deadline the tiebreak could stack up to ~3 s on Space
+                // when llama-server was warm-but-slow (cold KV, GPU
+                // driver swap) — Space blocks the frontend main loop
+                // (bug [3] in Fable-5 review 2026-08-31). 400 ms keeps
+                // the happy path (~50-100 ms per call) intact while
+                // dropping the pathological case to one stalled call
+                // plus a skip, not two stalled calls.
+                let deadline = Instant::now() + Duration::from_millis(400);
                 // Acquire two real scores or nothing — a partial reading
                 // would compare a real logprob against the neutral 0.5
                 // fallback and pick the wrong segmentation from a
@@ -1685,6 +1757,16 @@ impl ConversionEngine {
                     }
                     let base = Self::score_segmentation_llm(&alternatives[0], &llm);
                     if !llm.is_scorer_available() {
+                        return None;
+                    }
+                    // If the first call already blew the budget, fall
+                    // back to heuristic instead of stacking a second
+                    // blocking call on top (bug [3]).
+                    if Instant::now() >= deadline {
+                        log::debug!(
+                            "Segmentation filter: tiebreak budget exhausted after first call; \
+                             using heuristic best"
+                        );
                         return None;
                     }
                     let best =
@@ -1708,12 +1790,7 @@ impl ConversionEngine {
                         log::info!(
                             "Segmentation filter: LLM overrode heuristic, keeping base"
                         );
-                        // Invariant: alternatives always includes the
-                        // base segmentation at index 0 (seeded above).
-                        return alternatives
-                            .into_iter()
-                            .next()
-                            .expect("alternatives always contains the base segmentation");
+                        chosen_idx = 0;
                     }
                 } else {
                     log::debug!(
@@ -1722,11 +1799,13 @@ impl ConversionEngine {
                     );
                 }
             }
-            log::info!(
-                "Segmentation filter: changed from '{}' to '{}'",
-                Self::compose_top_candidates(&alternatives[0]),
-                Self::compose_top_candidates(&alternatives[heuristic_best]),
-            );
+            if chosen_idx != 0 {
+                log::info!(
+                    "Segmentation filter: changed from '{}' to '{}'",
+                    Self::compose_top_candidates(&alternatives[0]),
+                    Self::compose_top_candidates(&alternatives[heuristic_best]),
+                );
+            }
         }
 
         for (i, score) in &scored {
@@ -1738,12 +1817,15 @@ impl ConversionEngine {
             );
         }
 
-        // scored[0].0 is an index into alternatives (built above from the
-        // same alternatives.iter().enumerate()), so nth() is always Some.
-        alternatives
+        // chosen_idx / heuristic_only_idx are both indices into
+        // alternatives (built above from the enumeration), so cloning
+        // by index is always valid.
+        let heuristic_only = alternatives[heuristic_only_idx].clone();
+        let chosen = alternatives
             .into_iter()
-            .nth(scored[0].0)
-            .expect("scored indices are always valid alternatives positions")
+            .nth(chosen_idx)
+            .expect("chosen_idx is always a valid alternatives position");
+        (chosen, heuristic_only)
     }
 
     /// Generate alternative segmentations by merging adjacent segment pairs.
@@ -1987,6 +2069,15 @@ impl ConversionEngine {
         if let Some(state) = self.conversion.as_mut() {
             state.segments[idx].candidates = candidates;
             state.segments[idx].selected = 0;
+            // Clear user_selected so a candidate the user cycled to BEFORE
+            // resize does not travel with the boundary change into the new
+            // reading. Without this, commit_conversion records a phantom
+            // learn against a surface the user never picked for the new
+            // reading (bug [1] in Fable-5 review 2026-08-31), and
+            // apply_llm_rerank would skip the resized bunsetsu because
+            // it still looks user-locked despite the reset comment on
+            // resize_segment saying otherwise.
+            state.segments[idx].user_selected = false;
         }
     }
 
@@ -2149,6 +2240,107 @@ mod tests {
         assert!(
             segs.iter().all(|s| !s.user_selected),
             "resized/split bunsetsu must stay rerank-eligible (user_selected=false)",
+        );
+    }
+
+    /// Regression (bug [1] in Fable-5 review 2026-08-31): cycling a
+    /// candidate on a segment and THEN resizing the boundary must not
+    /// carry the `user_selected` flag onto the new (resized) reading.
+    /// If it did, `commit_conversion` would fire `user_scorer.record()`
+    /// against a surface the user never picked for the new reading —
+    /// silently planting a permanent learning entry that would then
+    /// bias future conversions of an unrelated word.
+    #[test]
+    fn resize_after_cycle_does_not_learn_stale_surface() {
+        let mut engine = ConversionEngine::with_shared(SharedCore::new_hermetic());
+        for ch in "amegafuru".chars() {
+            engine.process_key(ch);
+        }
+        engine.start_conversion();
+
+        // Default: seg0="あめが", seg1="ふる". Cycle a candidate on seg0
+        // so it gets marked user_selected=true, then shrink to change
+        // the reading to "あめ". The user_selected flag must be cleared
+        // (it applied to the OLD reading's surface, not the new one).
+        engine.cycle_candidate(1);
+        assert!(
+            engine.conversion_state().unwrap().segments[0].user_selected,
+            "sanity: cycle_candidate should mark the segment user_selected",
+        );
+        engine.resize_segment(-1);
+
+        let segs = &engine.conversion_state().unwrap().segments;
+        assert_eq!(segs[0].reading, "あめ");
+        assert!(
+            !segs[0].user_selected,
+            "resize into a new reading must clear the pre-resize user_selected flag; \
+             leaving it set makes commit_conversion learn the stale surface",
+        );
+    }
+
+    /// Regression (bug [2] in Fable-5 review 2026-08-31): committing a
+    /// conversion whose initial layout came from a learned
+    /// user_segmentations row (final==initial → user didn't re-adjust
+    /// the layout this session) must still reinforce the row.
+    /// Without the reinforcement, count stays at 1 forever and the
+    /// MAX_USER_SEGMENTATIONS eviction (ORDER BY count ASC) becomes
+    /// effectively FIFO, evicting daily-use entries before one-off
+    /// recent ones.
+    #[test]
+    fn commit_reinforces_learned_layout_on_rehit() {
+        let mut engine = ConversionEngine::with_shared(SharedCore::new_hermetic());
+        for ch in "amegafuru".chars() {
+            engine.process_key(ch);
+        }
+        engine.start_conversion();
+        // Prime a learned layout: resize once and commit so the row
+        // lands in the (memory-only, hermetic) user_scorer segmentation
+        // map with the shrunk boundaries.
+        engine.resize_segment(-1);
+        let learned_kana = engine.conversion_state().unwrap().kana.clone();
+        let learned_boundaries = boundaries_of(&engine.conversion_state().unwrap().segments);
+        engine.commit_conversion();
+        {
+            let scorer = engine
+                .shared
+                .user_scorer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                scorer.lookup_segmentation(&learned_kana),
+                Some(learned_boundaries.as_slice()),
+                "sanity: first commit should have persisted the learned layout",
+            );
+        }
+
+        // Re-type the same kana. The learned layout is applied at
+        // start_conversion, so initial==final on commit. The commit
+        // path must still call record_segmentation to bump the count.
+        for ch in "amegafuru".chars() {
+            engine.process_key(ch);
+        }
+        engine.start_conversion();
+        assert!(
+            engine.conversion_state().unwrap().initial_from_learned,
+            "start_conversion should mark the state as learned-derived so \
+             commit_conversion can reinforce it",
+        );
+        engine.commit_conversion();
+        // The learned row is still present in memory (record_segmentation
+        // replaces on conflict, so no eviction happens here). The bump
+        // itself is only observable through the store's count column,
+        // which is a real SQLite integration test; the invariant this
+        // hermetic case pins is the trigger — that
+        // `initial_from_learned` reaches commit_conversion truthfully.
+        let scorer = engine
+            .shared
+            .user_scorer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            scorer.lookup_segmentation(&learned_kana),
+            Some(learned_boundaries.as_slice()),
+            "re-hit must leave the learned layout in place, not forget it",
         );
     }
 
