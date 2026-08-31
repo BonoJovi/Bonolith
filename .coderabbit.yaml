@@ -10,13 +10,9 @@ language: "ja-JP"
 early_access: false
 enable_free_tier: true
 
+# tone_instructions is capped at 250 chars by the validator — keep terse.
 tone_instructions: |
-  Findings must include a concrete failure scenario: specific inputs / state
-  that lead to the wrong output, crash, or data corruption. Rank real
-  correctness / persistence / concurrency bugs above style nits. Skip
-  cosmetic suggestions on doc comments unless the comment misdescribes
-  actual behaviour. Reply in Japanese to match the project's review
-  history; keep each finding under ~10 lines.
+  Each finding needs a concrete failure scenario (specific inputs/state → wrong output, crash, data corruption). Rank real correctness / persistence / concurrency bugs above style nits. Reply in Japanese; keep findings ≤10 lines.
 
 reviews:
   profile: "assertive"
