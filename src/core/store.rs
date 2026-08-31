@@ -648,6 +648,23 @@ impl DictStore {
             .collect())
     }
 
+    /// Return the `count` column value for the learned segmentation
+    /// row keyed by `kana`, or `None` when no row exists. Used by
+    /// integration tests to verify that a re-hit actually reinforces
+    /// the row (Devin PR #7 [R2-8]); also useful as a diagnostic hook
+    /// for future eviction observability work.
+    pub fn segmentation_count(&self, kana: &str) -> io::Result<Option<u32>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn
+            .prepare("SELECT count FROM user_segmentations WHERE kana = ?1")
+            .map_err(sqlite_to_io)?;
+        let mut rows = stmt.query(params![kana]).map_err(sqlite_to_io)?;
+        match rows.next().map_err(sqlite_to_io)? {
+            Some(row) => Ok(Some(row.get::<_, u32>(0).map_err(sqlite_to_io)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Delete a learned segmentation row (called when the learned layout
     /// converges back to the DP default — see `ConversionEngine::start_conversion`
     /// self-cleaning). No error if the row is absent.

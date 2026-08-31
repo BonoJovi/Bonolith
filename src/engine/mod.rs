@@ -642,14 +642,18 @@ impl ConversionEngine {
                 .skip(1)
                 .map(|s| s.start)
                 .collect::<Vec<_>>();
-            if valid && learned != chosen_boundaries {
+            let learned_matches_chosen = learned == chosen_boundaries;
+            let learned_matches_heuristic = learned == heuristic_boundaries;
+            if valid && !learned_matches_chosen {
+                // Override chosen with the user's learned layout — the
+                // saved preference wins over LLM veto too. Marking
+                // initial_from_learned lets commit_conversion reinforce
+                // the row's count on this hit (bug [2]).
                 if let Some(rebuilt) = segments_from_boundaries(&kana, &learned, &dict) {
                     segment_states = self.build_segment_states(&rebuilt);
                     initial_from_learned = true;
                 }
-            } else if learned == chosen_boundaries
-                && chosen_boundaries == heuristic_boundaries
-            {
+            } else if learned_matches_chosen && learned_matches_heuristic {
                 // Self-cleaning (bug [23]): the learned layout now
                 // matches what the DP segmenter would produce on its
                 // own — the dictionary caught up, or the user resized
@@ -665,6 +669,18 @@ impl ConversionEngine {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 scorer.forget_segmentation(&kana);
+            } else if valid && learned_matches_chosen {
+                // learned == chosen but != heuristic_only. The LLM
+                // vetoed heuristic and coincidentally landed on
+                // learned. The row is not overriding anything this
+                // time (chosen already matches), but it IS still
+                // valuable — the next session with LLM off would
+                // pick heuristic_only, so learned is what keeps the
+                // layout stable across llama-server state. Reinforce
+                // it via initial_from_learned so commit_conversion
+                // bumps the count and eviction reflects real usage
+                // (Devin PR #7 [R2-7]).
+                initial_from_learned = true;
             }
         }
         drop(dict);
@@ -2376,6 +2392,75 @@ mod tests {
             Some(learned_boundaries.as_slice()),
             "re-hit must leave the learned layout in place, not forget it",
         );
+    }
+
+    /// Regression (Devin PR #7 [R2-8]): the re-hit reinforcement must
+    /// actually bump `user_segmentations.count` in SQLite, not just
+    /// flip an in-memory flag. Runs the full conversion pipeline
+    /// through a store-attached SharedCore, resizes to learn a
+    /// segmentation, commits (count=1), then re-hits the same kana
+    /// and commits again. `count` must reach ≥2 — with the pre-fix
+    /// code it stayed at 1, so heavy-use entries would evict before
+    /// one-off recent ones under MAX_USER_SEGMENTATIONS pressure
+    /// (bug [2] in Fable-5 review 2026-08-31).
+    #[test]
+    fn commit_bumps_segmentation_count_on_rehit_store_backed() {
+        use crate::core::store::DictStore;
+        use std::sync::RwLock;
+
+        let dir = std::env::temp_dir().join("bonolith_test_segcount_rehit");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("dict.sqlite");
+        let store = Arc::new(DictStore::open(&db_path).unwrap());
+
+        // Build a store-attached SharedCore. Dictionary attaches the
+        // store so its segmenter sees the same rows the scorer writes.
+        let mut dict = Dictionary::new();
+        dict.attach_store(store.clone());
+        let user_scorer = crate::core::user_scorer::UserScorer::from_store(store.clone()).unwrap();
+        let shared = Arc::new(SharedCore {
+            dictionary: RwLock::new(dict),
+            grammar: GrammarEngine::new(),
+            llm: Mutex::new(LlmEngine::with_scorer(Box::new(
+                crate::core::llm::MockScorer,
+            ))),
+            user_scorer: Mutex::new(user_scorer),
+            store: Some(store.clone()),
+            pending_llm_context: Mutex::new(Vec::new()),
+        });
+        let mut engine = ConversionEngine::with_shared(shared);
+
+        // Prime a learned layout by resizing once and committing.
+        for ch in "amegafuru".chars() {
+            engine.process_key(ch);
+        }
+        engine.start_conversion();
+        engine.resize_segment(-1);
+        let learned_kana = engine.conversion_state().unwrap().kana.clone();
+        engine.commit_conversion();
+        let count_after_learn = store.segmentation_count(&learned_kana).unwrap();
+        assert_eq!(
+            count_after_learn,
+            Some(1),
+            "sanity: first commit persists count=1",
+        );
+
+        // Re-hit the same kana; commit again without changing the layout.
+        for ch in "amegafuru".chars() {
+            engine.process_key(ch);
+        }
+        engine.start_conversion();
+        engine.commit_conversion();
+        let count_after_rehit = store.segmentation_count(&learned_kana).unwrap();
+        assert_eq!(
+            count_after_rehit,
+            Some(2),
+            "re-hit commit must bump user_segmentations.count from 1 to 2 \
+             so LRU eviction reflects real usage",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Regression: a background rerank from a superseded segmentation (e.g. one
